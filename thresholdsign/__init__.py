@@ -5,11 +5,16 @@ split_secret_verifiable / split_secret_pedersen / verify_share /
 verify_pedersen_share / reconstruct_secret / evaluate_polynomial, plus the
 single-round Pedersen DKG: DKGContribution / DKGReceivedShare / DKGResult /
 DKGRejection / create_dkg_contribution / verify_dkg_received_share /
-aggregate_dkg.
+aggregate_dkg, and the two-round threshold Schnorr signature built on it:
+SigningContribution / SigningDKGResult / NonceCommitment / SignatureShare /
+Signature / SigningRejection / create_signing_contribution /
+aggregate_signing_dkg / create_nonce_commitment / create_signature_share /
+verify_signature_share / aggregate_signatures / verify_signature.
 """
 
 from __future__ import annotations
 
+import hashlib
 import secrets
 from dataclasses import dataclass
 from typing import Callable, Iterable, Sequence
@@ -33,6 +38,19 @@ __all__ = [
     "create_dkg_contribution",
     "verify_dkg_received_share",
     "aggregate_dkg",
+    "SigningContribution",
+    "SigningDKGResult",
+    "NonceCommitment",
+    "SignatureShare",
+    "Signature",
+    "SigningRejection",
+    "create_signing_contribution",
+    "aggregate_signing_dkg",
+    "create_nonce_commitment",
+    "create_signature_share",
+    "verify_signature_share",
+    "aggregate_signatures",
+    "verify_signature",
 ]
 
 # Mersenne prime 2**127 - 1: large enough for integer secrets, small enough that
@@ -553,28 +571,24 @@ class DKGRejection:
     sender_id: int
 
 
-def create_dkg_contribution(
+def _dkg_polynomials(
     sender_id: int,
     participant_ids: Iterable[int],
     threshold: int,
     *,
+    prime: int,
     group_prime: int,
     generator: int,
     blinding_generator: int,
-    prime: int = DEFAULT_PRIME,
-    randbelow: Callable[[int], int] = secrets.randbelow,
-) -> DKGContribution:
-    """Create one participant's contribution to a single-round Pedersen DKG.
+    randbelow: Callable[[int], int],
+) -> tuple[tuple[int, ...], list[int], list[int]]:
+    """Validate the DKG parameters and draw the sharing/blinding coefficients.
 
-    Every participant runs this once with the same ``participant_ids``,
-    ``threshold`` and group parameters. The sender draws a random sharing
-    polynomial and a random blinding polynomial (``threshold`` coefficients
-    each, all from ``randbelow``; a deterministic source may legitimately
-    produce an all-zero contribution), commits to both with a Pedersen
-    commitment, and evaluates a double share for each participant id. Ids
-    must satisfy ``1 <= id <= prime - 1``, must be unique, and the sender
-    must be one of the participants. The joint secret is the sum of all
-    participants' random constant terms, so nobody ever knows it.
+    Returns the sorted participant id tuple together with the ``threshold``
+    coefficients of the random sharing polynomial and of the random blinding
+    polynomial, all drawn from ``randbelow``. This is the single validation
+    and coefficient rule shared by :func:`create_dkg_contribution` and
+    :func:`create_signing_contribution`.
     """
     if not isinstance(sender_id, int):
         raise TypeError("sender_id must be an integer")
@@ -601,10 +615,23 @@ def create_dkg_contribution(
     if threshold > len(ids):
         raise ValueError("threshold must not exceed the number of participants")
 
-    ordered_ids = tuple(sorted(ids))
     coefficients = [randbelow(prime) for _ in range(threshold)]
     blinding_coefficients = [randbelow(prime) for _ in range(threshold)]
+    return tuple(sorted(ids)), coefficients, blinding_coefficients
 
+
+def _build_dkg_contribution(
+    sender_id: int,
+    ordered_ids: tuple[int, ...],
+    coefficients: Sequence[int],
+    blinding_coefficients: Sequence[int],
+    *,
+    prime: int,
+    group_prime: int,
+    generator: int,
+    blinding_generator: int,
+) -> DKGContribution:
+    """Build the DKG contribution of already-drawn sharing/blinding polynomials."""
     shares = tuple(
         Share(
             x=participant_id,
@@ -637,6 +664,51 @@ def create_dkg_contribution(
         shares=shares,
         blinding_shares=blinding_shares,
         commitment=commitment,
+    )
+
+
+def create_dkg_contribution(
+    sender_id: int,
+    participant_ids: Iterable[int],
+    threshold: int,
+    *,
+    group_prime: int,
+    generator: int,
+    blinding_generator: int,
+    prime: int = DEFAULT_PRIME,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> DKGContribution:
+    """Create one participant's contribution to a single-round Pedersen DKG.
+
+    Every participant runs this once with the same ``participant_ids``,
+    ``threshold`` and group parameters. The sender draws a random sharing
+    polynomial and a random blinding polynomial (``threshold`` coefficients
+    each, all from ``randbelow``; a deterministic source may legitimately
+    produce an all-zero contribution), commits to both with a Pedersen
+    commitment, and evaluates a double share for each participant id. Ids
+    must satisfy ``1 <= id <= prime - 1``, must be unique, and the sender
+    must be one of the participants. The joint secret is the sum of all
+    participants' random constant terms, so nobody ever knows it.
+    """
+    ordered_ids, coefficients, blinding_coefficients = _dkg_polynomials(
+        sender_id,
+        participant_ids,
+        threshold,
+        prime=prime,
+        group_prime=group_prime,
+        generator=generator,
+        blinding_generator=blinding_generator,
+        randbelow=randbelow,
+    )
+    return _build_dkg_contribution(
+        sender_id,
+        ordered_ids,
+        coefficients,
+        blinding_coefficients,
+        prime=prime,
+        group_prime=group_prime,
+        generator=generator,
+        blinding_generator=blinding_generator,
     )
 
 
@@ -732,35 +804,12 @@ def _check_dkg_contribution_structure(contribution: DKGContribution) -> None:
         raise ValueError("threshold must satisfy 1 <= threshold <= participant count")
 
 
-def aggregate_dkg(
-    contributions: Iterable[DKGContribution],
-) -> DKGResult | list[DKGRejection]:
-    """Combine one verified contribution per participant into the joint key material.
+def _check_dkg_contributions_consistent(materialised: list[DKGContribution]) -> None:
+    """Cross-contribution consistency checks shared by both DKG aggregations.
 
-    Every participant must contribute exactly once, and all contributions
-    must agree on the participant ids, the threshold and the group
-    parameters. Missing or duplicate participants, illegal ids or
-    commitments, and inconsistent parameters raise ValueError; wrong types
-    raise TypeError. Each double share is verified against its sender's
-    commitment and failures are never dropped: if any contribution does not
-    verify, the result is a list of :class:`DKGRejection` naming every
-    sender whose contribution failed.
-
-    On success the double shares of all contributions are added modulo
-    ``field_prime`` and the commitments are multiplied componentwise modulo
-    ``group_prime``, so the input order does not affect the result. Any
-    ``threshold`` receivers can rebuild the joint secret from their
-    aggregated shares with :func:`reconstruct_secret`, yet no single party
-    ever learns it.
+    Every contribution must agree on the participant ids, the threshold and
+    the group parameters, and each participant must contribute exactly once.
     """
-    materialised = list(contributions)
-    if not materialised:
-        raise ValueError("at least one contribution is required")
-    for contribution in materialised:
-        if not isinstance(contribution, DKGContribution):
-            raise TypeError("contributions must be DKGContribution instances")
-        _check_dkg_contribution_types(contribution)
-
     first = materialised[0]
     participant_ids = first.participant_ids
     first_commitment = first.commitment
@@ -786,24 +835,26 @@ def aggregate_dkg(
     if set(sender_ids) != set(participant_ids):
         raise ValueError("each participant must contribute exactly once")
 
-    # Sort by sender so the input order cannot influence the outcome.
-    ordered = sorted(materialised, key=lambda contribution: contribution.sender_id)
 
-    rejections = []
-    for contribution in ordered:
-        for index, receiver_id in enumerate(contribution.participant_ids):
-            received = DKGReceivedShare(
-                sender_id=contribution.sender_id,
-                receiver_id=receiver_id,
-                share=contribution.shares[index],
-                blinding_share=contribution.blinding_shares[index],
-            )
-            if not verify_dkg_received_share(received, contribution.commitment):
-                rejections.append(DKGRejection(sender_id=contribution.sender_id))
-                break
-    if rejections:
-        return rejections
+def _verify_dkg_contribution(contribution: DKGContribution) -> bool:
+    """True iff every double share verifies against the sender's Pedersen commitment."""
+    for index, receiver_id in enumerate(contribution.participant_ids):
+        received = DKGReceivedShare(
+            sender_id=contribution.sender_id,
+            receiver_id=receiver_id,
+            share=contribution.shares[index],
+            blinding_share=contribution.blinding_shares[index],
+        )
+        if not verify_dkg_received_share(received, contribution.commitment):
+            return False
+    return True
 
+
+def _combine_dkg_contributions(ordered: list[DKGContribution]) -> DKGResult:
+    """Sum the double shares and multiply the commitments of sorted contributions."""
+    first_commitment = ordered[0].commitment
+    participant_ids = ordered[0].participant_ids
+    threshold = len(first_commitment.values)
     field_prime = first_commitment.field_prime
     group_prime = first_commitment.group_prime
     shares = []
@@ -834,3 +885,840 @@ def aggregate_dkg(
             blinding_generator=first_commitment.blinding_generator,
         ),
     )
+
+
+def aggregate_dkg(
+    contributions: Iterable[DKGContribution],
+) -> DKGResult | list[DKGRejection]:
+    """Combine one verified contribution per participant into the joint key material.
+
+    Every participant must contribute exactly once, and all contributions
+    must agree on the participant ids, the threshold and the group
+    parameters. Missing or duplicate participants, illegal ids or
+    commitments, and inconsistent parameters raise ValueError; wrong types
+    raise TypeError. Each double share is verified against its sender's
+    commitment and failures are never dropped: if any contribution does not
+    verify, the result is a list of :class:`DKGRejection` naming every
+    sender whose contribution failed.
+
+    On success the double shares of all contributions are added modulo
+    ``field_prime`` and the commitments are multiplied componentwise modulo
+    ``group_prime``, so the input order does not affect the result. Any
+    ``threshold`` receivers can rebuild the joint secret from their
+    aggregated shares with :func:`reconstruct_secret`, yet no single party
+    ever learns it.
+    """
+    materialised = list(contributions)
+    if not materialised:
+        raise ValueError("at least one contribution is required")
+    for contribution in materialised:
+        if not isinstance(contribution, DKGContribution):
+            raise TypeError("contributions must be DKGContribution instances")
+        _check_dkg_contribution_types(contribution)
+    _check_dkg_contributions_consistent(materialised)
+
+    # Sort by sender so the input order cannot influence the outcome.
+    ordered = sorted(materialised, key=lambda contribution: contribution.sender_id)
+
+    rejections = [
+        DKGRejection(sender_id=contribution.sender_id)
+        for contribution in ordered
+        if not _verify_dkg_contribution(contribution)
+    ]
+    if rejections:
+        return rejections
+    return _combine_dkg_contributions(ordered)
+
+
+@dataclass(frozen=True)
+class SigningContribution:
+    """One participant's DKG contribution plus a Feldman commitment to it.
+
+    ``dkg_contribution`` is the participant's ordinary single-round Pedersen
+    DKG contribution; ``feldman_commitment`` commits to the *same* secret
+    sharing polynomial (coefficient for coefficient, without the blinding
+    polynomial), so the group can derive public verification material for
+    threshold signatures. The secret coefficients never appear in the object.
+    """
+
+    dkg_contribution: DKGContribution
+    feldman_commitment: FeldmanCommitment
+
+
+@dataclass(frozen=True)
+class SigningDKGResult:
+    """Successful signing-DKG aggregation: joint key material and public keys.
+
+    ``dkg_result`` is the ordinary DKG aggregation result; ``public_key`` is
+    the joint public key ``Y = generator ** secret mod group_prime``;
+    ``verification_shares`` holds, for each position of
+    ``dkg_result.participant_ids``, the participant's public verification
+    share ``Y_i = generator ** s_i mod group_prime`` where ``s_i`` is that
+    participant's aggregated secret share. Neither the joint secret nor any
+    polynomial coefficient is stored.
+    """
+
+    dkg_result: DKGResult
+    public_key: int
+    verification_shares: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class NonceCommitment:
+    """One signer's round-1 nonce commitment ``value = generator ** r mod group_prime``.
+
+    The secret nonce ``r`` itself is returned separately by
+    :func:`create_nonce_commitment` and must be kept private and never reused.
+    """
+
+    signer_id: int
+    value: int
+
+
+@dataclass(frozen=True)
+class SignatureShare:
+    """One signer's round-2 signature share ``z_i = r_i + c * lambda_i * s_i mod q``."""
+
+    signer_id: int
+    value: int
+
+
+@dataclass(frozen=True)
+class Signature:
+    """An aggregated threshold Schnorr signature.
+
+    ``signer_ids`` is the strictly increasing tuple of signers, ``nonce`` is
+    the combined commitment ``R = product(R_i) mod group_prime`` and ``value``
+    is the combined response ``z = sum(z_i) mod field_prime``.
+    """
+
+    signer_ids: tuple[int, ...]
+    nonce: int
+    value: int
+
+
+@dataclass(frozen=True)
+class SigningRejection:
+    """A signature share that failed verification, identified by its signer."""
+
+    signer_id: int
+
+
+def create_signing_contribution(
+    sender_id: int,
+    participant_ids: Iterable[int],
+    threshold: int,
+    *,
+    group_prime: int,
+    generator: int,
+    blinding_generator: int,
+    prime: int = DEFAULT_PRIME,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> SigningContribution:
+    """Create one participant's contribution to a threshold-signing DKG.
+
+    Follows exactly the validation and coefficient rule of
+    :func:`create_dkg_contribution`: the same random sharing and blinding
+    polynomials (``threshold`` coefficients each, all drawn from
+    ``randbelow``) produce the Pedersen DKG contribution, and the same
+    secret sharing polynomial is additionally committed to with a Feldman
+    commitment ``F_j = generator ** a_j mod group_prime``. The Feldman
+    commitment lets the group derive the joint public key and each
+    participant's public verification share without revealing any
+    coefficient; the secret coefficients are never stored.
+    """
+    ordered_ids, coefficients, blinding_coefficients = _dkg_polynomials(
+        sender_id,
+        participant_ids,
+        threshold,
+        prime=prime,
+        group_prime=group_prime,
+        generator=generator,
+        blinding_generator=blinding_generator,
+        randbelow=randbelow,
+    )
+    contribution = _build_dkg_contribution(
+        sender_id,
+        ordered_ids,
+        coefficients,
+        blinding_coefficients,
+        prime=prime,
+        group_prime=group_prime,
+        generator=generator,
+        blinding_generator=blinding_generator,
+    )
+    feldman_commitment = FeldmanCommitment(
+        values=tuple(pow(generator, coefficient, group_prime) for coefficient in coefficients),
+        field_prime=prime,
+        group_prime=group_prime,
+        generator=generator,
+    )
+    return SigningContribution(
+        dkg_contribution=contribution,
+        feldman_commitment=feldman_commitment,
+    )
+
+
+def _check_signing_contribution_types(contribution: SigningContribution) -> None:
+    """Type-check every field of a signing contribution, raising TypeError."""
+    if not isinstance(contribution.dkg_contribution, DKGContribution):
+        raise TypeError("dkg_contribution must be a DKGContribution instance")
+    commitment = contribution.feldman_commitment
+    if not isinstance(commitment, FeldmanCommitment):
+        raise TypeError("feldman_commitment must be a FeldmanCommitment instance")
+    for name, value in (
+        ("field_prime", commitment.field_prime),
+        ("group_prime", commitment.group_prime),
+        ("generator", commitment.generator),
+    ):
+        if not isinstance(value, int):
+            raise TypeError(f"{name} must be an integer")
+    if not isinstance(commitment.values, tuple):
+        raise TypeError("commitment values must be a tuple")
+    for value in commitment.values:
+        if not isinstance(value, int):
+            raise TypeError("commitment values must be integers")
+
+
+def _feldman_evaluate(
+    values: tuple[int, ...], x: int, *, field_prime: int, group_prime: int
+) -> int:
+    """Evaluate a Feldman commitment in the exponent: ``product(C_j ** x**j)``."""
+    product = 1
+    x_power = 1
+    for c_j in values:
+        product = product * pow(c_j, x_power, group_prime) % group_prime
+        x_power = x_power * x % field_prime
+    return product
+
+
+def aggregate_signing_dkg(
+    contributions: Iterable[SigningContribution],
+) -> SigningDKGResult | list[DKGRejection]:
+    """Combine signing contributions into joint key material and public keys.
+
+    Applies the same checks as :func:`aggregate_dkg` to the embedded
+    Pedersen contributions (missing or duplicate participants, inconsistent
+    ids, threshold or group parameters raise ValueError; wrong types raise
+    TypeError), and additionally requires each Feldman commitment to be
+    well-formed, to share the Pedersen group parameters and to commit to the
+    same threshold. Every double share is verified against its sender's
+    Pedersen commitment and every share against the sender's Feldman
+    commitment; failures are never dropped: if any contribution does not
+    verify, the result is a list of :class:`DKGRejection` naming every
+    sender whose contribution failed, sorted by ``sender_id`` regardless of
+    the input order.
+
+    On success returns a :class:`SigningDKGResult`: the ordinary
+    :class:`DKGResult`, the joint public key ``Y`` (the product of the
+    constant-term Feldman commitments) and each participant's verification
+    share ``Y_i`` (the product of the Feldman commitments evaluated at the
+    participant's id), so the input order does not affect the result.
+    """
+    materialised = list(contributions)
+    if not materialised:
+        raise ValueError("at least one contribution is required")
+    for contribution in materialised:
+        if not isinstance(contribution, SigningContribution):
+            raise TypeError("contributions must be SigningContribution instances")
+        _check_signing_contribution_types(contribution)
+        _check_dkg_contribution_types(contribution.dkg_contribution)
+
+    inner = [contribution.dkg_contribution for contribution in materialised]
+    _check_dkg_contributions_consistent(inner)
+
+    for contribution in materialised:
+        pedersen = contribution.dkg_contribution.commitment
+        feldman = contribution.feldman_commitment
+        if (
+            feldman.field_prime != pedersen.field_prime
+            or feldman.group_prime != pedersen.group_prime
+            or feldman.generator != pedersen.generator
+        ):
+            raise ValueError("both commitments must share the same group parameters")
+        if len(feldman.values) != len(pedersen.values):
+            raise ValueError("both commitments must commit to the same threshold")
+        _validate_commitment_setup(
+            feldman.values,
+            feldman.field_prime,
+            feldman.group_prime,
+            (feldman.generator,),
+        )
+
+    # Sort by sender so the input order cannot influence the outcome.
+    ordered = sorted(materialised, key=lambda contribution: contribution.dkg_contribution.sender_id)
+
+    rejections = []
+    for contribution in ordered:
+        dkg_contribution = contribution.dkg_contribution
+        if not _verify_dkg_contribution(dkg_contribution):
+            rejections.append(DKGRejection(sender_id=dkg_contribution.sender_id))
+            continue
+        feldman = contribution.feldman_commitment
+        if not all(
+            verify_share(share, feldman) for share in dkg_contribution.shares
+        ):
+            rejections.append(DKGRejection(sender_id=dkg_contribution.sender_id))
+    if rejections:
+        return rejections
+
+    dkg_result = _combine_dkg_contributions([c.dkg_contribution for c in ordered])
+    field_prime = dkg_result.commitment.field_prime
+    group_prime = dkg_result.commitment.group_prime
+    public_key = 1
+    for contribution in ordered:
+        public_key = (
+            public_key * contribution.feldman_commitment.values[0] % group_prime
+        )
+    verification_shares = tuple(
+        _product_of_feldman_evaluations(ordered, participant_id, field_prime, group_prime)
+        for participant_id in dkg_result.participant_ids
+    )
+    return SigningDKGResult(
+        dkg_result=dkg_result,
+        public_key=public_key,
+        verification_shares=verification_shares,
+    )
+
+
+def _product_of_feldman_evaluations(
+    ordered: list[SigningContribution],
+    participant_id: int,
+    field_prime: int,
+    group_prime: int,
+) -> int:
+    """The verification share ``Y_i``: every Feldman commitment evaluated at the id."""
+    value = 1
+    for contribution in ordered:
+        value = (
+            value
+            * _feldman_evaluate(
+                contribution.feldman_commitment.values,
+                participant_id,
+                field_prime=field_prime,
+                group_prime=group_prime,
+            )
+            % group_prime
+        )
+    return value
+
+
+def _check_message(message: bytes) -> bytes:
+    """Require a bytes-like message, raising TypeError otherwise."""
+    if not isinstance(message, (bytes, bytearray)):
+        raise TypeError("message must be bytes")
+    return bytes(message)
+
+
+def _check_message(message: bytes) -> bytes:
+    """Require a bytes-like message, raising TypeError otherwise."""
+    if not isinstance(message, (bytes, bytearray)):
+        raise TypeError("message must be bytes")
+    return bytes(message)
+
+
+def _schnorr_challenge(
+    message: bytes,
+    public_key: int,
+    nonce: int,
+    signer_ids: tuple[int, ...],
+    *,
+    field_prime: int,
+    group_prime: int,
+) -> int:
+    """The Fiat-Shamir challenge ``c`` of a threshold Schnorr signing session.
+
+    Hashes the domain-separation tag, the SHA-256 digest of the message and
+    the ``L``-byte unsigned big-endian encodings of ``Y``, ``R`` and every
+    signer id (in strictly increasing order), where
+    ``L = ceil(group_prime.bit_length() / 8)``; the digest is interpreted
+    big-endian and reduced modulo ``field_prime``.
+    """
+    length = (group_prime.bit_length() + 7) // 8
+    hasher = hashlib.sha256()
+    hasher.update(b"thresholdsign/schnorr/v1")
+    hasher.update(hashlib.sha256(message).digest())
+    hasher.update(public_key.to_bytes(length, "big"))
+    hasher.update(nonce.to_bytes(length, "big"))
+    for signer_id in signer_ids:
+        hasher.update(signer_id.to_bytes(length, "big"))
+    return int.from_bytes(hasher.digest(), "big") % field_prime
+
+
+def _lagrange_weight(indices: tuple[int, ...], position: int, prime: int) -> int:
+    """The Lagrange coefficient of ``indices[position]`` at x = 0 modulo ``prime``."""
+    numerator = 1
+    denominator = 1
+    for other_position, other in enumerate(indices):
+        if other_position == position:
+            continue
+        numerator = numerator * other % prime
+        denominator = denominator * (other - indices[position]) % prime
+    return numerator * pow(denominator, -1, prime) % prime
+
+
+def _check_signing_result(
+    result: SigningDKGResult,
+) -> tuple[int, int, int, int, tuple[int, ...]]:
+    """Validate a SigningDKGResult and return (field_prime, group_prime,
+    generator, threshold, participant_ids)."""
+    if not isinstance(result, SigningDKGResult):
+        raise TypeError("result must be a SigningDKGResult instance")
+    dkg_result = result.dkg_result
+    if not isinstance(dkg_result, DKGResult):
+        raise TypeError("dkg_result must be a DKGResult instance")
+    commitment = dkg_result.commitment
+    if not isinstance(commitment, PedersenCommitment):
+        raise TypeError("commitment must be a PedersenCommitment instance")
+    if not isinstance(result.public_key, int):
+        raise TypeError("public_key must be an integer")
+    if not isinstance(result.verification_shares, tuple):
+        raise TypeError("verification_shares must be a tuple")
+    for value in result.verification_shares:
+        if not isinstance(value, int):
+            raise TypeError("verification shares must be integers")
+    if not isinstance(dkg_result.participant_ids, tuple):
+        raise TypeError("participant_ids must be a tuple")
+    for participant_id in dkg_result.participant_ids:
+        if not isinstance(participant_id, int):
+            raise TypeError("participant ids must be integers")
+    for name, shares in (
+        ("shares", dkg_result.shares),
+        ("blinding_shares", dkg_result.blinding_shares),
+    ):
+        if not isinstance(shares, tuple):
+            raise TypeError(f"{name} must be a tuple")
+        for share in shares:
+            if not isinstance(share, Share):
+                raise TypeError(f"{name} must contain Share instances")
+    for name, value in (
+        ("field_prime", commitment.field_prime),
+        ("group_prime", commitment.group_prime),
+        ("generator", commitment.generator),
+        ("blinding_generator", commitment.blinding_generator),
+    ):
+        if not isinstance(value, int):
+            raise TypeError(f"{name} must be an integer")
+    if not isinstance(commitment.values, tuple):
+        raise TypeError("commitment values must be a tuple")
+
+    field_prime = commitment.field_prime
+    group_prime = commitment.group_prime
+    generator = commitment.generator
+    ids = dkg_result.participant_ids
+    _validate_commitment_setup(
+        commitment.values,
+        field_prime,
+        group_prime,
+        (generator, commitment.blinding_generator),
+    )
+    if not ids:
+        raise ValueError("participant ids must not be empty")
+    if any(ids[index] >= ids[index + 1] for index in range(len(ids) - 1)):
+        raise ValueError("participant ids must be strictly increasing and unique")
+    for participant_id in ids:
+        if not 0 < participant_id < field_prime:
+            raise ValueError("participant ids must satisfy 1 <= id <= field_prime - 1")
+    if not len(dkg_result.shares) == len(dkg_result.blinding_shares) == len(ids):
+        raise ValueError("each participant id must have exactly one double share")
+    if len(result.verification_shares) != len(ids):
+        raise ValueError("each participant id must have exactly one verification share")
+    if not 1 <= len(commitment.values) <= len(ids):
+        raise ValueError("threshold must satisfy 1 <= threshold <= participant count")
+    if not 0 < result.public_key < group_prime or pow(
+        result.public_key, field_prime, group_prime
+    ) != 1:
+        raise ValueError("public_key must lie in the order-field_prime subgroup")
+    for value in result.verification_shares:
+        if not 0 < value < group_prime or pow(value, field_prime, group_prime) != 1:
+            raise ValueError(
+                "verification shares must lie in the order-field_prime subgroup"
+            )
+    return field_prime, group_prime, generator, len(commitment.values), ids
+
+
+def _check_nonce_commitments(
+    materialised: list[NonceCommitment],
+    *,
+    field_prime: int,
+    group_prime: int,
+    threshold: int,
+    participant_ids: tuple[int, ...],
+) -> tuple[int, ...]:
+    """Validate one signing session's nonce commitments; return the sorted signer ids.
+
+    Signer ids must be unique DKG participants and number at least
+    ``threshold``; every commitment value must be a non-identity element of
+    the order-``field_prime`` subgroup (a zero nonce commits to the
+    identity), and all values must be distinct so a reused nonce is
+    rejected.
+    """
+    for commitment in materialised:
+        if not isinstance(commitment, NonceCommitment):
+            raise TypeError("nonce commitments must be NonceCommitment instances")
+        if not isinstance(commitment.signer_id, int):
+            raise TypeError("signer_id must be an integer")
+        if not isinstance(commitment.value, int):
+            raise TypeError("nonce commitment value must be an integer")
+    if not materialised:
+        raise ValueError("at least one nonce commitment is required")
+    signer_ids = [commitment.signer_id for commitment in materialised]
+    if len(set(signer_ids)) != len(signer_ids):
+        raise ValueError("duplicate nonce commitment from the same signer")
+    for signer_id in signer_ids:
+        if signer_id not in participant_ids:
+            raise ValueError("signer must be one of the DKG participants")
+    if len(signer_ids) < threshold:
+        raise ValueError("at least threshold signers are required")
+    values = [commitment.value for commitment in materialised]
+    for value in values:
+        if not 1 < value < group_prime or pow(value, field_prime, group_prime) != 1:
+            raise ValueError(
+                "nonce commitment must be a non-identity element of the "
+                "order-field_prime subgroup"
+            )
+    if len(set(values)) != len(values):
+        raise ValueError("nonce values must not be reused")
+    return tuple(sorted(signer_ids))
+
+
+def create_nonce_commitment(
+    signer_id: int,
+    *,
+    group_prime: int,
+    generator: int,
+    prime: int = DEFAULT_PRIME,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> tuple[int, NonceCommitment]:
+    """Round 1 of a signing session: draw a one-time nonce and commit to it.
+
+    Draws a fresh non-zero nonce ``r`` (uniform in ``1..prime - 1`` via the
+    injectable ``randbelow``) and returns ``(r, commitment)`` where
+    ``commitment.value = generator ** r mod group_prime``. The signer keeps
+    ``r`` secret for round 2 and publishes the commitment; a nonce must
+    never be reused across messages or sessions, as reuse leaks the secret
+    share.
+    """
+    if not isinstance(signer_id, int):
+        raise TypeError("signer_id must be an integer")
+    _validate_feldman_parameters(prime, group_prime, generator)
+    if not 0 < signer_id < prime:
+        raise ValueError("signer_id must satisfy 1 <= signer_id <= prime - 1")
+    nonce = randbelow(prime - 1) + 1
+    return nonce, NonceCommitment(
+        signer_id=signer_id, value=pow(generator, nonce, group_prime)
+    )
+
+
+def _combine_nonce_values(
+    materialised: list[NonceCommitment], group_prime: int
+) -> int:
+    """The combined nonce commitment ``R = product(R_i) mod group_prime``."""
+    nonce = 1
+    for commitment in materialised:
+        nonce = nonce * commitment.value % group_prime
+    return nonce
+
+
+def create_signature_share(
+    signer_id: int,
+    message: bytes,
+    *,
+    nonce: int,
+    share: Share,
+    nonce_commitments: Iterable[NonceCommitment],
+    result: SigningDKGResult,
+) -> SignatureShare:
+    """Round 2 of a signing session: compute one signer's signature share.
+
+    ``nonce`` is the signer's secret one-time nonce from
+    :func:`create_nonce_commitment`, ``share`` the signer's aggregated
+    secret share from the DKG result (its ``x`` must equal ``signer_id``),
+    and ``nonce_commitments`` the published commitments of every signer of
+    this session, whose ids must be unique DKG participants numbering at
+    least the threshold. The share is
+    ``z_i = r_i + c * lambda_i * s_i mod field_prime`` with the challenge
+    ``c`` of :func:`_schnorr_challenge` and the Lagrange weight
+    ``lambda_i`` of the signer set at x = 0.
+    """
+    if not isinstance(signer_id, int):
+        raise TypeError("signer_id must be an integer")
+    message = _check_message(message)
+    if not isinstance(nonce, int):
+        raise TypeError("nonce must be an integer")
+    if not isinstance(share, Share):
+        raise TypeError("share must be a Share instance")
+    field_prime, group_prime, generator, threshold, participant_ids = (
+        _check_signing_result(result)
+    )
+    if not 0 < signer_id < field_prime:
+        raise ValueError("signer_id must satisfy 1 <= signer_id <= field_prime - 1")
+    if not 0 < nonce < field_prime:
+        raise ValueError("nonce must satisfy 1 <= nonce <= field_prime - 1")
+    if share.x != signer_id:
+        raise ValueError("share must be the signer's own aggregated share")
+    if not 0 <= share.y < field_prime:
+        raise ValueError("share value must satisfy 0 <= y < field_prime")
+
+    commitments = list(nonce_commitments)
+    signer_ids = _check_nonce_commitments(
+        commitments,
+        field_prime=field_prime,
+        group_prime=group_prime,
+        threshold=threshold,
+        participant_ids=participant_ids,
+    )
+    if signer_id not in signer_ids:
+        raise ValueError("signer must publish a nonce commitment for this session")
+    own = next(c for c in commitments if c.signer_id == signer_id)
+    if pow(generator, nonce, group_prime) != own.value:
+        raise ValueError("nonce does not match the signer's published commitment")
+
+    combined_nonce = _combine_nonce_values(commitments, group_prime)
+    challenge = _schnorr_challenge(
+        message,
+        result.public_key,
+        combined_nonce,
+        signer_ids,
+        field_prime=field_prime,
+        group_prime=group_prime,
+    )
+    weight = _lagrange_weight(signer_ids, signer_ids.index(signer_id), field_prime)
+    return SignatureShare(
+        signer_id=signer_id,
+        value=(nonce + challenge * weight * share.y) % field_prime,
+    )
+
+
+def _signature_share_matches(
+    value: int,
+    nonce_value: int,
+    verification_share: int,
+    weight: int,
+    challenge: int,
+    *,
+    field_prime: int,
+    group_prime: int,
+    generator: int,
+) -> bool:
+    """The share equation ``g ** z_i == R_i * Y_i ** (c * lambda_i) mod group_prime``."""
+    expected = (
+        nonce_value
+        * pow(verification_share, weight * challenge % field_prime, group_prime)
+        % group_prime
+    )
+    return pow(generator, value, group_prime) == expected
+
+
+def verify_signature_share(
+    share: SignatureShare,
+    message: bytes,
+    *,
+    nonce_commitments: Iterable[NonceCommitment],
+    result: SigningDKGResult,
+) -> bool:
+    """Check one signature share against the session's public material.
+
+    Verifies ``g ** z_i == R_i * Y_i ** (c * lambda_i) mod group_prime``
+    using the signer's nonce commitment ``R_i``, the signer's verification
+    share ``Y_i`` from the DKG result and the session challenge ``c``.
+    Returns ``True`` on a match and ``False`` for a well-formed share that
+    was tampered with or belongs to a different message or session.
+    Malformed arguments raise TypeError/ValueError; a share whose signer
+    published no nonce commitment raises ValueError.
+    """
+    if not isinstance(share, SignatureShare):
+        raise TypeError("share must be a SignatureShare instance")
+    if not isinstance(share.signer_id, int):
+        raise TypeError("signer_id must be an integer")
+    if not isinstance(share.value, int):
+        raise TypeError("share value must be an integer")
+    message = _check_message(message)
+    field_prime, group_prime, generator, threshold, participant_ids = (
+        _check_signing_result(result)
+    )
+    commitments = list(nonce_commitments)
+    signer_ids = _check_nonce_commitments(
+        commitments,
+        field_prime=field_prime,
+        group_prime=group_prime,
+        threshold=threshold,
+        participant_ids=participant_ids,
+    )
+    if not 0 <= share.value < field_prime:
+        raise ValueError("share value must satisfy 0 <= z < field_prime")
+    if share.signer_id not in signer_ids:
+        raise ValueError("share does not belong to a signer of this session")
+
+    combined_nonce = _combine_nonce_values(commitments, group_prime)
+    challenge = _schnorr_challenge(
+        message,
+        result.public_key,
+        combined_nonce,
+        signer_ids,
+        field_prime=field_prime,
+        group_prime=group_prime,
+    )
+    position = signer_ids.index(share.signer_id)
+    weight = _lagrange_weight(signer_ids, position, field_prime)
+    own = next(c for c in commitments if c.signer_id == share.signer_id)
+    verification_share = result.verification_shares[
+        participant_ids.index(share.signer_id)
+    ]
+    return _signature_share_matches(
+        share.value,
+        own.value,
+        verification_share,
+        weight,
+        challenge,
+        field_prime=field_prime,
+        group_prime=group_prime,
+        generator=generator,
+    )
+
+
+def aggregate_signatures(
+    shares: Iterable[SignatureShare],
+    message: bytes,
+    *,
+    nonce_commitments: Iterable[NonceCommitment],
+    result: SigningDKGResult,
+) -> Signature | list[SigningRejection]:
+    """Combine one verified signature share per signer into the signature.
+
+    Every signer of the session (named by the nonce commitments) must
+    provide exactly one share; duplicate or missing signers raise
+    ValueError, as do illegal values or session parameters, while wrong
+    types raise TypeError. Each share is verified as in
+    :func:`verify_signature_share` and failures are never dropped: if any
+    share does not verify, the result is a list of :class:`SigningRejection`
+    naming every signer whose share failed, sorted by ``signer_id``
+    regardless of the input order.
+
+    On success returns the :class:`Signature` with the strictly increasing
+    signer ids, the combined nonce commitment ``R = product(R_i)`` and the
+    combined response ``z = sum(z_i) mod field_prime``.
+    """
+    materialised = list(shares)
+    for share in materialised:
+        if not isinstance(share, SignatureShare):
+            raise TypeError("shares must be SignatureShare instances")
+        if not isinstance(share.signer_id, int):
+            raise TypeError("signer_id must be an integer")
+        if not isinstance(share.value, int):
+            raise TypeError("share value must be an integer")
+    message = _check_message(message)
+    field_prime, group_prime, generator, threshold, participant_ids = (
+        _check_signing_result(result)
+    )
+    commitments = list(nonce_commitments)
+    signer_ids = _check_nonce_commitments(
+        commitments,
+        field_prime=field_prime,
+        group_prime=group_prime,
+        threshold=threshold,
+        participant_ids=participant_ids,
+    )
+    share_signer_ids = [share.signer_id for share in materialised]
+    if len(set(share_signer_ids)) != len(share_signer_ids):
+        raise ValueError("duplicate signature share from the same signer")
+    if set(share_signer_ids) != set(signer_ids):
+        raise ValueError("each signer must provide exactly one signature share")
+    for share in materialised:
+        if not 0 <= share.value < field_prime:
+            raise ValueError("share value must satisfy 0 <= z < field_prime")
+
+    combined_nonce = _combine_nonce_values(commitments, group_prime)
+    challenge = _schnorr_challenge(
+        message,
+        result.public_key,
+        combined_nonce,
+        signer_ids,
+        field_prime=field_prime,
+        group_prime=group_prime,
+    )
+    rejections = []
+    for position, signer_id in enumerate(signer_ids):
+        share = next(s for s in materialised if s.signer_id == signer_id)
+        own = next(c for c in commitments if c.signer_id == signer_id)
+        verification_share = result.verification_shares[
+            participant_ids.index(signer_id)
+        ]
+        weight = _lagrange_weight(signer_ids, position, field_prime)
+        if not _signature_share_matches(
+            share.value,
+            own.value,
+            verification_share,
+            weight,
+            challenge,
+            field_prime=field_prime,
+            group_prime=group_prime,
+            generator=generator,
+        ):
+            rejections.append(SigningRejection(signer_id=signer_id))
+    if rejections:
+        return rejections
+
+    value = sum(share.value for share in materialised) % field_prime
+    return Signature(signer_ids=signer_ids, nonce=combined_nonce, value=value)
+
+
+def verify_signature(
+    signature: Signature,
+    message: bytes,
+    *,
+    public_key: int,
+    group_prime: int,
+    generator: int,
+    prime: int = DEFAULT_PRIME,
+) -> bool:
+    """Verify an aggregated threshold Schnorr signature against the joint key.
+
+    Recomputes the challenge ``c`` from the message, ``public_key`` (``Y``),
+    the signature's combined nonce ``R`` and its signer ids, and checks
+    ``g ** z == R * Y ** c mod group_prime``. Returns ``True`` on a match
+    and ``False`` for a well-formed signature that does not match the
+    message or key; malformed arguments raise TypeError/ValueError.
+    """
+    if not isinstance(signature, Signature):
+        raise TypeError("signature must be a Signature instance")
+    message = _check_message(message)
+    if not isinstance(signature.signer_ids, tuple):
+        raise TypeError("signer_ids must be a tuple")
+    for signer_id in signature.signer_ids:
+        if not isinstance(signer_id, int):
+            raise TypeError("signer ids must be integers")
+    for name, value in (
+        ("nonce", signature.nonce),
+        ("value", signature.value),
+        ("public_key", public_key),
+    ):
+        if not isinstance(value, int):
+            raise TypeError(f"{name} must be an integer")
+
+    _validate_feldman_parameters(prime, group_prime, generator)
+
+    signer_ids = signature.signer_ids
+    if not signer_ids:
+        raise ValueError("at least one signer id is required")
+    if any(signer_ids[index] >= signer_ids[index + 1] for index in range(len(signer_ids) - 1)):
+        raise ValueError("signer ids must be strictly increasing and unique")
+    for signer_id in signer_ids:
+        if not 0 < signer_id < prime:
+            raise ValueError("signer ids must satisfy 1 <= id <= prime - 1")
+    if not 0 <= signature.value < prime:
+        raise ValueError("signature value must satisfy 0 <= z < prime")
+    for name, element in (("nonce", signature.nonce), ("public_key", public_key)):
+        if not 0 < element < group_prime or pow(element, prime, group_prime) != 1:
+            raise ValueError(f"{name} must lie in the order-prime subgroup")
+
+    challenge = _schnorr_challenge(
+        message,
+        public_key,
+        signature.nonce,
+        signer_ids,
+        field_prime=prime,
+        group_prime=group_prime,
+    )
+    expected = signature.nonce * pow(public_key, challenge, group_prime) % group_prime
+    return pow(generator, signature.value, group_prime) == expected

@@ -1,6 +1,6 @@
 # thresholdsign
 
-有限域上的 Shamir 秘密共享。把一份秘密拆成 `share_count` 份，任意 `threshold` 份可重建，少于 `threshold` 份得不到关于秘密的信息。支持 Feldman 与 Pedersen 可验证秘密共享（VSS）：接收者可凭承诺公开验证自己的份额是否落在分发多项式上，而无需信任分发者；Pedersen 承诺还对秘密本身信息论保密。在此之上还提供单轮 Pedersen 分布式密钥生成（DKG）：多名参与者各自贡献随机性，联合生成无人知晓完整秘密的共享密钥。
+有限域上的 Shamir 秘密共享。把一份秘密拆成 `share_count` 份，任意 `threshold` 份可重建，少于 `threshold` 份得不到关于秘密的信息。支持 Feldman 与 Pedersen 可验证秘密共享（VSS）：接收者可凭承诺公开验证自己的份额是否落在分发多项式上，而无需信任分发者；Pedersen 承诺还对秘密本身信息论保密。在此之上还提供单轮 Pedersen 分布式密钥生成（DKG）：多名参与者各自贡献随机性，联合生成无人知晓完整秘密的共享密钥；以及构建在 DKG 之上的两轮门限 Schnorr 签名：任意不少于 `threshold` 名参与者可联合对消息签名，签名可用联合公钥验证。
 
 ## 环境
 
@@ -90,6 +90,75 @@ else:
 不影响结果；每名参与者必须恰好贡献一份且参数一致，缺失、重复或参数不一致抛
 `ValueError`，验证不通过的贡献以 `DKGRejection` 逐个列出，不会被静默忽略。
 
+### 两轮门限 Schnorr 签名
+
+在 DKG 之上，任意不少于 `threshold` 名参与者可以两轮交互对一条消息联合签名：
+密钥生成阶段每人创建签名贡献（原 Pedersen 贡献外加对**同一**秘密多项式的
+Feldman 承诺），聚合后得到联合公钥 `Y` 与每人的验证份额 `Y_i`；签名阶段第一轮
+每人抽取一次性非零随机数 `r_i` 并发布 `R_i = g ** r_i`，第二轮各自计算并发布
+签名份额 `z_i = r_i + c * λ_i * s_i mod q`（`λ_i` 为签名者集合在 `x = 0` 处的
+拉格朗日权重），任何人可公开验证每份份额并聚合成签名 `(R, z)`，最终用联合公钥
+验签 `g ** z == R * Y ** c`。
+
+```python
+from thresholdsign import (
+    Signature, SigningDKGResult,
+    aggregate_signatures, aggregate_signing_dkg,
+    create_nonce_commitment, create_signature_share, create_signing_contribution,
+    verify_signature,
+)
+
+participant_ids = (1, 2, 3)
+contributions = [
+    create_signing_contribution(
+        pid, participant_ids, 2,
+        prime=2017, group_prime=8069, generator=16, blinding_generator=256,
+    )
+    for pid in participant_ids
+]
+outcome = aggregate_signing_dkg(contributions)
+assert isinstance(outcome, SigningDKGResult)
+Y = outcome.public_key                      # 联合公钥
+# outcome.verification_shares[i] 是 participant_ids[i] 的验证份额 Y_i
+
+message = b"hello"
+signer_ids = (1, 3)                         # 任意不少于 threshold 名参与者
+# 第一轮：各自抽取一次性随机数并公开承诺（随机数绝不复用）
+nonces, commitments = {}, []
+for sid in signer_ids:
+    r_i, R_i = create_nonce_commitment(
+        sid, prime=2017, group_prime=8069, generator=16
+    )
+    nonces[sid] = r_i                       # r_i 保密，仅用于第二轮
+    commitments.append(R_i)                 # R_i 公开
+# 第二轮：各自用聚合秘密份额计算签名份额
+shares = [
+    create_signature_share(
+        sid, message, nonce=nonces[sid],
+        share=outcome.dkg_result.shares[outcome.dkg_result.participant_ids.index(sid)],
+        nonce_commitments=commitments, result=outcome,
+    )
+    for sid in signer_ids
+]
+signature = aggregate_signatures(
+    shares, message, nonce_commitments=commitments, result=outcome
+)
+if isinstance(signature, Signature):
+    assert verify_signature(
+        signature, message, public_key=Y,
+        prime=2017, group_prime=8069, generator=16,
+    )
+else:
+    # 验证失败的签名份额：list[SigningRejection]，按 signer_id 定位
+    ...
+```
+
+挑战值 `c` 由标签 `b"thresholdsign/schnorr/v1"`、消息的 SHA-256 摘要以及 `Y`、`R`、
+各签名者编号的 `L` 字节无符号大端编码（`L = ceil(group_prime.bit_length() / 8)`）
+依次连接后再取 SHA-256，摘要按大端转整数模 `field_prime` 得到。每份签名份额按
+`g ** z_i == R_i * Y_i ** (c * λ_i)` 校验，篡改、跨消息/跨轮次或承诺错配的份额在
+聚合时按 `signer_id` 排序逐个拒绝，绝不忽略且与输入顺序无关；最终验签对结构合法
+但不匹配的签名返回 `False`。`threshold = 1` 时即退化为单人 Schnorr 签名。
 
 ## 命令行演示
 
@@ -147,6 +216,43 @@ python3 -m thresholdsign
   忽略）；类型错误抛 `TypeError`，缺失或重复参与者、非法编号或承诺、参数不一致抛
   `ValueError`；任意 `threshold` 名接收者可用聚合份额经 `reconstruct_secret` 重建联合
   秘密
+- `SigningContribution(dkg_contribution, feldman_commitment)` — 冻结数据类；签名用途的
+  DKG 贡献：`dkg_contribution` 是原 Pedersen 贡献，`feldman_commitment` 是对**同一**
+  秘密多项式的 Feldman 承诺，秘密与系数均不出现
+- `SigningDKGResult(dkg_result, public_key, verification_shares)` — 冻结数据类；签名
+  DKG 聚合结果：原 `DKGResult`、联合公钥 `Y`（各贡献 Feldman 常数项承诺之积）与每个
+  参与者编号的验证份额 `Y_i`（各 Feldman 承诺在该编号处的求值之积），不含联合秘密
+- `create_signing_contribution(sender_id, participant_ids, threshold, *, group_prime, generator, blinding_generator, prime=DEFAULT_PRIME, randbelow=secrets.randbelow)`
+  — 参数与校验同 `create_dkg_contribution`，返回原 Pedersen 贡献及对同一秘密多项式的
+  Feldman 承诺
+- `aggregate_signing_dkg(contributions)` — 沿用 `aggregate_dkg` 的全部校验，并额外校验
+  每份 Feldman 承诺的参数、门限一致性及其与份额的匹配；全部通过返回
+  `SigningDKGResult`，否则返回 `list[DKGRejection]`（按 `sender_id` 排序，与输入顺序
+  无关）
+- `NonceCommitment(signer_id, value)` — 冻结数据类；签名第一轮的随机数承诺
+  `value = R_i = generator ** r_i mod group_prime`，随机数 `r_i` 本身不在对象中
+- `create_nonce_commitment(signer_id, *, group_prime, generator, prime=DEFAULT_PRIME, randbelow=secrets.randbelow)`
+  — 返回 `(r_i, NonceCommitment)`：`r_i` 由可注入的 `randbelow` 抽取的一次性非零随机数
+  （均匀分布于 `1..prime-1`），务必保密且绝不跨消息/跨会话复用；`R_i` 公开发布
+- `SignatureShare(signer_id, value)` — 冻结数据类；签名第二轮的签名份额 `z_i`
+- `create_signature_share(signer_id, message, *, nonce, share, nonce_commitments, result)`
+  — 用自己的一次性随机数 `nonce`、聚合秘密份额 `share`（其 `x` 必须等于 `signer_id`）
+  和本轮全部随机数承诺计算 `z_i = r_i + c * λ_i * s_i mod field_prime`；签名者编号必须
+  唯一、为 DKG 参与者且不少于 `threshold`，否则抛 `ValueError`
+- `verify_signature_share(share, message, *, nonce_commitments, result)` — 校验
+  `g ** z_i == R_i * Y_i ** (c * λ_i) mod group_prime`；匹配返回 `True`，合法但被篡改
+  或跨消息/轮次的份额返回 `False`；非法输入抛 `TypeError`/`ValueError`
+- `SigningRejection(signer_id)` — 冻结数据类；验证失败的签名份额，按签名者编号定位
+- `Signature(signer_ids, nonce, value)` — 冻结数据类；聚合签名：`signer_ids` 严格递增，
+  `nonce` 为组合承诺 `R = ∏ R_i`，`value` 为组合响应 `z = Σ z_i mod field_prime`
+- `aggregate_signatures(shares, message, *, nonce_commitments, result)` — 校验并聚合本轮
+  全部签名份额：每名签名者必须恰好提交一份，重复或缺失抛 `ValueError`；全部验证通过
+  返回 `Signature`，否则返回 `list[SigningRejection]`（按 `signer_id` 排序，绝不静默
+  忽略）；同一签名会话中随机数承诺重复（随机数复用）或为单位元（零随机数）抛
+  `ValueError`
+- `verify_signature(signature, message, *, public_key, group_prime, generator, prime=DEFAULT_PRIME)`
+  — 重算挑战 `c` 并校验 `g ** z == R * Y ** c mod group_prime`；匹配返回 `True`，结构
+  合法但不匹配返回 `False`，非法输入抛 `TypeError`/`ValueError`
 
 ### 群参数约束
 
@@ -168,7 +274,11 @@ Feldman 方案对秘密不保信息论安全（常数项承诺 `C_0 = generator 
 单轮 Pedersen DKG 消除了"分发者知道完整秘密"这一点：联合秘密是各参与者随机常数
 项之和，任何一方都无从得知。但 DKG 只覆盖密钥生成的一轮计算——贡献的网络传输、
 广播信道的可靠性与一致性、参与者身份认证（签名）、状态持久化都不在此实现，需要
-调用方在已认证的通道上交换贡献；它也没有门限签名、份额轮换或重共享能力。
+调用方在已认证的通道上交换贡献；它也没有份额轮换或重共享能力。两轮门限 Schnorr
+签名在 DKG 之上提供联合签名能力，但同样不含网络、认证、存储与重放防护：随机数
+`r_i` 的一次性由调用方保证（复用同一随机数会泄露秘密份额，本实现只能在同一会话
+内检出重复的承诺值），签名会话与消息、轮次的绑定完全依赖挑战值中的哈希，跨会话
+的重放需要调用方自行防护。
 
 ## 测试
 
