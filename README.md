@@ -1,6 +1,6 @@
 # thresholdsign
 
-有限域上的 Shamir 秘密共享。把一份秘密拆成 `share_count` 份，任意 `threshold` 份可重建，少于 `threshold` 份得不到关于秘密的信息。支持 Feldman 与 Pedersen 可验证秘密共享（VSS）：接收者可凭承诺公开验证自己的份额是否落在分发多项式上，而无需信任分发者；Pedersen 承诺还对秘密本身信息论保密。
+有限域上的 Shamir 秘密共享。把一份秘密拆成 `share_count` 份，任意 `threshold` 份可重建，少于 `threshold` 份得不到关于秘密的信息。支持 Feldman 与 Pedersen 可验证秘密共享（VSS）：接收者可凭承诺公开验证自己的份额是否落在分发多项式上，而无需信任分发者；Pedersen 承诺还对秘密本身信息论保密。在此之上还提供单轮 Pedersen 分布式密钥生成（DKG）：多名参与者各自贡献随机性，联合生成无人知晓完整秘密的共享密钥。
 
 ## 环境
 
@@ -55,6 +55,42 @@ assert all(
 每个接收者拿到一对同坐标份额 `(f(x), g(x))`；份额被篡改、两份额坐标不同或把
 两套拆分交叉组合时，验证返回 `False`。
 
+### 单轮 Pedersen DKG
+
+在 Pedersen VSS 之上，多名已认证参与者可以各自贡献随机性，联合生成无人知晓
+完整秘密的共享密钥（不含网络、广播、持久化或签名，传输与认证由调用方保证）。
+每名参与者用相同的参与者编号集合、`threshold` 和群参数各创建一份贡献，向每个
+编号分发一对双份额并公开 Pedersen 承诺；随后任何人都可以聚合所有贡献：
+
+```python
+from thresholdsign import (
+    DKGResult, aggregate_dkg, create_dkg_contribution, reconstruct_secret,
+)
+
+participant_ids = (1, 2, 3)
+contributions = [
+    create_dkg_contribution(
+        pid, participant_ids, 2,
+        prime=2017, group_prime=8069, generator=16, blinding_generator=256,
+    )
+    for pid in participant_ids
+]
+outcome = aggregate_dkg(contributions)
+if isinstance(outcome, DKGResult):
+    # 联合秘密 = 各参与者随机常数项之和，任何一方都无从得知；
+    # 任意 2 名接收者可用各自的聚合份额重建它
+    assert reconstruct_secret(outcome.shares[:2], prime=2017) == \
+        reconstruct_secret(outcome.shares[1:], prime=2017)
+else:
+    # 验证失败的贡献：list[DKGRejection]，可按 sender_id 定位
+    ...
+```
+
+聚合时双份额按 `field_prime` 逐项相加、承诺按 `group_prime` 逐项相乘，输入顺序
+不影响结果；每名参与者必须恰好贡献一份且参数一致，缺失、重复或参数不一致抛
+`ValueError`，验证不通过的贡献以 `DKGRejection` 逐个列出，不会被静默忽略。
+
+
 ## 命令行演示
 
 ```bash
@@ -89,6 +125,28 @@ python3 -m thresholdsign
   （指数按 `field_prime` 约简）；匹配返回 `True`，份额被篡改、两份额坐标不同或交叉组合
   返回 `False`
 - `reconstruct_secret(shares, *, prime=DEFAULT_PRIME)` — 在 `x = 0` 处做拉格朗日插值
+- `DKGContribution(sender_id, participant_ids, shares, blinding_shares, commitment)`
+  — 冻结数据类；一名参与者的 DKG 贡献：`participant_ids` 严格递增且无重复，
+  `shares[i]` / `blinding_shares[i]` 是发给 `participant_ids[i]` 的双份额，
+  `commitment` 是对发送者随机共享多项式与盲化多项式的 Pedersen 承诺，系数不出现
+- `DKGReceivedShare(sender_id, receiver_id, share, blinding_share)` — 冻结数据类；
+  接收者从贡献中取出的双份额，含收发双方编号
+- `DKGResult(participant_ids, shares, blinding_shares, commitment)` — 冻结数据类；
+  聚合成功结果：每名接收者的聚合双份额、联合承诺与参与者编号，不含联合秘密或系数
+- `DKGRejection(sender_id)` — 冻结数据类；验证失败的贡献，按发送者编号定位
+- `create_dkg_contribution(sender_id, participant_ids, threshold, *, group_prime, generator, blinding_generator, prime=DEFAULT_PRIME, randbelow=secrets.randbelow)`
+  — 为每名参与者编号生成双份额并返回贡献；编号限 `1..prime-1` 且唯一，发送者必须是
+  参与者之一；共享与盲化多项式的全部系数（各 `threshold` 个）都由 `randbelow` 抽取，
+  确定性随机源产生全零贡献也是合法的
+- `verify_dkg_received_share(received, commitment)` — 沿用 Pedersen 校验接收份额：
+  匹配返回 `True`，合法篡改或坐标与 `receiver_id` 错配返回 `False`；非法编号、坐标或
+  承诺抛 `TypeError`/`ValueError`
+- `aggregate_dkg(contributions)` — 聚合每名参与者恰好一份且参数一致的贡献：双份额按
+  `field_prime` 相加、承诺按 `group_prime` 逐项相乘，输入顺序不影响结果；全部验证通过
+  返回 `DKGResult`，否则返回 `list[DKGRejection]`（每个验证失败的发送者一条，绝不静默
+  忽略）；类型错误抛 `TypeError`，缺失或重复参与者、非法编号或承诺、参数不一致抛
+  `ValueError`；任意 `threshold` 名接收者可用聚合份额经 `reconstruct_secret` 重建联合
+  秘密
 
 ### 群参数约束
 
@@ -107,8 +165,10 @@ Feldman 方案对秘密不保信息论安全（常数项承诺 `C_0 = generator 
 字典攻击），也不能识别分发者在重建阶段提交的错误份额以外的恶意行为。Pedersen 方案
 在同一验证能力之上额外隐藏常数项：`C_0 = g ** secret * h ** b_0` 对秘密信息论保密，
 可抵抗离线字典攻击，但代价是每个接收者要保存一对份额，且分发者仍知道完整秘密。
-两种方案都没有分布式密钥生成的交互轮次（多方各自贡献随机性、无人知道完整秘密的
-DKG 流程不在此实现），也没有门限签名、份额轮换或重共享能力。
+单轮 Pedersen DKG 消除了"分发者知道完整秘密"这一点：联合秘密是各参与者随机常数
+项之和，任何一方都无从得知。但 DKG 只覆盖密钥生成的一轮计算——贡献的网络传输、
+广播信道的可靠性与一致性、参与者身份认证（签名）、状态持久化都不在此实现，需要
+调用方在已认证的通道上交换贡献；它也没有门限签名、份额轮换或重共享能力。
 
 ## 测试
 

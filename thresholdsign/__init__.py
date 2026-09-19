@@ -2,7 +2,10 @@
 
 Public API: Share / FeldmanCommitment / PedersenCommitment / split_secret /
 split_secret_verifiable / split_secret_pedersen / verify_share /
-verify_pedersen_share / reconstruct_secret / evaluate_polynomial.
+verify_pedersen_share / reconstruct_secret / evaluate_polynomial, plus the
+single-round Pedersen DKG: DKGContribution / DKGReceivedShare / DKGResult /
+DKGRejection / create_dkg_contribution / verify_dkg_received_share /
+aggregate_dkg.
 """
 
 from __future__ import annotations
@@ -23,6 +26,13 @@ __all__ = [
     "verify_share",
     "verify_pedersen_share",
     "reconstruct_secret",
+    "DKGContribution",
+    "DKGReceivedShare",
+    "DKGResult",
+    "DKGRejection",
+    "create_dkg_contribution",
+    "verify_dkg_received_share",
+    "aggregate_dkg",
 ]
 
 # Mersenne prime 2**127 - 1: large enough for integer secrets, small enough that
@@ -483,3 +493,344 @@ def reconstruct_secret(shares: Iterable[Share], *, prime: int = DEFAULT_PRIME) -
             denominator = denominator * (share.x - other.x) % prime
         secret = (secret + share.y * numerator * pow(denominator, -1, prime)) % prime
     return secret
+
+
+@dataclass(frozen=True)
+class DKGReceivedShare:
+    """The double share one DKG participant receives from one sender.
+
+    ``sender_id`` names the contribution the share came from and
+    ``receiver_id`` the participant it is addressed to. Both share
+    coordinates must equal ``receiver_id`` for the share to verify.
+    """
+
+    sender_id: int
+    receiver_id: int
+    share: Share
+    blinding_share: Share
+
+
+@dataclass(frozen=True)
+class DKGContribution:
+    """One participant's single-round Pedersen DKG contribution.
+
+    ``participant_ids`` is the strictly increasing, duplicate-free tuple of
+    every participant's id. ``shares`` and ``blinding_shares`` hold the
+    double share addressed to each participant: position ``i`` belongs to
+    ``participant_ids[i]`` and both coordinates equal it. ``commitment``
+    commits to the sender's random sharing and blinding polynomials; the
+    secret coefficients themselves never appear in the object.
+    """
+
+    sender_id: int
+    participant_ids: tuple[int, ...]
+    shares: tuple[Share, ...]
+    blinding_shares: tuple[Share, ...]
+    commitment: PedersenCommitment
+
+
+@dataclass(frozen=True)
+class DKGResult:
+    """Successful DKG aggregation: summed double shares and the joint commitment.
+
+    ``shares`` / ``blinding_shares`` hold, for each position of
+    ``participant_ids``, the sum of every contribution's double share for
+    that receiver; ``commitment`` is the componentwise product of the
+    individual Pedersen commitments. Neither the joint secret nor any
+    polynomial coefficient is stored: no party ever learns them.
+    """
+
+    participant_ids: tuple[int, ...]
+    shares: tuple[Share, ...]
+    blinding_shares: tuple[Share, ...]
+    commitment: PedersenCommitment
+
+
+@dataclass(frozen=True)
+class DKGRejection:
+    """A contribution that failed verification, identified by its sender."""
+
+    sender_id: int
+
+
+def create_dkg_contribution(
+    sender_id: int,
+    participant_ids: Iterable[int],
+    threshold: int,
+    *,
+    group_prime: int,
+    generator: int,
+    blinding_generator: int,
+    prime: int = DEFAULT_PRIME,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> DKGContribution:
+    """Create one participant's contribution to a single-round Pedersen DKG.
+
+    Every participant runs this once with the same ``participant_ids``,
+    ``threshold`` and group parameters. The sender draws a random sharing
+    polynomial and a random blinding polynomial (``threshold`` coefficients
+    each, all from ``randbelow``; a deterministic source may legitimately
+    produce an all-zero contribution), commits to both with a Pedersen
+    commitment, and evaluates a double share for each participant id. Ids
+    must satisfy ``1 <= id <= prime - 1``, must be unique, and the sender
+    must be one of the participants. The joint secret is the sum of all
+    participants' random constant terms, so nobody ever knows it.
+    """
+    if not isinstance(sender_id, int):
+        raise TypeError("sender_id must be an integer")
+    if not isinstance(threshold, int):
+        raise TypeError("threshold must be an integer")
+    ids = list(participant_ids)
+    for participant_id in ids:
+        if not isinstance(participant_id, int):
+            raise TypeError("participant ids must be integers")
+
+    _validate_feldman_parameters(prime, group_prime, generator, blinding_generator)
+
+    if not ids:
+        raise ValueError("at least one participant id is required")
+    if len(set(ids)) != len(ids):
+        raise ValueError("participant ids must be unique")
+    for participant_id in ids:
+        if not 0 < participant_id < prime:
+            raise ValueError("participant ids must satisfy 1 <= id <= prime - 1")
+    if sender_id not in ids:
+        raise ValueError("sender_id must be one of the participant ids")
+    if threshold < 1:
+        raise ValueError("threshold must be at least 1")
+    if threshold > len(ids):
+        raise ValueError("threshold must not exceed the number of participants")
+
+    ordered_ids = tuple(sorted(ids))
+    coefficients = [randbelow(prime) for _ in range(threshold)]
+    blinding_coefficients = [randbelow(prime) for _ in range(threshold)]
+
+    shares = tuple(
+        Share(
+            x=participant_id,
+            y=evaluate_polynomial(coefficients, participant_id, prime=prime),
+        )
+        for participant_id in ordered_ids
+    )
+    blinding_shares = tuple(
+        Share(
+            x=participant_id,
+            y=evaluate_polynomial(blinding_coefficients, participant_id, prime=prime),
+        )
+        for participant_id in ordered_ids
+    )
+    commitment = PedersenCommitment(
+        values=tuple(
+            pow(generator, coefficient, group_prime)
+            * pow(blinding_generator, blinding, group_prime)
+            % group_prime
+            for coefficient, blinding in zip(coefficients, blinding_coefficients)
+        ),
+        field_prime=prime,
+        group_prime=group_prime,
+        generator=generator,
+        blinding_generator=blinding_generator,
+    )
+    return DKGContribution(
+        sender_id=sender_id,
+        participant_ids=ordered_ids,
+        shares=shares,
+        blinding_shares=blinding_shares,
+        commitment=commitment,
+    )
+
+
+def verify_dkg_received_share(
+    received: DKGReceivedShare, commitment: PedersenCommitment
+) -> bool:
+    """Check a received DKG double share against the sender's Pedersen commitment.
+
+    Reuses the Pedersen check of :func:`verify_pedersen_share`: a match
+    returns ``True``; a well-formed share that was tampered with, or whose
+    coordinates do not name ``receiver_id``, returns ``False``. Illegal ids,
+    coordinates, values or commitments raise TypeError/ValueError.
+    """
+    if not isinstance(received, DKGReceivedShare):
+        raise TypeError("received must be a DKGReceivedShare instance")
+    if not isinstance(commitment, PedersenCommitment):
+        raise TypeError("commitment must be a PedersenCommitment instance")
+    for name, value in (
+        ("sender_id", received.sender_id),
+        ("receiver_id", received.receiver_id),
+    ):
+        if not isinstance(value, int):
+            raise TypeError(f"{name} must be an integer")
+    if not isinstance(received.share, Share):
+        raise TypeError("received.share must be a Share instance")
+    if not isinstance(received.blinding_share, Share):
+        raise TypeError("received.blinding_share must be a Share instance")
+    if not isinstance(commitment.field_prime, int):
+        raise TypeError("field_prime must be an integer")
+
+    field_prime = commitment.field_prime
+    if not 0 < received.sender_id < field_prime:
+        raise ValueError("sender id must satisfy 1 <= sender_id <= field_prime - 1")
+    if not 0 < received.receiver_id < field_prime:
+        raise ValueError("receiver id must satisfy 1 <= receiver_id <= field_prime - 1")
+
+    if not verify_pedersen_share(received.share, received.blinding_share, commitment):
+        return False
+    # Both coordinates must name the addressed receiver (the Pedersen check
+    # already pins the two coordinates to each other).
+    return received.share.x == received.receiver_id
+
+
+def _check_dkg_contribution_types(contribution: DKGContribution) -> None:
+    """Type-check every field of a DKG contribution, raising TypeError."""
+    if not isinstance(contribution.sender_id, int):
+        raise TypeError("sender_id must be an integer")
+    if not isinstance(contribution.participant_ids, tuple):
+        raise TypeError("participant_ids must be a tuple")
+    for participant_id in contribution.participant_ids:
+        if not isinstance(participant_id, int):
+            raise TypeError("participant ids must be integers")
+    for name, shares in (
+        ("shares", contribution.shares),
+        ("blinding_shares", contribution.blinding_shares),
+    ):
+        if not isinstance(shares, tuple):
+            raise TypeError(f"{name} must be a tuple")
+        for share in shares:
+            if not isinstance(share, Share):
+                raise TypeError(f"{name} must contain Share instances")
+    commitment = contribution.commitment
+    if not isinstance(commitment, PedersenCommitment):
+        raise TypeError("commitment must be a PedersenCommitment instance")
+    for name, value in (
+        ("field_prime", commitment.field_prime),
+        ("group_prime", commitment.group_prime),
+        ("generator", commitment.generator),
+        ("blinding_generator", commitment.blinding_generator),
+    ):
+        if not isinstance(value, int):
+            raise TypeError(f"{name} must be an integer")
+    if not isinstance(commitment.values, tuple):
+        raise TypeError("commitment values must be a tuple")
+
+
+def _check_dkg_contribution_structure(contribution: DKGContribution) -> None:
+    """Validate the ids, lengths and threshold of one contribution (ValueError)."""
+    ids = contribution.participant_ids
+    if not ids:
+        raise ValueError("participant ids must not be empty")
+    if any(ids[index] >= ids[index + 1] for index in range(len(ids) - 1)):
+        raise ValueError("participant ids must be strictly increasing and unique")
+    field_prime = contribution.commitment.field_prime
+    for participant_id in ids:
+        if not 0 < participant_id < field_prime:
+            raise ValueError("participant ids must satisfy 1 <= id <= field_prime - 1")
+    if contribution.sender_id not in ids:
+        raise ValueError("sender_id must be one of the participant ids")
+    if not len(contribution.shares) == len(contribution.blinding_shares) == len(ids):
+        raise ValueError("each participant id must have exactly one double share")
+    if not 1 <= len(contribution.commitment.values) <= len(ids):
+        raise ValueError("threshold must satisfy 1 <= threshold <= participant count")
+
+
+def aggregate_dkg(
+    contributions: Iterable[DKGContribution],
+) -> DKGResult | list[DKGRejection]:
+    """Combine one verified contribution per participant into the joint key material.
+
+    Every participant must contribute exactly once, and all contributions
+    must agree on the participant ids, the threshold and the group
+    parameters. Missing or duplicate participants, illegal ids or
+    commitments, and inconsistent parameters raise ValueError; wrong types
+    raise TypeError. Each double share is verified against its sender's
+    commitment and failures are never dropped: if any contribution does not
+    verify, the result is a list of :class:`DKGRejection` naming every
+    sender whose contribution failed.
+
+    On success the double shares of all contributions are added modulo
+    ``field_prime`` and the commitments are multiplied componentwise modulo
+    ``group_prime``, so the input order does not affect the result. Any
+    ``threshold`` receivers can rebuild the joint secret from their
+    aggregated shares with :func:`reconstruct_secret`, yet no single party
+    ever learns it.
+    """
+    materialised = list(contributions)
+    if not materialised:
+        raise ValueError("at least one contribution is required")
+    for contribution in materialised:
+        if not isinstance(contribution, DKGContribution):
+            raise TypeError("contributions must be DKGContribution instances")
+        _check_dkg_contribution_types(contribution)
+
+    first = materialised[0]
+    participant_ids = first.participant_ids
+    first_commitment = first.commitment
+    threshold = len(first_commitment.values)
+    for contribution in materialised:
+        _check_dkg_contribution_structure(contribution)
+        commitment = contribution.commitment
+        if contribution.participant_ids != participant_ids:
+            raise ValueError("contributions must agree on the same participant ids")
+        if (
+            commitment.field_prime != first_commitment.field_prime
+            or commitment.group_prime != first_commitment.group_prime
+            or commitment.generator != first_commitment.generator
+            or commitment.blinding_generator != first_commitment.blinding_generator
+        ):
+            raise ValueError("contributions must share the same group parameters")
+        if len(commitment.values) != threshold:
+            raise ValueError("contributions must share the same threshold")
+
+    sender_ids = [contribution.sender_id for contribution in materialised]
+    if len(set(sender_ids)) != len(sender_ids):
+        raise ValueError("duplicate contribution from the same participant")
+    if set(sender_ids) != set(participant_ids):
+        raise ValueError("each participant must contribute exactly once")
+
+    # Sort by sender so the input order cannot influence the outcome.
+    ordered = sorted(materialised, key=lambda contribution: contribution.sender_id)
+
+    rejections = []
+    for contribution in ordered:
+        for index, receiver_id in enumerate(contribution.participant_ids):
+            received = DKGReceivedShare(
+                sender_id=contribution.sender_id,
+                receiver_id=receiver_id,
+                share=contribution.shares[index],
+                blinding_share=contribution.blinding_shares[index],
+            )
+            if not verify_dkg_received_share(received, contribution.commitment):
+                rejections.append(DKGRejection(sender_id=contribution.sender_id))
+                break
+    if rejections:
+        return rejections
+
+    field_prime = first_commitment.field_prime
+    group_prime = first_commitment.group_prime
+    shares = []
+    blinding_shares = []
+    for index, receiver_id in enumerate(participant_ids):
+        y = 0
+        y_blinding = 0
+        for contribution in ordered:
+            y = (y + contribution.shares[index].y) % field_prime
+            y_blinding = (y_blinding + contribution.blinding_shares[index].y) % field_prime
+        shares.append(Share(x=receiver_id, y=y))
+        blinding_shares.append(Share(x=receiver_id, y=y_blinding))
+    joint_values = []
+    for position in range(threshold):
+        value = 1
+        for contribution in ordered:
+            value = value * contribution.commitment.values[position] % group_prime
+        joint_values.append(value)
+    return DKGResult(
+        participant_ids=participant_ids,
+        shares=tuple(shares),
+        blinding_shares=tuple(blinding_shares),
+        commitment=PedersenCommitment(
+            values=tuple(joint_values),
+            field_prime=field_prime,
+            group_prime=group_prime,
+            generator=first_commitment.generator,
+            blinding_generator=first_commitment.blinding_generator,
+        ),
+    )
