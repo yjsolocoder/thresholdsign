@@ -5,11 +5,21 @@ from __future__ import annotations
 from itertools import combinations
 
 from . import (
+    AggregateSignature,
     DKGResult,
+    SigningDKGResult,
     aggregate_dkg,
+    aggregate_signature,
+    aggregate_signing_dkg,
     create_dkg_contribution,
+    create_signature_share,
+    create_signing_contribution,
+    create_signing_nonce_commitment,
+    create_signing_round,
     reconstruct_secret,
     split_secret,
+    verify_signature,
+    verify_signature_share,
 )
 
 SECRET = 0x5EC12E7
@@ -82,6 +92,86 @@ def main() -> int:
         print("  (no single participant ever knew it)")
     else:
         print(f"  rejected contributions from: {[r.sender_id for r in outcome]}")
+
+    print()
+    print(
+        f"threshold Schnorr signing on the same {len(DKG_PARTICIPANT_IDS)} "
+        f"participants, threshold {DKG_THRESHOLD}"
+    )
+    signing_contributions = [
+        create_signing_contribution(
+            participant_id,
+            DKG_PARTICIPANT_IDS,
+            DKG_THRESHOLD,
+            prime=DKG_FIELD_PRIME,
+            group_prime=DKG_GROUP_PRIME,
+            generator=DKG_GENERATOR,
+            blinding_generator=DKG_BLINDING_GENERATOR,
+        )
+        for participant_id in DKG_PARTICIPANT_IDS
+    ]
+    signing_outcome = aggregate_signing_dkg(signing_contributions)
+    if not isinstance(signing_outcome, SigningDKGResult):
+        print(f"  rejected contributions from: {signing_outcome}")
+        return 0
+    print(f"  joint public key Y={signing_outcome.public_key}")
+    print(f"  verification shares Y_i={list(signing_outcome.verification_shares)}")
+
+    # Any threshold participants sign; each keeps its own one-off nonce.
+    signer_ids = tuple(DKG_PARTICIPANT_IDS[:DKG_THRESHOLD])
+    message = b"thresholdsign demo message"
+    nonce_commitments = []
+    nonces = {}
+    for index, participant_id in enumerate(signer_ids, start=1):
+        commitment, nonce = create_signing_nonce_commitment(
+            participant_id,
+            prime=DKG_FIELD_PRIME,
+            group_prime=DKG_GROUP_PRIME,
+            generator=DKG_GENERATOR,
+            randbelow=lambda upper, seed=index: (
+                seed * 7919 + 17
+            ) % (upper - 1),
+        )
+        nonce_commitments.append(commitment)
+        nonces[participant_id] = nonce
+    round_info = create_signing_round(
+        message, signer_ids, nonce_commitments, signing_outcome
+    )
+    print(f"  round R={round_info.R}  challenge c={round_info.challenge}")
+
+    signature_shares = []
+    for participant_id in signer_ids:
+        position = signing_outcome.result.participant_ids.index(participant_id)
+        secret_share = signing_outcome.result.shares[position].y
+        share = create_signature_share(
+            participant_id, secret_share, nonces[participant_id],
+            round_info, signing_outcome,
+        )
+        signature_shares.append(share)
+        print(
+            f"  signer {participant_id}: z_i={share.z}  "
+            f"share_verifies={verify_signature_share(share, round_info, signing_outcome)}"
+        )
+
+    signature = aggregate_signature(signature_shares, round_info, signing_outcome)
+    if isinstance(signature, AggregateSignature):
+        print(f"  aggregate z={signature.z}")
+        valid = verify_signature(
+            message,
+            signature,
+            signing_outcome.public_key,
+            prime=DKG_FIELD_PRIME,
+            group_prime=DKG_GROUP_PRIME,
+            generator=DKG_GENERATOR,
+        )
+        print(f"  g^z == R * Y^c -> {valid}")
+        tampered = bytes([message[0] ^ 1]) + message[1:]
+        print(
+            f"  verification on a different message -> "
+            f"{verify_signature(tampered, signature, signing_outcome.public_key, prime=DKG_FIELD_PRIME, group_prime=DKG_GROUP_PRIME, generator=DKG_GENERATOR)}"
+        )
+    else:
+        print(f"  rejected signature shares from: {[r.signer_id for r in signature]}")
     return 0
 
 
