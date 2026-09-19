@@ -1,7 +1,8 @@
 """thresholdsign - Shamir secret sharing over a prime field.
 
-Public API: Share / FeldmanCommitment / split_secret / split_secret_verifiable
-/ verify_share / reconstruct_secret / evaluate_polynomial.
+Public API: Share / FeldmanCommitment / PedersenCommitment / split_secret
+/ split_secret_verifiable / split_secret_pedersen / verify_share
+/ verify_pedersen_share / reconstruct_secret / evaluate_polynomial.
 """
 
 from __future__ import annotations
@@ -14,10 +15,13 @@ __all__ = [
     "DEFAULT_PRIME",
     "Share",
     "FeldmanCommitment",
+    "PedersenCommitment",
     "evaluate_polynomial",
     "split_secret",
     "split_secret_verifiable",
+    "split_secret_pedersen",
     "verify_share",
+    "verify_pedersen_share",
     "reconstruct_secret",
 ]
 
@@ -47,6 +51,24 @@ class FeldmanCommitment:
     field_prime: int
     group_prime: int
     generator: int
+
+
+@dataclass(frozen=True)
+class PedersenCommitment:
+    """Pedersen commitments ``C_j = g ** a_j * h ** b_j mod group_prime``.
+
+    ``g`` is ``generator`` and ``h`` is ``blinding_generator``: two distinct
+    non-identity elements of the order-``field_prime`` subgroup. ``values``
+    holds one commitment per polynomial coefficient, ordered from the
+    constant term up: ``values[j]`` commits to coefficient ``a_j`` blinded by
+    ``b_j``. Neither the coefficients nor the blinding factors are stored.
+    """
+
+    values: tuple[int, ...]
+    field_prime: int
+    group_prime: int
+    generator: int
+    blinding_generator: int
 
 
 def evaluate_polynomial(coefficients: Sequence[int], x: int, *, prime: int = DEFAULT_PRIME) -> int:
@@ -164,6 +186,27 @@ def _validate_feldman_parameters(
         raise ValueError("generator must have order prime in the multiplicative group")
 
 
+def _validate_pedersen_parameters(
+    field_prime: int, group_prime: int, generator: int, blinding_generator: int
+) -> None:
+    """Check the Pedersen group setup on top of the Feldman constraints.
+
+    Both generators must be non-identity elements of the unique
+    order-``field_prime`` subgroup and must differ from each other, so that
+    ``log_g(h)`` is unknown to the dealer and the commitments hide the
+    coefficients information-theoretically.
+    """
+    _validate_feldman_parameters(field_prime, group_prime, generator)
+    if not isinstance(blinding_generator, int):
+        raise TypeError("blinding_generator must be an integer")
+    if not 1 < blinding_generator < group_prime:
+        raise ValueError("blinding_generator must satisfy 1 < blinding_generator < group_prime")
+    if blinding_generator == generator:
+        raise ValueError("generator and blinding_generator must differ")
+    if pow(blinding_generator, field_prime, group_prime) != 1:
+        raise ValueError("blinding_generator must have order prime in the multiplicative group")
+
+
 def split_secret_verifiable(
     secret: int,
     threshold: int,
@@ -197,6 +240,58 @@ def split_secret_verifiable(
         generator=generator,
     )
     return shares, commitment
+
+
+def split_secret_pedersen(
+    secret: int,
+    threshold: int,
+    share_count: int,
+    *,
+    group_prime: int,
+    generator: int,
+    blinding_generator: int,
+    prime: int = DEFAULT_PRIME,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> tuple[list[Share], list[Share], PedersenCommitment]:
+    """Split ``secret`` like :func:`split_secret`, returning Pedersen commitments.
+
+    Accepts every parameter of :func:`split_secret` plus the required
+    ``group_prime``, ``generator`` and ``blinding_generator``. The sharing
+    polynomial follows the same coefficient rule; a second, fully random
+    blinding polynomial of the same degree supplies ``threshold`` blinding
+    coefficients drawn from the same ``randbelow``. For each coefficient
+    pair ``(a_j, b_j)`` a commitment
+    ``C_j = generator ** a_j * blinding_generator ** b_j mod group_prime``
+    is published. Returns ``(shares, blinding_shares, commitment)`` where the
+    two share lists use the same ``x`` coordinates; the raw coefficients and
+    blinding factors are never exposed.
+    """
+    _validate_pedersen_parameters(prime, group_prime, generator, blinding_generator)
+    coefficients = _sharing_coefficients(secret, threshold, share_count, prime, randbelow)
+    blinding_coefficients = [randbelow(prime) for _ in range(threshold)]
+
+    shares = [
+        Share(x=x, y=evaluate_polynomial(coefficients, x, prime=prime))
+        for x in range(1, share_count + 1)
+    ]
+    blinding_shares = [
+        Share(x=x, y=evaluate_polynomial(blinding_coefficients, x, prime=prime))
+        for x in range(1, share_count + 1)
+    ]
+    commitments = tuple(
+        pow(generator, coefficient, group_prime)
+        * pow(blinding_generator, blinding, group_prime)
+        % group_prime
+        for coefficient, blinding in zip(coefficients, blinding_coefficients)
+    )
+    commitment = PedersenCommitment(
+        values=commitments,
+        field_prime=prime,
+        group_prime=group_prime,
+        generator=generator,
+        blinding_generator=blinding_generator,
+    )
+    return shares, blinding_shares, commitment
 
 
 def verify_share(share: Share, commitment: FeldmanCommitment) -> bool:
@@ -251,6 +346,95 @@ def verify_share(share: Share, commitment: FeldmanCommitment) -> bool:
         raise ValueError("share value must satisfy 0 <= y < field_prime")
 
     expected = pow(generator, share.y, group_prime)
+    x_power = 1
+    product = 1
+    for c_j in values:
+        product = product * pow(c_j, x_power, group_prime) % group_prime
+        x_power = x_power * share.x % field_prime
+    return product == expected
+
+
+def verify_pedersen_share(
+    share: Share, blinding_share: Share, commitment: PedersenCommitment
+) -> bool:
+    """Check a share/blinding-share pair against a Pedersen commitment.
+
+    Verifies
+    ``generator ** y * blinding_generator ** by == product(C_j ** x**j)``
+    modulo ``group_prime`` with exponents reduced modulo ``field_prime``,
+    where ``y``/``by`` are the two share values at the same coordinate ``x``.
+    Returns ``True`` on a match and ``False`` for well-formed input that was
+    tampered with, whose two coordinates differ, or that mixes shares from
+    different polynomials. Malformed arguments raise TypeError/ValueError.
+    """
+    if not isinstance(share, Share):
+        raise TypeError("share must be a Share instance")
+    if not isinstance(blinding_share, Share):
+        raise TypeError("blinding_share must be a Share instance")
+    if not isinstance(commitment, PedersenCommitment):
+        raise TypeError("commitment must be a PedersenCommitment instance")
+    for name, value in (
+        ("share.x", share.x),
+        ("share.y", share.y),
+        ("blinding_share.x", blinding_share.x),
+        ("blinding_share.y", blinding_share.y),
+        ("field_prime", commitment.field_prime),
+        ("group_prime", commitment.group_prime),
+        ("generator", commitment.generator),
+        ("blinding_generator", commitment.blinding_generator),
+    ):
+        if not isinstance(value, int):
+            raise TypeError(f"{name} must be an integer")
+
+    values = commitment.values
+    if not isinstance(values, tuple):
+        raise TypeError("commitment values must be a tuple")
+    if not values:
+        raise ValueError("commitment must contain at least one value")
+    for value in values:
+        if not isinstance(value, int):
+            raise TypeError("commitment values must be integers")
+        if not 0 < value < commitment.group_prime:
+            raise ValueError("commitment values must satisfy 0 < value < group_prime")
+
+    field_prime = commitment.field_prime
+    group_prime = commitment.group_prime
+    generator = commitment.generator
+    blinding_generator = commitment.blinding_generator
+    if not _is_prime(field_prime) or not _is_prime(group_prime):
+        raise ValueError("field_prime and group_prime must be prime")
+    if (group_prime - 1) % field_prime != 0:
+        raise ValueError("field_prime must divide group_prime - 1")
+    if not 1 < generator < group_prime or pow(generator, field_prime, group_prime) != 1:
+        raise ValueError("generator must be a non-identity element of order field_prime")
+    if (
+        not 1 < blinding_generator < group_prime
+        or pow(blinding_generator, field_prime, group_prime) != 1
+    ):
+        raise ValueError("blinding_generator must be a non-identity element of order field_prime")
+    if generator == blinding_generator:
+        raise ValueError("generator and blinding_generator must differ")
+    for value in values:
+        if pow(value, field_prime, group_prime) != 1:
+            raise ValueError("every commitment value must lie in the order-field_prime subgroup")
+
+    if not 0 < share.x < field_prime:
+        raise ValueError("share index must satisfy 0 < x < field_prime")
+    if not 0 <= share.y < field_prime:
+        raise ValueError("share value must satisfy 0 <= y < field_prime")
+    if not 0 < blinding_share.x < field_prime:
+        raise ValueError("blinding share index must satisfy 0 < x < field_prime")
+    if not 0 <= blinding_share.y < field_prime:
+        raise ValueError("blinding share value must satisfy 0 <= y < field_prime")
+
+    if share.x != blinding_share.x:
+        return False
+
+    expected = (
+        pow(generator, share.y, group_prime)
+        * pow(blinding_generator, blinding_share.y, group_prime)
+        % group_prime
+    )
     x_power = 1
     product = 1
     for c_j in values:
