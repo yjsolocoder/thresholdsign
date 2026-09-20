@@ -14,7 +14,8 @@ SigningRound / SignatureShare / SignatureShareRejection / AggregateSignature /
 create_signing_nonce_commitment / create_signing_round / create_signature_share
 / verify_signature_share / aggregate_signature / verify_signature, signing
 audit receipts: SigningAudit / create_audit / check_audit, the stateless
-nonce-reuse audit NonceReuse / find_nonce_reuse, and publicly
+nonce-reuse audit NonceReuse / find_nonce_reuse, leaked-share recovery from
+reused nonces via NonceLeak / recover_leaks, and publicly
 verifiable key-rotation authorization: Rotation / rotation_payload /
 verify_rotation.
 """
@@ -70,6 +71,8 @@ __all__ = [
     "check_audit",
     "NonceReuse",
     "find_nonce_reuse",
+    "NonceLeak",
+    "recover_leaks",
     "Rotation",
     "rotation_payload",
     "verify_rotation",
@@ -2906,3 +2909,113 @@ def find_nonce_reuse(
         )
     findings.sort(key=lambda finding: (finding.signer_id, finding.nonce_commitment))
     return tuple(findings)
+
+
+# ---------------------------------------------------------------------------
+# Leaked-share recovery: from two verified status-1 receipts in which one
+# signer republished the same round-one commitment R_i, solve the two
+# Schnorr responses z_i = r_i + c * lambda_i * s_i for the signer's secret
+# share s_i. Builds on find_nonce_reuse for the grouping; keeps no state.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class NonceLeak:
+    """One signer's secret share recovered from a reused round-one nonce.
+
+    ``signer_id`` names the DKG participant, ``commitment`` the reused
+    round-one value ``R_i``, ``share`` the recovered secret share ``s_i``
+    (verified against the signer's public verification share ``Y_i``) and
+    ``receipts`` the two status-1 :class:`SigningAudit` receipts the
+    recovery used, ordered by their ``payload`` bytes.
+    """
+
+    signer_id: int
+    commitment: int
+    share: int
+    receipts: tuple[SigningAudit, ...]
+
+
+def recover_leaks(
+    records: Iterable[tuple[bytes, SigningAudit]],
+    key: SigningDKGResult,
+) -> tuple[NonceLeak, ...]:
+    """Recover exposed secret shares from receipts with reused nonces.
+
+    ``records`` pairs each audited message with its receipt, exactly as in
+    :func:`find_nonce_reuse`, which is called first: every record is
+    re-verified with :func:`check_audit` against ``key``, only status-1
+    receipts take part, and the ``(signer_id, R_i)`` groups follow its
+    deduplication and payload-ordering rules. Wrong argument or record
+    element types raise TypeError; a structurally illegal receipt or one
+    that does not match its message or the key raises ValueError.
+
+    For each reuse group, every receipt contributes its signer's response
+    ``z_i`` and the coefficient ``a = c * lambda_i mod q`` (``c`` the
+    receipt's challenge, ``lambda_i`` the signer's Lagrange weight at zero
+    over that receipt's signer set). The pair of receipts with the smallest
+    payload bytes satisfying ``a1 != a2`` then yields
+    ``s = (z1 - z2) / (a1 - a2) mod q``. The recovered share must satisfy
+    ``g ** share == Y_i mod p`` against the signer's verification share,
+    otherwise ValueError is raised. A group whose receipts all share the
+    same ``a`` has no invertible pair and is ignored.
+
+    Each reported :class:`NonceLeak` carries the two receipts the recovery
+    used, ordered by payload bytes; the findings are returned as a tuple
+    sorted by ascending ``signer_id`` then ``commitment``, so the result
+    does not depend on the input order. The function is stateless.
+    """
+    reuses = find_nonce_reuse(records, key)
+
+    result = key.result
+    pedersen = result.commitment
+    field_prime = pedersen.field_prime
+    group_prime = pedersen.group_prime
+    generator = pedersen.generator
+
+    leaks = []
+    for reuse in reuses:
+        # reuse.receipts is already deduplicated and ordered by payload.
+        entries = []
+        for receipt in reuse.receipts:
+            _digest, _Y, _R, challenge, rows, _status, _z = _decode_audit_payload(
+                receipt.payload, field_prime, group_prime
+            )
+            signer_ids = tuple(row[0] for row in rows)
+            z_i = next(row[2] for row in rows if row[0] == reuse.signer_id)
+            weight = _lagrange_weight(reuse.signer_id, signer_ids, field_prime)
+            entries.append((receipt, challenge * weight % field_prime, z_i))
+
+        # The lexicographically smallest pair by payload with a1 != a2: the
+        # first receipt paired with the first later receipt of a different
+        # coefficient. No such partner means every coefficient is equal.
+        pair = None
+        first_receipt, first_a, first_z = entries[0]
+        for receipt, a, z in entries[1:]:
+            if a != first_a:
+                pair = (receipt, a, z)
+                break
+        if pair is None:
+            continue
+        second_receipt, second_a, second_z = pair
+
+        share = (
+            (first_z - second_z)
+            * pow(first_a - second_a, -1, field_prime)
+            % field_prime
+        )
+        share_index = result.participant_ids.index(reuse.signer_id)
+        if pow(generator, share, group_prime) != key.verification_shares[share_index]:
+            raise ValueError(
+                "recovered share does not match the verification share Y_i"
+            )
+        leaks.append(
+            NonceLeak(
+                signer_id=reuse.signer_id,
+                commitment=reuse.nonce_commitment,
+                share=share,
+                receipts=(first_receipt, second_receipt),
+            )
+        )
+    leaks.sort(key=lambda leak: (leak.signer_id, leak.commitment))
+    return tuple(leaks)
