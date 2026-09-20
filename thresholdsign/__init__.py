@@ -2415,9 +2415,13 @@ def create_audit(
 
     Every signer of ``round_info`` must contribute exactly one share, in any
     order; duplicate or missing signers raise ValueError and wrong types raise
-    TypeError, exactly as in :func:`aggregate_signature`. The shares are
+    TypeError, exactly as in :func:`aggregate_signature`. ``message`` must be
+    the round's message, otherwise ValueError is raised. The shares are
     re-verified with :func:`verify_signature_share` in ascending
-    ``signer_id`` order. The returned :class:`SigningAudit` payload encodes,
+    ``signer_id`` order; a commitment mismatch or a failed share equation
+    still produces a receipt (with status 0), and the rows encode the
+    submitted ``nonce_commitment`` and ``z`` unchanged. The returned
+    :class:`SigningAudit` payload encodes,
     in order: the tag ``b"thresholdsign/audit/v1"``, the 32-byte
     ``SHA256(message)`` digest, ``Y``, ``R`` and ``c`` (each an unsigned
     big-endian integer in the Schnorr width
@@ -2440,6 +2444,8 @@ def create_audit(
         result.participant_ids,
         len(result.commitment.values),
     )
+    if message != round_info.message:
+        raise ValueError("message must match the signing round's message")
 
     materialised = list(shares)
     if not materialised:
@@ -2566,6 +2572,8 @@ def _decode_audit_payload(
         previous_id = signer_id
         if not 1 < nonce_commitment < group_prime:
             raise ValueError("audit R_i must satisfy 1 < R_i < group_prime")
+        if pow(nonce_commitment, field_prime, group_prime) != 1:
+            raise ValueError("audit R_i must lie in the order-field_prime subgroup")
         if not 0 <= z_i < field_prime:
             raise ValueError("audit z_i must satisfy 0 <= z_i < field_prime")
     if z is not None and not 0 <= z < field_prime:
@@ -2581,14 +2589,22 @@ def check_audit(
     """Re-verify an audit receipt against the message and the signing key.
 
     Decodes ``receipt.payload`` (structural or decoding defects raise
-    ValueError, wrong types raise TypeError) and recomputes everything from
-    the message and ``dkg_result``: the message digest, the public key, the
-    aggregate ``R`` from the row commitments, the Fiat-Shamir challenge, the
-    per-row share verification ``g ** z_i == R_i * Y_i ** (c * lambda_i)``
-    and, when the status byte is 1, the aggregated ``z`` and the aggregate
-    signature ``g ** z == R * Y ** c``. Returns ``True`` only if every
-    recomputed value matches the payload; a well-formed payload that was
-    tampered with, or belongs to another message or key, returns ``False``.
+    ValueError, wrong types raise TypeError; so do fewer rows than the
+    threshold, non-participant signer ids, non-increasing rows and row
+    commitments outside the order-``field_prime`` subgroup) and recomputes
+    everything from the message and ``dkg_result``: the message digest, the
+    public key, the Fiat-Shamir challenge from the header's ``R``, the
+    aggregate ``R`` from the row commitments, the per-row share verification
+    ``g ** z_i == R_i * Y_i ** (c * lambda_i)`` and, when the status byte is
+    1, the aggregated ``z`` and the aggregate signature
+    ``g ** z == R * Y ** c``. A row-``R_i`` product differing from the
+    header's ``R`` or a failing share equation is a verification failure and
+    only forces the recomputed status to 0 — it does not by itself make the
+    receipt invalid. Returns ``True`` only if the payload's status (and, when
+    present, its aggregate ``z``) matches the recomputed outcome, so a
+    failure receipt produced by :func:`create_audit` checks out as-is while
+    a well-formed payload that was tampered with, or belongs to another
+    message or key, returns ``False``.
     """
     if not isinstance(message, bytes):
         raise TypeError("message must be bytes")
@@ -2604,21 +2620,17 @@ def check_audit(
         receipt.payload, field_prime, group_prime
     )
 
+    signer_ids = tuple(row[0] for row in rows)
+    if len(signer_ids) < threshold:
+        raise ValueError("audit rows must number at least the threshold")
+    if any(signer_id not in result.participant_ids for signer_id in signer_ids):
+        raise ValueError("audit signer ids must be DKG participants")
+
     if digest != hashlib.sha256(message).digest():
         return False
     if Y != public_key:
         return False
-    signer_ids = tuple(row[0] for row in rows)
-    if any(signer_id not in result.participant_ids for signer_id in signer_ids):
-        return False
-    if len(signer_ids) < threshold:
-        return False
 
-    recomputed_R = 1
-    for _signer_id, nonce_commitment, _z_i in rows:
-        recomputed_R = recomputed_R * nonce_commitment % group_prime
-    if recomputed_R != R:
-        return False
     recomputed_challenge = schnorr_challenge(
         message,
         public_key,
@@ -2630,7 +2642,14 @@ def check_audit(
     if recomputed_challenge != challenge:
         return False
 
-    all_verified = True
+    # A row-product/header R mismatch or a failing share equation only
+    # forces the recomputed status to 0; it is not by itself a reason to
+    # reject the receipt.
+    recomputed_R = 1
+    for _signer_id, nonce_commitment, _z_i in rows:
+        recomputed_R = recomputed_R * nonce_commitment % group_prime
+
+    all_verified = recomputed_R == R
     z_total = 0
     for signer_id, nonce_commitment, z_i in rows:
         weight = _lagrange_weight(signer_id, signer_ids, field_prime)
