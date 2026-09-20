@@ -366,6 +366,21 @@ python3 -m thresholdsign
   — 用 `signature.signer_ids` 重建挑战并校验 `g^z = R·Y^c`；合法签名返回 `True`，
   签名被篡改或与消息/公钥/签名者集合不匹配返回 `False`，非法参数抛
   `TypeError`/`ValueError`
+- `SigningAudit(payload)` — 冻结数据类，仅含 `payload` 一个字段；一次签名轮次第
+  二轮校验的审计回执，自包含的字节编码中不含 nonce、秘密份额或系数
+- `create_audit(message, shares, round_info, dkg_result)` — 轮次中每名签名者必须
+  恰好提交一份份额（重复/缺失抛 `ValueError`，类型错误抛 `TypeError`），按
+  `signer_id` 升序以 `verify_signature_share` 重验后生成 `SigningAudit`：payload
+  依次拼接标签 `b"thresholdsign/audit/v1"`、32 字节 `SHA256(message)`、`Y`、`R`、
+  `c`（均为 Schnorr 宽度 `L` 字节无符号大端）、4 字节无符号大端行数 `n`、按
+  `signer_id` 升序的 `n` 行（每行 `id`、`R_i`、`z_i` 各 `L` 字节）、1 字节
+  status 与 1 字节 present；全部份额通过时 status=1、present=1 并追加聚合
+  `z = Σ z_i mod q`（`L` 字节），否则 status=0、present=0 且不追加 `z`
+- `check_audit(message, receipt, dkg_result)` — 解码回执（结构或解码非法抛
+  `ValueError`，类型错误抛 `TypeError`）并重算消息摘要、公钥、由各行 `R_i` 之积
+  得到的 `R`、Fiat-Shamir 挑战、逐行份额校验 `g^z_i = R_i·Y_i^(c·λ_i)` 以及
+  status 为 1 时的聚合 `z` 与聚合签名 `g^z = R·Y^c`；全部一致返回 `True`，
+  合法篡改或消息/密钥不匹配返回 `False`
 
 ### 门限 Schnorr 群参数与边界
 

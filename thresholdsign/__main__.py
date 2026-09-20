@@ -11,6 +11,8 @@ from . import (
     aggregate_dkg,
     aggregate_signature,
     aggregate_signing_dkg,
+    check_audit,
+    create_audit,
     create_dkg_contribution,
     create_signature_share,
     create_signing_contribution,
@@ -169,6 +171,15 @@ def main() -> int:
         print(
             f"  verification on a different message -> "
             f"{verify_signature(tampered, signature, signing_outcome.public_key, prime=DKG_FIELD_PRIME, group_prime=DKG_GROUP_PRIME, generator=DKG_GENERATOR)}"
+        )
+        audit = create_audit(message, signature_shares, round_info, signing_outcome)
+        print(
+            f"  audit payload: {len(audit.payload)} bytes, "
+            f"checks={check_audit(message, audit, signing_outcome)}"
+        )
+        print(
+            f"  audit check on a different message -> "
+            f"{check_audit(tampered, audit, signing_outcome)}"
         )
     else:
         print(f"  rejected signature shares from: {[r.signer_id for r in signature]}")
