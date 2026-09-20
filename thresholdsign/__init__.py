@@ -21,6 +21,8 @@ verify_rotation, the persistent, multi-hop authorization chain
 RotationChain / verify_rotation_chain / encode_rotation_chain /
 decode_rotation_chain, and the stateless, threshold-Schnorr-authenticated
 audit chain: AuditChain / audit_chain_payload / verify_audit_chain.
+Per-record Merkle inclusion proofs over a sealed chain's records are
+provided by AuditProof / make_proof / check_proof.
 """
 
 from __future__ import annotations
@@ -90,6 +92,9 @@ __all__ = [
     "verify_audit_chain",
     "encode_audit_chain",
     "decode_audit_chain",
+    "AuditProof",
+    "make_proof",
+    "check_proof",
 ]
 
 # Mersenne prime 2**127 - 1: large enough for integer secrets, small enough that
@@ -3626,8 +3631,11 @@ def _check_audit_chain_signature(signature: object) -> int:
 
     The integers and signer set are checked only as the unsigned, ordered
     structures the wire framing needs; nothing here places ``R``/``z`` in a
-    group (that takes group parameters and is :func:`verify_signature`'s job).
-    Returns the signer count.
+    group (that takes group parameters and is :func:`verify_signature`'s
+    job). ``R`` must be positive (a zero ``R`` is never a legal Schnorr
+    commitment and would canonicalise ambiguously against the node framing);
+    ``z`` may be zero and keeps its single ``00`` byte. Returns the signer
+    count.
     """
     if not isinstance(signature, AggregateSignature):
         raise TypeError("chain signature must be an AggregateSignature instance")
@@ -3637,25 +3645,29 @@ def _check_audit_chain_signature(signature: object) -> int:
         raise TypeError("signature.z must be an integer")
     if not isinstance(signature.signer_ids, tuple):
         raise TypeError("signature.signer_ids must be a tuple")
+    try:
+        signer_count = len(signature.signer_ids)
+    except OverflowError:
+        raise ValueError("too many signer ids") from None
     for signer_id in signature.signer_ids:
         if not isinstance(signer_id, int) or isinstance(signer_id, bool):
             raise TypeError("signer ids must be integers")
 
-    if signature.R < 0:
-        raise ValueError("signature R must be non-negative")
+    if signature.R <= 0:
+        raise ValueError("signature R must be positive")
     if signature.z < 0:
         raise ValueError("signature z must be non-negative")
-    if not signature.signer_ids:
+    if signer_count == 0:
         raise ValueError("at least one signer is required")
     for signer_id in signature.signer_ids:
         if signer_id <= 0:
             raise ValueError("signer ids must be positive")
     if any(
-        signature.signer_ids[index] >= signature.signer_ids[index + 1]
-        for index in range(len(signature.signer_ids) - 1)
+        previous >= current
+        for previous, current in zip(signature.signer_ids, signature.signer_ids[1:])
     ):
         raise ValueError("signer ids must be strictly increasing and unique")
-    return len(signature.signer_ids)
+    return signer_count
 
 
 def encode_audit_chain(chain: AuditChain) -> bytes:
@@ -3672,18 +3684,20 @@ def encode_audit_chain(chain: AuditChain) -> bytes:
     the 4-byte unsigned big-endian ``signer_ids`` count and then the ascending
     signer ids; each integer is a 4-byte unsigned big-endian length followed
     by its shortest unsigned big-endian value (zero is the single byte
-    ``00``, positive values carry no leading zero).
+    ``00``, positive values carry no leading zero). ``z`` may be zero but
+    ``R`` must be positive.
 
     Only a chain whose field types and structure are legal is accepted — the
     records must be a non-empty tuple of ``(bytes, SigningAudit)`` pairs with
     non-empty payloads and the signature an :class:`AggregateSignature` with
-    non-negative ``R``/``z`` and a non-empty tuple of strictly increasing
-    positive ids — but neither the receipts nor the signature are required to
-    match anything: :func:`verify_audit_chain` stays the way to test a chain
-    afterwards. Wrong field types raise TypeError; an empty chain, an empty
-    receipt, a negative or non-increasing signature value or an over-long
-    frame raises ValueError. The output for a given chain is unique and the
-    encoding carries no network, storage or hidden state.
+    a positive ``R``, a non-negative ``z`` and a non-empty tuple of strictly
+    increasing positive ids — but neither the receipts nor the signature are
+    required to match anything: :func:`verify_audit_chain` stays the way to
+    test a chain afterwards. Wrong field types raise TypeError; an empty
+    chain, an empty receipt, a zero ``R``, a negative ``z``, a
+    non-increasing/over-long count or an over-long frame raises ValueError.
+    The output for a given chain is unique and the encoding carries no
+    network, storage or hidden state.
     """
     if not isinstance(chain, AuditChain):
         raise TypeError("chain must be an AuditChain instance")
@@ -3745,10 +3759,11 @@ def decode_audit_chain(payload: bytes) -> AuditChain:
     ``signer_ids`` count and the ascending signer ids, each integer a
     4-byte length-prefixed shortest unsigned big-endian value. A non-bytes
     argument raises TypeError; a wrong or missing tag, an empty chain, a
-    zero-length receipt, a count mismatch, truncation, trailing bytes, an
-    empty, zero, duplicate or non-increasing signer id, or a non-canonical
-    integer (leading zero or over-long length) raises ValueError. A
-    successfully decoded chain re-encodes to exactly the input bytes.
+    zero-length receipt, a count mismatch, truncation, trailing bytes, a zero
+    ``R`` (``z`` may be zero), an empty, zero, duplicate or non-increasing
+    signer id, or a non-canonical integer (leading zero or over-long length)
+    raises ValueError. A successfully decoded chain re-encodes to exactly
+    the input bytes.
 
     Decoding only restores the structure: receipt payloads are stored opaque
     and neither they nor the signature are verified, and the chain carries no
@@ -3785,6 +3800,8 @@ def decode_audit_chain(payload: bytes) -> AuditChain:
 
     R, offset = _read_varint(payload, offset, what="audit chain signature R")
     z, offset = _read_varint(payload, offset, what="audit chain signature z")
+    if R == 0:
+        raise ValueError("audit chain signature R must be positive")
 
     if offset + 4 > len(payload):
         raise ValueError("truncated audit chain signer count")
@@ -3814,3 +3831,219 @@ def decode_audit_chain(payload: bytes) -> AuditChain:
     if encode_audit_chain(chain) != payload:
         raise ValueError("non-canonical audit chain")
     return chain
+
+
+# ---------------------------------------------------------------------------
+# Per-record audit proofs: instead of handing over the whole sealed chain, a
+# holder can prove that one record is the i-th leaf committed by the chain's
+# signed Merkle root. The tree is domain-separated (leaves vs. nodes vs. the
+# signed message), binds each leaf to its position via the U64 index, and
+# duplicates an odd tail node at every level, so the root is unambiguous. The
+# library keeps no state: a proof is a plain value and verification rebuilds
+# the root and re-checks both the receipt (check_audit) and the sealing
+# signature (verify_signature).
+# ---------------------------------------------------------------------------
+
+AUDIT_PROOF_LEAF_TAG = b"am/l"
+AUDIT_PROOF_NODE_TAG = b"am/n"
+AUDIT_PROOF_ROOT_TAG = b"am/r"
+
+
+@dataclass(frozen=True)
+class AuditProof:
+    """A Merkle inclusion proof for one record of a sealed audit chain.
+
+    Fields, in order: ``i`` the zero-based leaf position, ``n`` the chain's
+    record count, ``m`` the record message, ``a`` the record
+    :class:`SigningAudit` receipt and ``p`` the tuple of sibling digests from
+    the leaf level up to the root, each 32 bytes (empty only when ``n == 1``).
+    The dataclass is frozen, positionally constructible and compared by
+    value. It is not checked at construction time: :func:`make_proof` builds
+    honest proofs and :func:`check_proof` is the way to test one afterwards.
+    """
+
+    i: int
+    n: int
+    m: bytes
+    a: SigningAudit
+    p: tuple[bytes, ...]
+
+
+def _audit_proof_leaf(index: int, message: bytes, audit: SigningAudit) -> bytes:
+    """The position-bound leaf digest ``H(b"am/l" || U64(index) || H(m) || H(a.payload))``."""
+    return hashlib.sha256(
+        AUDIT_PROOF_LEAF_TAG
+        + index.to_bytes(8, "big", signed=False)
+        + hashlib.sha256(message).digest()
+        + hashlib.sha256(audit.payload).digest()
+    ).digest()
+
+
+def _audit_proof_node(left: bytes, right: bytes) -> bytes:
+    """The parent digest ``H(b"am/n" || left || right)``."""
+    return hashlib.sha256(AUDIT_PROOF_NODE_TAG + left + right).digest()
+
+
+def _audit_proof_u64(value: int) -> bytes:
+    return value.to_bytes(8, "big", signed=False)
+
+
+def _audit_proof_depth(count: int) -> int:
+    """Number of pairing levels that reduces ``count`` nodes to one root."""
+    depth = 0
+    while count > 1:
+        count = (count + 1) // 2
+        depth += 1
+    return depth
+
+
+def make_proof(
+    records: tuple[tuple[bytes, SigningAudit], ...], i: int
+) -> tuple[bytes, AuditProof]:
+    """Build the signed message and a Merkle proof for record ``i``.
+
+    ``records`` must be a non-empty, order-preserving tuple of
+    ``(message, SigningAudit)`` pairs exactly as ``AuditChain.records``, and
+    ``i`` the zero-based position of the record the proof is for. With
+    ``H = SHA256`` and ``U64`` an 8-byte unsigned big-endian integer, each
+    leaf is ``H(b"am/l" || U64(index) || H(message) || H(audit.payload))``;
+    parents are ``H(b"am/n" || left || right)`` pairing the level left to
+    right and duplicating an odd level's last node as its own sibling. The
+    returned proof's sibling path runs from the leaf level up to the root
+    (each entry 32 bytes, the duplicated-tail entry being the node itself).
+    The returned message is ``b"am/r" || U64(n) || root`` — the exact bytes
+    the threshold key signs (usable as ``SigningRound.message``) — and the
+    proof is the :class:`AuditProof` ``(i, n, message, audit, path)``.
+
+    Wrong types raise TypeError (a non-tuple record sequence, a malformed
+    record pair, or a non-integer including boolean index); an empty record
+    tuple, an out-of-range or negative index, or a record count that does not
+    fit the 8-byte counter raises ValueError.
+    """
+    if not isinstance(i, int) or isinstance(i, bool):
+        raise TypeError("i must be an integer")
+    count = _check_audit_chain_records(records)
+    if count > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("too many records")
+    if i < 0 or i >= count:
+        raise ValueError("i must satisfy 0 <= i < len(records)")
+
+    leaves: list[bytes] = []
+    message_i = audit_i = None
+    for index, (message, audit) in enumerate(records):
+        leaves.append(_audit_proof_leaf(index, message, audit))
+        if index == i:
+            message_i, audit_i = message, audit
+    if message_i is None:
+        # A container whose reported length exceeds its real contents.
+        raise ValueError("i must satisfy 0 <= i < len(records)")
+
+    level = leaves
+    path = []
+    index = i
+    while len(level) > 1:
+        paired = level
+        if len(paired) % 2:
+            paired = paired + [paired[-1]]
+        path.append(paired[index ^ 1])
+        level = [
+            _audit_proof_node(paired[pos], paired[pos + 1])
+            for pos in range(0, len(paired), 2)
+        ]
+        index //= 2
+    root = level[0]
+
+    proof = AuditProof(
+        i=i,
+        n=count,
+        m=message_i,
+        a=audit_i,
+        p=tuple(path),
+    )
+    signed_message = AUDIT_PROOF_ROOT_TAG + _audit_proof_u64(count) + root
+    return signed_message, proof
+
+
+def check_proof(
+    proof: AuditProof,
+    sig: AggregateSignature,
+    key: SigningDKGResult,
+) -> bool:
+    """Verify an audit-record Merkle proof against its sealing signature.
+
+    Re-checks the proof's receipt ``proof.a`` against its message
+    ``proof.m`` and ``key`` with :func:`check_audit`, rebuilds the Merkle
+    root from ``proof.i``, ``proof.n``, the leaf
+    ``H(b"am/l" || U64(i) || H(m) || H(a.payload))`` and the leaf-to-root
+    sibling path ``proof.p`` (duplicating an odd level's tail node exactly as
+    in :func:`make_proof`), reconstructs the signed message
+    ``b"am/r" || U64(n) || root`` and verifies ``sig`` on it with
+    :func:`verify_signature` under ``key``'s group parameters and public key.
+    Returns ``True`` only when the receipt, the inclusion path and the
+    signature all match; a well-formed proof tampered with at any point — a
+    swapped message or receipt, a wrong position or count, a replaced
+    sibling, a re-rooted path, a bad signature or verification under another
+    key — returns ``False``.
+
+    Wrong argument or field types raise TypeError (a non-:class:`AuditProof`
+    proof, a non-:class:`AggregateSignature` signature, non-integer
+    ``i``/``n``, non-bytes message or path entries, or a non-tuple path); a
+    non-positive or counter-overflowing ``n``, an index outside
+    ``0 <= i < n``, a path entry that is not 32 bytes, a path length
+    inconsistent with ``n``, a structurally illegal receipt or signature, or
+    a malformed ``key`` raises ValueError, exactly as :func:`check_audit` and
+    :func:`verify_signature` would.
+    """
+    if not isinstance(proof, AuditProof):
+        raise TypeError("proof must be an AuditProof instance")
+    if not isinstance(sig, AggregateSignature):
+        raise TypeError("sig must be an AggregateSignature instance")
+    if not isinstance(proof.i, int) or isinstance(proof.i, bool):
+        raise TypeError("proof.i must be an integer")
+    if not isinstance(proof.n, int) or isinstance(proof.n, bool):
+        raise TypeError("proof.n must be an integer")
+    if not isinstance(proof.m, bytes):
+        raise TypeError("proof.m must be bytes")
+    if not isinstance(proof.a, SigningAudit):
+        raise TypeError("proof.a must be a SigningAudit instance")
+    if not isinstance(proof.p, tuple):
+        raise TypeError("proof.p must be a tuple")
+    for sibling in proof.p:
+        if not isinstance(sibling, bytes):
+            raise TypeError("proof.p entries must be bytes")
+
+    if proof.n <= 0 or proof.n > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("proof.n must satisfy 1 <= n <= 2**64 - 1")
+    if proof.i < 0 or proof.i >= proof.n:
+        raise ValueError("proof.i must satisfy 0 <= i < n")
+    for position, sibling in enumerate(proof.p):
+        if len(sibling) != 32:
+            raise ValueError(f"proof.p entry {position} must be 32 bytes")
+    expected_depth = _audit_proof_depth(proof.n)
+    if len(proof.p) != expected_depth:
+        raise ValueError("proof.p length must match the tree depth of n")
+
+    # The receipt must belong to the message and the key on its own.
+    if not check_audit(proof.m, proof.a, key):
+        return False
+
+    _result, public_key, field_prime, group_prime, generator = _check_signing_setup(key)
+    node = _audit_proof_leaf(proof.i, proof.m, proof.a)
+    index = proof.i
+    for sibling in proof.p:
+        if index % 2 == 0:
+            node = _audit_proof_node(node, sibling)
+        else:
+            node = _audit_proof_node(sibling, node)
+        index //= 2
+    root = node
+
+    signed_message = AUDIT_PROOF_ROOT_TAG + _audit_proof_u64(proof.n) + root
+    return verify_signature(
+        signed_message,
+        sig,
+        public_key,
+        group_prime=group_prime,
+        generator=generator,
+        prime=field_prime,
+    )

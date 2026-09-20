@@ -620,15 +620,45 @@ python3 -m thresholdsign
   大端消息长度及原始 `message`（允许空），再写 4 字节无符号大端回执长度及
   `SigningAudit.payload`（不允许空）；签名帧依次写 `VARINT(R)`、`VARINT(z)`、
   4 字节无符号大端 `signer_ids` 数量及升序编号，`VARINT` 为 4 字节无符号大端
-  长度加最短无符号大端值（零为单字节 `00`，正数禁前导零）。输出唯一，只校验
-  字段类型与结构、不要求回执或签名匹配；类型错误抛 `TypeError`，空链、空回执、
-  负数/溢出或编号非升序等结构非法抛 `ValueError`
+  长度加最短无符号大端值（零为单字节 `00`，正数禁前导零）。`z` 允许为零（仍编码
+  为单字节 `00`），但 `R` 必须为正。输出唯一，只校验字段类型与结构、不要求回执或
+  签名匹配；类型错误抛 `TypeError`，空链、空回执、`R=0`、`z<0`、计数/帧溢出或
+  编号非升序等结构非法抛 `ValueError`
 - `decode_audit_chain(payload) -> AuditChain` — `encode_audit_chain` 的逆操作，
   只恢复结构：回执不解析、签名不核验且不引入任何网络、存储或隐藏状态。拒绝
-  错误/缺失标签、空链、零长回执、截断、尾随字节、计数不符、空/零/重复/非升序
-  签名者编号及非规范整数（前导零或零长整数帧）；成功后重编码必得到原字节。
-  非 `bytes` 入参抛 `TypeError`，其余非法情形抛 `ValueError`；结构合法但签名
-  不匹配由 `verify_audit_chain` 返回 `False`
+  错误/缺失标签、空链、零长回执、截断、尾随字节、计数不符、`R=0`（`z=0` 合法）、
+  空/零/重复/非升序签名者编号及非规范整数（前导零或零长整数帧）；成功后重编码
+  必得到原字节。非 `bytes` 入参抛 `TypeError`，其余非法情形抛 `ValueError`；
+  结构合法但签名不匹配由 `verify_audit_chain` 返回 `False`
+
+#### 单条审计记录的 Merkle 包含证明
+
+`make_proof(records, i)` / `check_proof(proof, sig, key)` 让持有已封签审计链的一方
+只需出示第 `i` 条记录及其包含证明，而无需交出整条链。取 `H = SHA256`、`U64` 为 8
+字节无符号大端；叶为 `H(b"am/l" || U64(index) || H(message) || H(audit.payload))`，
+父节点为 `H(b"am/n" || left || right)`，每层自左向右配对，奇数层的尾节点复制后与
+自身配对；叶节点绑定了位置 `index`。所有记录的证明共用同一个根。
+
+- `AuditProof(i, n, m, a, p)` — 冻结数据类，可按位置构造、按值相等；字段依次为
+  `int`、`int`、`bytes`、`SigningAudit`、`tuple[bytes, ...]`。`i` 为从零起的叶
+  位置，`n` 为记录总数，`m`/`a` 为该记录的消息与回执，`p` 为自叶层至根层的兄弟
+  摘要路径（每项 32 字节；仅 `n=1` 时为空元组）。构造时不校验，核验由
+  `check_proof` 负责
+- `make_proof(records, i) -> tuple[bytes, AuditProof]` — `records` 沿用
+  `AuditChain.records` 的非空保序 `(bytes, SigningAudit)` 元组结构。按上述规则
+  计算根并返回 `(message, proof)`，其中待签消息为
+  `b"am/r" || U64(n) || root`（作为 `SigningRound.message`，同一棵树的所有叶
+  共用这一条消息，一张门限签名即可封签全部单记录证明），`proof` 为第 `i` 叶的
+  `AuditProof`。类型错误（非元组序列、记录不是二元组、非整数/布尔 `i`）抛
+  `TypeError`；空记录、越界/负 `i` 或计数超过 2^64-1 抛 `ValueError`
+- `check_proof(proof, sig, key) -> bool` — 先以 `check_audit(m, a, key)` 复核
+  回执，再从 `i`、叶与路径 `p` 重建根（奇数尾节点同样复制配对），拼出
+  `b"am/r" || U64(n) || root` 并以 `verify_signature` 在 `key` 的群参数与公钥下
+  核验 `sig`；三者全部一致返回 `True`。调换消息/回执、伪造位置或计数、替换路径
+  节点、篡改签名或换一把密钥核验等结构合法但不匹配的情形返回 `False`；非
+  `AuditProof`/`AggregateSignature` 入参或字段类型错误抛 `TypeError`，`n` 越界、
+  `i` 越界、路径项非 32 字节、路径长度与 `n` 的树高不符、回执或签名结构非法抛
+  `ValueError`
 
 ### 门限 Schnorr 群参数与边界
 
