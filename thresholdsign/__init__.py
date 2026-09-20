@@ -7,7 +7,8 @@ single-round Pedersen DKG: DKGContribution / DKGReceivedShare / DKGResult /
 DKGRejection / create_dkg_contribution / verify_dkg_received_share /
 aggregate_dkg. The signing extension adds SigningContribution /
 SigningDKGResult / create_signing_contribution / aggregate_signing_dkg,
-proactive share refresh via create_refresh / refresh, and the two-round
+proactive share refresh via create_refresh / refresh, member resharing via
+create_reshare / reshare, and the two-round
 threshold Schnorr protocol: SigningNonceCommitment /
 SigningRound / SignatureShare / SignatureShareRejection / AggregateSignature /
 create_signing_nonce_commitment / create_signing_round / create_signature_share
@@ -46,6 +47,8 @@ __all__ = [
     "aggregate_signing_dkg",
     "create_refresh",
     "refresh",
+    "create_reshare",
+    "reshare",
     "SigningNonceCommitment",
     "SigningRound",
     "SignatureShare",
@@ -631,19 +634,20 @@ def _deal_dkg_contribution(
     blinding_generator: int,
     prime: int = DEFAULT_PRIME,
     randbelow: Callable[[int], int] = secrets.randbelow,
-    zero_constant: bool = False,
+    constant: int | None = None,
 ):
     """Validate a dealing and draw its polynomials and double shares.
 
     Returns ``(ordered_ids, coefficients, blinding_coefficients, shares,
     blinding_shares, pedersen_commitment)``; the coefficients stay inside the
     package and let :func:`create_signing_contribution` add a Feldman
-    commitment to the very same sharing polynomial. With ``zero_constant``
-    set, the sharing polynomial's constant term is fixed at zero (and is not
+    commitment to the very same sharing polynomial. With ``constant`` set,
+    the sharing polynomial's constant term is fixed at that value (and is not
     drawn from ``randbelow``); the remaining sharing coefficients and every
-    blinding coefficient follow the usual draw order. This is the proactive
-    refresh dealing: a zero secret contribution shifts every share without
-    changing the joint secret.
+    blinding coefficient follow the usual draw order. This supports the
+    proactive refresh dealing (a zero constant shifts every share without
+    changing the joint secret) and the reshare dealing (a Lagrange-weighted
+    old share as the constant).
     """
     ordered_ids = _validate_dkg_dealing_parameters(
         sender_id,
@@ -654,10 +658,10 @@ def _deal_dkg_contribution(
         generator,
         blinding_generator,
     )
-    if zero_constant:
-        coefficients = [0] + [randbelow(prime) for _ in range(threshold - 1)]
-    else:
+    if constant is None:
         coefficients = [randbelow(prime) for _ in range(threshold)]
+    else:
+        coefficients = [constant] + [randbelow(prime) for _ in range(threshold - 1)]
     blinding_coefficients = [randbelow(prime) for _ in range(threshold)]
 
     shares = tuple(
@@ -1082,7 +1086,7 @@ def create_refresh(
         blinding_generator=pedersen.blinding_generator,
         prime=pedersen.field_prime,
         randbelow=randbelow,
-        zero_constant=True,
+        constant=0,
     )
     dealing = DKGContribution(
         sender_id=sender_id,
@@ -1391,6 +1395,314 @@ def refresh(
     verification_shares = tuple(
         pow(old_pedersen.generator, share.y, group_prime)
         for share in new_shares
+    )
+    return SigningDKGResult(
+        result=new_result,
+        public_key=key.public_key,
+        verification_shares=verification_shares,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Member resharing: a threshold quorum of old participants re-deals the joint
+# secret to a (possibly different) member set under an arbitrary new
+# threshold. Each dealer shares its Lagrange-weighted old share, so the new
+# shares rebuild the very same joint secret and the public key is unchanged.
+# ---------------------------------------------------------------------------
+
+
+def _check_reshare_dealers(
+    dealers: Iterable[int],
+    participant_ids: tuple[int, ...],
+    old_threshold: int,
+    members: tuple[int, ...] | None = None,
+) -> list[int]:
+    """Validate the dealer set of a resharing, returning it as a list.
+
+    Dealers must be strictly increasing, unique, number at least the old
+    threshold, and every dealer must be a participant of the old key; with
+    ``members`` given, every dealer must also be one of the new members (the
+    dealer both holds an old share and receives a new one).
+    """
+    if isinstance(dealers, (str, bytes)):
+        raise TypeError("dealers must be an iterable of integers")
+    dealer_list = list(dealers)
+    for dealer in dealer_list:
+        if not isinstance(dealer, int) or isinstance(dealer, bool):
+            raise TypeError("dealer ids must be integers")
+    if not dealer_list:
+        raise ValueError("at least one dealer is required")
+    if len(set(dealer_list)) != len(dealer_list):
+        raise ValueError("dealer ids must be unique")
+    if dealer_list != sorted(dealer_list):
+        raise ValueError("dealer ids must be strictly increasing")
+    if len(dealer_list) < old_threshold:
+        raise ValueError("dealers must number at least the old threshold")
+    for dealer in dealer_list:
+        if dealer not in participant_ids:
+            raise ValueError("every dealer must be a participant of the old key")
+    if members is not None:
+        for dealer in dealer_list:
+            if dealer not in members:
+                raise ValueError("every dealer must be one of the new members")
+    return dealer_list
+
+
+def create_reshare(
+    sender: int,
+    share: int,
+    dealers: Iterable[int],
+    members: Iterable[int],
+    threshold: int,
+    key: SigningDKGResult,
+    *,
+    rng: Callable[[int], int] = secrets.randbelow,
+) -> SigningContribution:
+    """Create one dealer's contribution to a member resharing of ``key``.
+
+    ``sender`` is one of the old participants; ``share`` is its aggregated
+    secret share ``s_i`` of ``key`` (checked against the old verification
+    share ``Y_i``, a mismatch raises ValueError). ``dealers`` is the strictly
+    increasing, duplicate-free quorum of old participants re-dealing the
+    secret: it must number at least the old threshold and every dealer must
+    be a participant of ``key`` and one of the new ``members``. ``members``
+    is the new participant-id set and ``threshold`` the new threshold ``t``;
+    both follow the usual DKG dealing constraints.
+
+    The sender's new sharing polynomial over ``members`` has the constant
+    term ``lambda_i * share mod q`` (not drawn), where ``lambda_i`` is the
+    sender's Lagrange weight at zero over ``dealers``; then ``t - 1`` sharing
+    coefficients and ``t`` blinding coefficients are drawn from ``rng(q)`` in
+    exactly the order of :func:`create_signing_contribution`. Summing one
+    such contribution per dealer makes the new constant terms add up to
+    ``sum(lambda_i * s_i)`` — the old joint secret — so any ``t`` new members
+    rebuild it while the public key stays unchanged.
+    """
+    if not isinstance(key, SigningDKGResult):
+        raise TypeError("key must be a SigningDKGResult instance")
+    _check_signing_setup(key)
+    _check_signing_dkg_structure(key)
+    if not isinstance(sender, int) or isinstance(sender, bool):
+        raise TypeError("sender must be an integer")
+    if not isinstance(share, int) or isinstance(share, bool):
+        raise TypeError("share must be an integer")
+
+    old_result = key.result
+    pedersen = old_result.commitment
+    field_prime = pedersen.field_prime
+    group_prime = pedersen.group_prime
+    generator = pedersen.generator
+    old_ids = old_result.participant_ids
+    old_threshold = len(pedersen.values)
+
+    ordered_members = _validate_dkg_dealing_parameters(
+        sender,
+        members,
+        threshold,
+        field_prime,
+        group_prime,
+        generator,
+        pedersen.blinding_generator,
+    )
+    dealer_list = _check_reshare_dealers(
+        dealers, old_ids, old_threshold, ordered_members
+    )
+    if sender not in dealer_list:
+        raise ValueError("sender must be one of the dealers")
+
+    if not 0 <= share < field_prime:
+        raise ValueError("share must satisfy 0 <= share < field_prime")
+    sender_index = old_ids.index(sender)
+    if pow(generator, share, group_prime) != key.verification_shares[sender_index]:
+        raise ValueError("share does not match the old verification share Y_i")
+
+    weight = _lagrange_weight(sender, dealer_list, field_prime)
+    (
+        ordered_ids,
+        coefficients,
+        _blinding_coefficients,
+        shares,
+        blinding_shares,
+        commitment,
+    ) = _deal_dkg_contribution(
+        sender,
+        ordered_members,
+        threshold,
+        group_prime=group_prime,
+        generator=generator,
+        blinding_generator=pedersen.blinding_generator,
+        prime=field_prime,
+        randbelow=rng,
+        constant=weight * share % field_prime,
+    )
+    dealing = DKGContribution(
+        sender_id=sender,
+        participant_ids=ordered_ids,
+        shares=shares,
+        blinding_shares=blinding_shares,
+        commitment=commitment,
+    )
+    feldman_commitment = FeldmanCommitment(
+        values=tuple(
+            pow(generator, coefficient, group_prime) for coefficient in coefficients
+        ),
+        field_prime=field_prime,
+        group_prime=group_prime,
+        generator=generator,
+    )
+    return SigningContribution(
+        contribution=dealing,
+        feldman_commitment=feldman_commitment,
+    )
+
+
+def reshare(
+    contributions: Iterable[SigningContribution],
+    dealers: Iterable[int],
+    key: SigningDKGResult,
+) -> SigningDKGResult | list[DKGRejection]:
+    """Aggregate one resharing contribution per dealer into the new key.
+
+    ``dealers`` is the strictly increasing, duplicate-free quorum of old
+    participants re-dealing the secret of ``key``; it must number at least
+    the old threshold and every dealer must be a participant of ``key``.
+    Every dealer must contribute exactly once, and all contributions must
+    agree on the new member ids, the new threshold and the old group
+    parameters; missing or duplicate dealers, illegal ids or commitments and
+    inconsistent parameters raise ValueError, wrong types raise TypeError.
+
+    Beyond the plain-DKG checks, every contribution's Feldman constant-term
+    commitment must equal ``Y_i ** lambda_i`` (the sender's old verification
+    share raised to its Lagrange weight over ``dealers``) and its double
+    shares must lie on the polynomial committed to by both its commitments.
+    A contribution that fails any of these cryptographic checks is named in a
+    sender-sorted ``list`` of :class:`DKGRejection`, never silently dropped.
+
+    On success the double shares of all contributions are added fieldwise and
+    both commitment families are multiplied groupwise, so the result is
+    independent of the input order. The new constant terms sum to the old
+    joint secret, hence ``public_key`` is unchanged (old signatures remain
+    valid) while the new shares, over the new member set and threshold, can
+    sign at once; ``verification_shares`` are recomputed as ``g ** s_i``. The
+    library keeps no state: the caller must distribute the new shares and
+    destroy the old ones.
+    """
+    if not isinstance(key, SigningDKGResult):
+        raise TypeError("key must be a SigningDKGResult instance")
+    _check_signing_setup(key)
+    _check_signing_dkg_structure(key)
+
+    old_result = key.result
+    old_pedersen = old_result.commitment
+    old_ids = old_result.participant_ids
+    old_threshold = len(old_pedersen.values)
+    dealer_list = _check_reshare_dealers(dealers, old_ids, old_threshold)
+
+    materialised = list(contributions)
+    if not materialised:
+        raise ValueError("at least one contribution is required")
+    for contribution in materialised:
+        _check_signing_contribution_types(contribution)
+    for contribution in materialised:
+        _check_signing_contribution_structure(contribution)
+
+    dealings = [contribution.contribution for contribution in materialised]
+    first = dealings[0]
+    member_ids = first.participant_ids
+    threshold = len(first.commitment.values)
+    for dealing in dealings:
+        commitment = dealing.commitment
+        if dealing.participant_ids != member_ids:
+            raise ValueError("contributions must agree on the same participant ids")
+        if (
+            commitment.field_prime != old_pedersen.field_prime
+            or commitment.group_prime != old_pedersen.group_prime
+            or commitment.generator != old_pedersen.generator
+            or commitment.blinding_generator != old_pedersen.blinding_generator
+        ):
+            raise ValueError("contributions must share the same group parameters")
+        if len(commitment.values) != threshold:
+            raise ValueError("contributions must share the same threshold")
+    sender_ids = [dealing.sender_id for dealing in dealings]
+    if len(set(sender_ids)) != len(sender_ids):
+        raise ValueError("duplicate contribution from the same dealer")
+    if set(sender_ids) != set(dealer_list):
+        raise ValueError("each dealer must contribute exactly once")
+
+    ordered = sorted(materialised, key=lambda item: item.contribution.sender_id)
+    field_prime = old_pedersen.field_prime
+    group_prime = old_pedersen.group_prime
+    weights = {
+        dealer: _lagrange_weight(dealer, dealer_list, field_prime)
+        for dealer in dealer_list
+    }
+
+    rejections: list[DKGRejection] = []
+    for item in ordered:
+        dealing = item.contribution
+        failed = False
+        for index, receiver_id in enumerate(dealing.participant_ids):
+            received = DKGReceivedShare(
+                sender_id=dealing.sender_id,
+                receiver_id=receiver_id,
+                share=dealing.shares[index],
+                blinding_share=dealing.blinding_shares[index],
+            )
+            if not verify_dkg_received_share(received, dealing.commitment):
+                failed = True
+                break
+            if not verify_share(dealing.shares[index], item.feldman_commitment):
+                failed = True
+                break
+        # The Feldman constant must commit to lambda_i * s_i: exactly the old
+        # verification share Y_i raised to the sender's Lagrange weight.
+        expected_constant = pow(
+            key.verification_shares[old_ids.index(dealing.sender_id)],
+            weights[dealing.sender_id],
+            group_prime,
+        )
+        if failed or item.feldman_commitment.values[0] != expected_constant:
+            rejections.append(DKGRejection(sender_id=dealing.sender_id))
+    if rejections:
+        return rejections
+
+    new_shares = []
+    new_blinding_shares = []
+    for index, receiver_id in enumerate(member_ids):
+        y = 0
+        y_blinding = 0
+        for item in ordered:
+            y = (y + item.contribution.shares[index].y) % field_prime
+            y_blinding = (
+                y_blinding + item.contribution.blinding_shares[index].y
+            ) % field_prime
+        new_shares.append(Share(x=receiver_id, y=y))
+        new_blinding_shares.append(Share(x=receiver_id, y=y_blinding))
+
+    new_pedersen_values = []
+    for position in range(threshold):
+        value = 1
+        for item in ordered:
+            value = value * item.contribution.commitment.values[position] % group_prime
+        new_pedersen_values.append(value)
+
+    new_result = DKGResult(
+        participant_ids=member_ids,
+        shares=tuple(new_shares),
+        blinding_shares=tuple(new_blinding_shares),
+        commitment=PedersenCommitment(
+            values=tuple(new_pedersen_values),
+            field_prime=field_prime,
+            group_prime=group_prime,
+            generator=old_pedersen.generator,
+            blinding_generator=old_pedersen.blinding_generator,
+        ),
+    )
+
+    # Every Feldman constant was verified as Y_i ** lambda_i, so their
+    # product is g ** (sum lambda_i * s_i) == old public key: unchanged.
+    verification_shares = tuple(
+        pow(old_pedersen.generator, share.y, group_prime) for share in new_shares
     )
     return SigningDKGResult(
         result=new_result,

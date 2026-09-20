@@ -184,6 +184,47 @@ else:
 `DKGRejection`。支持 `threshold = 1`。库不保存任何隐藏状态，旧份额的销毁与替换由
 调用方负责。
 
+### 成员重共享
+
+刷新只能原班人马、原 threshold；要**更换成员集合或 threshold**（如 2-of-3 改为
+3-of-5、剔除离任成员），用成员重共享（resharing）：旧参与者中达到旧 threshold 的
+一个 quorum 作为 dealers，每人把自己的旧份额 `s_i` 乘以零点拉格朗日权重 `λ_i`
+（对 dealers 集合求值）作为新共享多项式的常数项，向**新**成员集合重新分发。各
+dealer 常数项之和 `Σ λ_i·s_i` 正是旧联合秘密，因此新份额重建的是同一个秘密、
+`public_key` 不变、旧签名依旧有效：
+
+```python
+from thresholdsign import SigningDKGResult, create_reshare, reshare
+
+# key 是旧 SigningDKGResult（参与者 (1,2,3)，threshold 2）
+dealers = (1, 3)                 # 严格递增、唯一、不少于旧 threshold，
+                                 # 且都属于旧 key 与新 members
+members = (1, 3, 4, 5)           # 新成员集合
+contributions = [
+    create_reshare(
+        dealer,
+        key.result.shares[key.result.participant_ids.index(dealer)].y,  # 本人旧份额
+        dealers, members, 3,     # 新 threshold
+        key,
+    )
+    for dealer in dealers
+]
+outcome = reshare(contributions, dealers, key)
+if isinstance(outcome, SigningDKGResult):
+    new_key = outcome            # public_key 不变；新份额立即可签名
+else:
+    ...                          # list[DKGRejection]，按 sender_id 定位失败贡献
+```
+
+`create_reshare` 会校验提交的份额与旧验证份额 `Y_i` 匹配（不匹配抛 `ValueError`）；
+新共享多项式的常数项 `λ_i·share mod q` 不抽样，随后从新 `threshold` 个系数位中依次
+抽取 `t - 1` 个秘密系数和 `t` 个盲化系数（与 `create_signing_contribution` 同一
+`randbelow` 约定）。聚合时双份额按域相加、Pedersen/Feldman 两类承诺按群相乘，结果与
+贡献顺序无关；每份贡献的 Feldman 常数项承诺必须等于 `Y_i ** λ_i`、双份额必须与两类
+承诺匹配，失败按 `sender_id` 升序返回 `DKGRejection`，类型错误抛 `TypeError`，
+dealer 缺失/重复/非法或参数不一致抛 `ValueError`。新份额的分配与旧份额的销毁由
+调用方负责，库不保存任何状态。
+
 
 ## 命令行演示
 
@@ -270,6 +311,21 @@ python3 -m thresholdsign
   常数项承诺不为 1、双份额不匹配两类承诺者各一条）；类型错误抛 `TypeError`，缺失、
   重复、参数不一致或结构非法抛 `ValueError`。库不保存隐藏状态，调用方须销毁旧份额、
   改用返回份额
+- `create_reshare(sender, share, dealers, members, threshold, key, *, rng=secrets.randbelow)`
+  — 旧参与者 `sender` 为成员重共享创建一份 `SigningContribution`：`dealers` 是严格
+  递增、唯一、人数不少于旧 threshold 的旧参与者 quorum，且每人同时属于旧 `key` 与新
+  `members`；`share` 是 sender 的旧秘密份额，必须与旧验证份额 `Y_i` 匹配（不匹配抛
+  `ValueError`）。新共享多项式（对新成员集合、新 `threshold`）常数项固定为
+  `λ_i·share mod q`（`λ_i` 是 sender 在 dealers 上的零点拉格朗日权重，不抽样），
+  随后依次抽取 `threshold - 1` 个秘密系数与 `threshold` 个盲化系数
+- `reshare(contributions, dealers, key)` — 聚合每名 dealer 恰好一份的重共享贡献：
+  双份额按域相加、Pedersen/Feldman 两类承诺按群相乘，结果与贡献顺序无关；每份贡献
+  的 Feldman 常数项承诺必须等于 `Y_i ** λ_i` 且双份额匹配两类承诺，失败按
+  `sender_id` 升序返回 `list[DKGRejection]`；类型错误抛 `TypeError`，dealer 缺失、
+  重复、非法或参数不一致抛 `ValueError`。成功返回新成员集合与新 threshold 下的
+  `SigningDKGResult`：新常数项之和即旧联合秘密，`public_key` 不变（旧签名仍有效），
+  新份额立即可用于签名，`verification_shares` 由新份额重算为 `g^{s_i}`。库不保存
+  隐藏状态，新份额分发与旧份额销毁由调用方负责
 - `SigningNonceCommitment(signer_id, commitment)` — 冻结数据类；第一轮随机数承诺
   `R_i = g^r_i mod group_prime`，非数本身不出现
 - `create_signing_nonce_commitment(signer_id, *, group_prime, generator, prime=DEFAULT_PRIME, randbelow=secrets.randbelow)`
@@ -340,9 +396,11 @@ Feldman 方案对秘密不保信息论安全（常数项承诺 `C_0 = generator 
 项之和，任何一方都无从得知。但 DKG 只覆盖密钥生成的一轮计算——贡献的网络传输、
 广播信道的可靠性与一致性、参与者身份认证（签名）、状态持久化都不在此实现，需要
 调用方在已认证的通道上交换贡献。`create_refresh` / `refresh` 在参与者集合、
-threshold 与群参数都不变的前提下提供主动份额刷新（旧份额须由调用方销毁替换），
-但不支持改变参与者集合或 threshold 的重共享（resharing），也不处理被攻陷方的
-剔除。门限 Schnorr 签名
+threshold 与群参数都不变的前提下提供主动份额刷新（旧份额须由调用方销毁替换）；
+`create_reshare` / `reshare` 在此基础上支持更换成员集合与 threshold 的重共享：
+达到旧 threshold 的旧参与者 quorum 把旧秘密重新分发给新成员集合，联合秘密与
+`public_key` 不变，但重共享同样不含网络、认证与持久化，且不能识别伪装成合法
+dealer 的敌对方——dealer 集合的协商与成员身份的认证由调用方保证。门限 Schnorr 签名
 在 DKG 之上增加两轮计算：第一轮的随机数承诺交换与第二轮的签名份额聚合同样不含
 网络、认证、存储；轮次对象不做重放防护，跨消息/轮次的复用由挑战绑定与份额校验
 识别，但是否为同一消息启用新一轮由调用方决定。一次性非数 `r_i` 的复用防护也不在
