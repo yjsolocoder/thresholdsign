@@ -1,6 +1,6 @@
 # thresholdsign
 
-有限域上的 Shamir 秘密共享。把一份秘密拆成 `share_count` 份，任意 `threshold` 份可重建，少于 `threshold` 份得不到关于秘密的信息。支持 Feldman 与 Pedersen 可验证秘密共享（VSS）：接收者可凭承诺公开验证自己的份额是否落在分发多项式上，而无需信任分发者；Pedersen 承诺还对秘密本身信息论保密。在此之上还提供单轮 Pedersen 分布式密钥生成（DKG）：多名参与者各自贡献随机性，联合生成无人知晓完整秘密的共享密钥。DKG 之上还提供两轮门限 Schnorr 签名：每个签名者独立发布一次性随机数承诺，再各自产出可公开验证的签名份额，聚合后任何人都可凭联合公钥验签。
+有限域上的 Shamir 秘密共享。把一份秘密拆成 `share_count` 份，任意 `threshold` 份可重建，少于 `threshold` 份得不到关于秘密的信息。支持 Feldman 与 Pedersen 可验证秘密共享（VSS）：接收者可凭承诺公开验证自己的份额是否落在分发多项式上，而无需信任分发者；Pedersen 承诺还对秘密本身信息论保密。在此之上还提供单轮 Pedersen 分布式密钥生成（DKG）：多名参与者各自贡献随机性，联合生成无人知晓完整秘密的共享密钥。DKG 之上还提供两轮门限 Schnorr 签名：每个签名者独立发布一次性随机数承诺，再各自产出可公开验证的签名份额，聚合后任何人都可凭联合公钥验签；并提供保持联合秘密与公钥不变的主动份额刷新（`create_refresh` / `refresh`）。
 
 ## 环境
 
@@ -155,6 +155,43 @@ assert verify_signature(
 支持 `threshold = 1`。一次性随机数由可注入的 `randbelow` 在 `prime - 1` 个值上
 抽取并自动排除零（返回值加一），复用防护需要调用方保证——本实现不保存任何状态。
 
+### 主动份额刷新
+
+签名 DKG 聚合出 `SigningDKGResult` 之后，参与者集合可以在**不改变联合秘密与联合
+公钥**的前提下主动轮换各自的份额：每名参与者以刷新前的 `key` 为参数调用
+`create_refresh` 产出一份刷新贡献，再由 `refresh` 聚合。刷新贡献与普通签名贡献
+采用完全相同的生成顺序与规则，唯一区别是共享多项式的常数项**固定为 0 且不抽样**
+（高次系数仍随机抽取，盲化多项式照常整体随机），因此其常数项 Feldman 承诺恒为
+群单位元 `1`。聚合时刷新双份额按域与旧份额相加、两类承诺按群与旧承诺相乘，并重算
+`verification_shares`；联合秘密与 `public_key` 不变，旧公钥下已有的聚合签名仍然
+有效。本库不保存任何隐藏状态、不修改 `key`，刷新成功后**调用方必须销毁旧份额**并
+改用返回结果中的新份额（参与者集合、`threshold` 与群参数均不变）。
+
+```python
+from thresholdsign import SigningDKGResult, create_refresh, refresh
+
+# key 为 aggregate_signing_dkg 的成功结果
+refresh_contributions = [
+    create_refresh(pid, key) for pid in key.result.participant_ids
+]
+refreshed = refresh(refresh_contributions, key)
+if isinstance(refreshed, SigningDKGResult):
+    assert refreshed.public_key == key.public_key          # 公钥不变
+    # 用任意 threshold 份新份额重建的联合秘密与刷新前一致
+    ...
+    # 此后销毁旧份额，签名协议改用 refreshed（接口完全相同）
+else:
+    # list[DKGRejection]：验证失败的刷新贡献，按 sender_id 升序列出
+    ...
+```
+
+`refresh` 要求 `key` 中每名参与者恰好提交一份同参贡献（编号、`threshold`、群参数
+均取自 `key`）；缺失、重复、参数不一致或结构非法抛 `ValueError`，类型错误抛
+`TypeError`。每份贡献都要通过完整验证：双份额匹配 Pedersen 承诺、每份份额匹配
+Feldman 承诺，且 Feldman 常数项承诺为 `1`；任一失败者按 `sender_id` 升序进入
+`DKGRejection` 列表。成功结果与贡献提交顺序无关。刷新可反复进行；支持
+`threshold = 1`。
+
 
 ## 命令行演示
 
@@ -229,6 +266,19 @@ python3 -m thresholdsign
   threshold 且绑定同一条共享多项式（不一致为非法输入，抛 `ValueError`）；成功返回
   `SigningDKGResult`，其中 `Y` 为各常数项 Feldman 承诺之积、`Y_i` 为各承诺在 `i` 处
   求值之积
+- `create_refresh(sender_id, key, *, randbelow=secrets.randbelow)` — 以刷新前的
+  `SigningDKGResult`（`key`）提供参与者编号、`threshold` 与群参数，产出一份
+  `SigningContribution` 用于主动份额刷新；除共享多项式常数项固定为 0 且不抽样外，
+  其余系数的生成顺序与规则与 `create_signing_contribution` 完全一致（高次系数随机，
+  盲化系数照常随机），故常数项 Feldman 承诺恒为 `1`
+- `refresh(contributions, key)` — 用 `key` 每名参与者恰好一份、同参（编号、
+  threshold、群参数与 `key` 一致）的刷新贡献轮换份额：校验双份额匹配 Pedersen 承诺、
+  每份份额匹配 Feldman 承诺且 Feldman 常数项承诺为 `1`，各失败者按 `sender_id`
+  升序返回 `list[DKGRejection]`（顺序无关、绝不忽略）；类型错误抛 `TypeError`，
+  缺失、重复、参数不一致或结构非法抛 `ValueError`；成功返回新的 `SigningDKGResult`：
+  双份额按域相加、两类承诺按群相乘并重算 `verification_shares`，联合秘密与
+  `public_key` 不变（旧聚合签名仍有效），结果与贡献顺序无关；库不保存隐藏状态，
+  调用方须在成功后销毁旧份额、改用新份额；支持 `threshold = 1`
 - `SigningNonceCommitment(signer_id, commitment)` — 冻结数据类；第一轮随机数承诺
   `R_i = g^r_i mod group_prime`，非数本身不出现
 - `create_signing_nonce_commitment(signer_id, *, group_prime, generator, prime=DEFAULT_PRIME, randbelow=secrets.randbelow)`
@@ -298,7 +348,10 @@ Feldman 方案对秘密不保信息论安全（常数项承诺 `C_0 = generator 
 单轮 Pedersen DKG 消除了"分发者知道完整秘密"这一点：联合秘密是各参与者随机常数
 项之和，任何一方都无从得知。但 DKG 只覆盖密钥生成的一轮计算——贡献的网络传输、
 广播信道的可靠性与一致性、参与者身份认证（签名）、状态持久化都不在此实现，需要
-调用方在已认证的通道上交换贡献；它也没有份额轮换或重共享能力。门限 Schnorr 签名
+调用方在已认证的通道上交换贡献。`create_refresh` / `refresh` 在参与者集合、
+`threshold` 与群参数均不变的前提下提供主动份额轮换（联合秘密与公钥不变），但它
+不是重共享：不能改变参与者集合或阈值，旧份额的销毁同样由调用方负责；刷新贡献的
+网络传输与认证也沿用 DKG 的边界。门限 Schnorr 签名
 在 DKG 之上增加两轮计算：第一轮的随机数承诺交换与第二轮的签名份额聚合同样不含
 网络、认证、存储；轮次对象不做重放防护，跨消息/轮次的复用由挑战绑定与份额校验
 识别，但是否为同一消息启用新一轮由调用方决定。一次性非数 `r_i` 的复用防护也不在

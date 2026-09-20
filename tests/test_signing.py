@@ -18,11 +18,13 @@ from thresholdsign import (
     SignatureShareRejection,
     aggregate_signature,
     aggregate_signing_dkg,
+    create_refresh,
     create_signature_share,
     create_signing_contribution,
     create_signing_nonce_commitment,
     create_signing_round,
     reconstruct_secret,
+    refresh,
     schnorr_challenge,
     verify_signature,
     verify_signature_share,
@@ -1134,6 +1136,399 @@ class NonceReuseSafetyTest(unittest.TestCase):
         )
         self.assertNotEqual(r1, r2)
         self.assertNotEqual(c1.commitment, c2.commitment)
+
+
+def make_refresh_contributions(key, participant_ids=None, seed_base=1000):
+    ids = participant_ids or key.result.participant_ids
+    return [
+        create_refresh(pid, key, randbelow=fixed_random(pid + seed_base))
+        for pid in ids
+    ]
+
+
+class CreateRefreshTest(unittest.TestCase):
+    def setUp(self):
+        self.key = make_signing_dkg((1, 2, 3), 2)
+
+    def test_returns_signing_contribution_on_key_parameters(self):
+        contribution = create_refresh(2, self.key, randbelow=fixed_random(5))
+        self.assertIsInstance(contribution, SigningContribution)
+        dealing = contribution.contribution
+        self.assertEqual(dealing.sender_id, 2)
+        self.assertEqual(dealing.participant_ids, (1, 2, 3))
+        self.assertEqual(len(dealing.shares), 3)
+        self.assertEqual(len(dealing.blinding_shares), 3)
+        self.assertEqual(len(dealing.commitment.values), 2)
+        self.assertEqual(len(contribution.feldman_commitment.values), 2)
+        for commitment in (dealing.commitment, contribution.feldman_commitment):
+            self.assertEqual(commitment.field_prime, FIELD_PRIME)
+            self.assertEqual(commitment.group_prime, GROUP_PRIME)
+            self.assertEqual(commitment.generator, GENERATOR)
+        self.assertEqual(dealing.commitment.blinding_generator, BLINDING_GENERATOR)
+
+    def test_feldman_constant_commitment_is_identity(self):
+        # The sharing constant term is fixed at zero and never sampled, so
+        # its Feldman commitment is the group identity.
+        for contribution in make_refresh_contributions(self.key):
+            self.assertEqual(contribution.feldman_commitment.values[0], 1)
+
+    def test_double_shares_verify_against_both_commitments(self):
+        from thresholdsign import verify_pedersen_share, verify_share
+
+        for contribution in make_refresh_contributions(self.key):
+            dealing = contribution.contribution
+            for share, blinding_share in zip(
+                dealing.shares, dealing.blinding_shares
+            ):
+                self.assertTrue(
+                    verify_pedersen_share(
+                        share, blinding_share, dealing.commitment
+                    )
+                )
+                self.assertTrue(verify_share(share, contribution.feldman_commitment))
+
+    def test_generation_order_matches_signing_contribution_except_constant(self):
+        # With the same random stream, a refresh contribution must equal a
+        # signing contribution whose first drawn sharing coefficient is zero:
+        # the constant is skipped and every later draw keeps the same order.
+        sequence = fixed_random(77)
+        refresh_contribution = create_refresh(1, self.key, randbelow=sequence)
+
+        calls = {"count": 0}
+        base = fixed_random(77)
+
+        def zero_first_then_stream(upper):
+            if calls["count"] == 0:
+                calls["count"] += 1
+                return 0
+            calls["count"] += 1
+            return base(upper)
+
+        signing_contribution = create_signing_contribution(
+            1, (1, 2, 3), 2,
+            prime=FIELD_PRIME, group_prime=GROUP_PRIME,
+            generator=GENERATOR, blinding_generator=BLINDING_GENERATOR,
+            randbelow=zero_first_then_stream,
+        )
+        self.assertEqual(refresh_contribution, signing_contribution)
+
+    def test_threshold_one_sharing_polynomial_is_zero(self):
+        key = make_signing_dkg((1, 2), 1)
+        contribution = create_refresh(1, key, randbelow=fixed_random(9))
+        self.assertEqual(contribution.feldman_commitment.values, (1,))
+        # The only sharing coefficient is the fixed zero, so every share is 0.
+        self.assertTrue(all(share.y == 0 for share in contribution.contribution.shares))
+        # Blinding shares still use the one random blinding coefficient.
+        self.assertTrue(
+            any(share.y != 0 for share in contribution.contribution.blinding_shares)
+        )
+
+    def test_does_not_mutate_key_and_keeps_no_state(self):
+        before = dataclasses.asdict(self.key)
+        create_refresh(1, self.key, randbelow=fixed_random(3))
+        self.assertEqual(dataclasses.asdict(self.key), before)
+        # The same inputs reproduce the same contribution: nothing is stored.
+        first = create_refresh(1, self.key, randbelow=fixed_random(3))
+        second = create_refresh(1, self.key, randbelow=fixed_random(3))
+        self.assertEqual(first, second)
+
+    def test_bad_sender_and_key(self):
+        with self.assertRaises(ValueError):
+            create_refresh(4, self.key)
+        with self.assertRaises(TypeError):
+            create_refresh("1", self.key)
+        with self.assertRaises(TypeError):
+            create_refresh(1, "not a key")
+        with self.assertRaises(TypeError):
+            create_refresh(1, aggregate_signing_dkg(make_signing_contributions()).result)
+
+    def test_large_group_parameters_taken_from_key(self):
+        key = make_signing_dkg(
+            (1, 2, 3), 2,
+            field_prime=LARGE_FIELD, group_prime=LARGE_GROUP,
+            generator=LARGE_G, blinding_generator=LARGE_H,
+        )
+        contribution = create_refresh(2, key, randbelow=fixed_random(4))
+        self.assertEqual(
+            contribution.contribution.commitment.group_prime, LARGE_GROUP
+        )
+        self.assertEqual(contribution.feldman_commitment.values[0], 1)
+
+
+class RefreshTest(unittest.TestCase):
+    def setUp(self):
+        self.key = make_signing_dkg((1, 2, 3), 2)
+        self.contributions = make_refresh_contributions(self.key)
+
+    def _refresh(self):
+        outcome = refresh(self.contributions, self.key)
+        self.assertIsInstance(outcome, SigningDKGResult)
+        return outcome
+
+    def test_success_shape(self):
+        new_key = self._refresh()
+        self.assertEqual(new_key.result.participant_ids, (1, 2, 3))
+        self.assertEqual(len(new_key.result.shares), 3)
+        self.assertEqual(len(new_key.result.blinding_shares), 3)
+        self.assertEqual(len(new_key.result.commitment.values), 2)
+        self.assertEqual(len(new_key.verification_shares), 3)
+
+    def test_shares_added_fieldwise_and_commitments_multiplied(self):
+        from thresholdsign import verify_pedersen_share
+
+        new_key = self._refresh()
+        delta = aggregate_signing_dkg(self.contributions)
+        assert isinstance(delta, SigningDKGResult)
+        for index, participant_id in enumerate((1, 2, 3)):
+            old_share = self.key.result.shares[index]
+            self.assertEqual(
+                new_key.result.shares[index].y,
+                (old_share.y + delta.result.shares[index].y) % FIELD_PRIME,
+            )
+            self.assertEqual(
+                new_key.result.blinding_shares[index].y,
+                (
+                    self.key.result.blinding_shares[index].y
+                    + delta.result.blinding_shares[index].y
+                )
+                % FIELD_PRIME,
+            )
+            self.assertTrue(
+                verify_pedersen_share(
+                    new_key.result.shares[index],
+                    new_key.result.blinding_shares[index],
+                    new_key.result.commitment,
+                )
+            )
+        for position in range(2):
+            self.assertEqual(
+                new_key.result.commitment.values[position],
+                self.key.result.commitment.values[position]
+                * delta.result.commitment.values[position]
+                % GROUP_PRIME,
+            )
+
+    def test_verification_shares_recomputed(self):
+        new_key = self._refresh()
+        for share, Y_i in zip(new_key.result.shares, new_key.verification_shares):
+            self.assertEqual(pow(GENERATOR, share.y, GROUP_PRIME), Y_i)
+
+    def test_joint_secret_and_public_key_unchanged(self):
+        new_key = self._refresh()
+        self.assertEqual(new_key.public_key, self.key.public_key)
+        first_pair = reconstruct_secret(new_key.result.shares[:2], prime=FIELD_PRIME)
+        second_pair = reconstruct_secret(new_key.result.shares[1:], prime=FIELD_PRIME)
+        old_secret = reconstruct_secret(self.key.result.shares[:2], prime=FIELD_PRIME)
+        self.assertEqual(first_pair, second_pair)
+        self.assertEqual(first_pair, old_secret)
+
+    def test_shares_actually_change(self):
+        new_key = self._refresh()
+        self.assertNotEqual(
+            [share.y for share in new_key.result.shares],
+            [share.y for share in self.key.result.shares],
+        )
+
+    def test_old_aggregate_signature_still_verifies(self):
+        round_info, shares = sign_full(self.key, signer_ids=(2, 3))
+        signature = aggregate_signature(shares, round_info, self.key)
+        self.assertIsInstance(signature, AggregateSignature)
+        new_key = self._refresh()
+        self.assertTrue(
+            verify_signature(
+                round_info.message,
+                signature,
+                new_key.public_key,
+                prime=FIELD_PRIME,
+                group_prime=GROUP_PRIME,
+                generator=GENERATOR,
+            )
+        )
+
+    def test_refreshed_key_still_signs(self):
+        new_key = self._refresh()
+        round_info, shares = sign_full(new_key, signer_ids=(1, 3))
+        self.assertTrue(
+            all(verify_signature_share(share, round_info, new_key) for share in shares)
+        )
+        signature = aggregate_signature(shares, round_info, new_key)
+        self.assertIsInstance(signature, AggregateSignature)
+        self.assertTrue(
+            verify_signature(
+                round_info.message,
+                signature,
+                self.key.public_key,  # the public key survives the refresh
+                prime=FIELD_PRIME,
+                group_prime=GROUP_PRIME,
+                generator=GENERATOR,
+            )
+        )
+
+    def test_double_refresh(self):
+        first = self._refresh()
+        second_contributions = make_refresh_contributions(first, seed_base=2000)
+        second = refresh(second_contributions, first)
+        self.assertIsInstance(second, SigningDKGResult)
+        self.assertEqual(second.public_key, self.key.public_key)
+        secret = reconstruct_secret(second.result.shares[1:], prime=FIELD_PRIME)
+        self.assertEqual(
+            secret, reconstruct_secret(self.key.result.shares[:2], prime=FIELD_PRIME)
+        )
+
+    def test_threshold_one(self):
+        key = make_signing_dkg((1, 2), 1)
+        contributions = make_refresh_contributions(key)
+        new_key = refresh(contributions, key)
+        self.assertIsInstance(new_key, SigningDKGResult)
+        self.assertEqual(new_key.public_key, key.public_key)
+        self.assertEqual(
+            reconstruct_secret([new_key.result.shares[0]], prime=FIELD_PRIME),
+            reconstruct_secret([key.result.shares[0]], prime=FIELD_PRIME),
+        )
+
+    def test_large_group(self):
+        key = make_signing_dkg(
+            (1, 2, 3), 2,
+            field_prime=LARGE_FIELD, group_prime=LARGE_GROUP,
+            generator=LARGE_G, blinding_generator=LARGE_H,
+        )
+        contributions = make_refresh_contributions(key)
+        new_key = refresh(contributions, key)
+        self.assertIsInstance(new_key, SigningDKGResult)
+        self.assertEqual(new_key.public_key, key.public_key)
+
+    def test_input_order_does_not_matter(self):
+        shuffled = [self.contributions[2], self.contributions[0], self.contributions[1]]
+        self.assertEqual(
+            refresh(self.contributions, self.key),
+            refresh(shuffled, self.key),
+        )
+
+    def test_key_is_not_modified(self):
+        before = dataclasses.asdict(self.key)
+        self._refresh()
+        self.assertEqual(dataclasses.asdict(self.key), before)
+
+
+class RefreshFailureTest(unittest.TestCase):
+    def setUp(self):
+        self.key = make_signing_dkg((1, 2, 3), 2)
+        self.contributions = make_refresh_contributions(self.key)
+
+    def test_tampered_pedersen_share_is_rejected(self):
+        dealing = self.contributions[1].contribution
+        tampered_dealing = dataclasses.replace(
+            dealing,
+            shares=(ShareLike(dealing.shares[0].x, dealing.shares[0].y + 1),)
+            + dealing.shares[1:],
+        )
+        tampered = dataclasses.replace(
+            self.contributions[1], contribution=tampered_dealing
+        )
+        outcome = refresh(
+            [self.contributions[0], tampered, self.contributions[2]], self.key
+        )
+        self.assertEqual(outcome, [DKGRejection(sender_id=2)])
+
+    def test_nonzero_constant_feldman_commitment_is_rejected(self):
+        # An ordinary signing contribution has a random (non-zero) constant;
+        # its shares match both commitments, only the refresh rule fails.
+        ordinary = make_signing_contributions()[1]
+        outcome = refresh(
+            [self.contributions[0], ordinary, self.contributions[2]], self.key
+        )
+        self.assertEqual(outcome, [DKGRejection(sender_id=2)])
+
+    def test_feldman_bound_to_other_polynomial_is_rejected(self):
+        swapped = dataclasses.replace(
+            self.contributions[0],
+            feldman_commitment=self.contributions[1].feldman_commitment,
+        )
+        first = refresh([swapped, self.contributions[1], self.contributions[2]], self.key)
+        second = refresh(
+            [self.contributions[2], self.contributions[1], swapped], self.key
+        )
+        self.assertEqual(first, [DKGRejection(sender_id=1)])
+        self.assertEqual(second, [DKGRejection(sender_id=1)])
+
+    def test_multiple_failures_sorted_and_order_independent(self):
+        tampered = []
+        for contribution in (self.contributions[0], self.contributions[2]):
+            dealing = contribution.contribution
+            tampered_dealing = dataclasses.replace(
+                dealing,
+                shares=(ShareLike(dealing.shares[0].x, dealing.shares[0].y + 1),)
+                + dealing.shares[1:],
+            )
+            tampered.append(
+                dataclasses.replace(contribution, contribution=tampered_dealing)
+            )
+        expected = [DKGRejection(sender_id=1), DKGRejection(sender_id=3)]
+        first = refresh(
+            [tampered[0], self.contributions[1], tampered[1]], self.key
+        )
+        second = refresh(
+            [tampered[1], self.contributions[1], tampered[0]], self.key
+        )
+        self.assertEqual(first, expected)
+        self.assertEqual(second, expected)
+
+    def test_missing_and_duplicate_participants(self):
+        with self.assertRaises(ValueError):
+            refresh(self.contributions[:2], self.key)
+        with self.assertRaises(ValueError):
+            refresh(
+                [self.contributions[0], self.contributions[0], self.contributions[2]],
+                self.key,
+            )
+
+    def test_empty_input(self):
+        with self.assertRaises(ValueError):
+            refresh([], self.key)
+
+    def test_wrong_types_raise_type_error(self):
+        with self.assertRaises(TypeError):
+            refresh(
+                [c.contribution for c in self.contributions],  # plain DKG objects
+                self.key,
+            )
+        with self.assertRaises(TypeError):
+            refresh(["nope"], self.key)
+        with self.assertRaises(TypeError):
+            refresh(self.contributions, "not a key")
+        with self.assertRaises(TypeError):
+            refresh(self.contributions, self.key.result)
+
+    def test_participant_ids_mismatch(self):
+        other = make_signing_dkg((1, 2, 4), 2)
+        other_contributions = make_refresh_contributions(other)
+        with self.assertRaises(ValueError):
+            refresh(other_contributions, self.key)
+
+    def test_threshold_mismatch(self):
+        other = make_signing_dkg((1, 2, 3), 1)
+        other_contributions = make_refresh_contributions(other)
+        with self.assertRaises(ValueError):
+            refresh(other_contributions, self.key)
+
+    def test_group_parameters_mismatch(self):
+        other = make_signing_dkg(
+            (1, 2, 3), 2,
+            field_prime=LARGE_FIELD, group_prime=LARGE_GROUP,
+            generator=LARGE_G, blinding_generator=LARGE_H,
+        )
+        other_contributions = make_refresh_contributions(other)
+        with self.assertRaises(ValueError):
+            refresh(other_contributions, self.key)
+
+    def test_malformed_key_structure_raises_value_error(self):
+        broken = dataclasses.replace(
+            self.key, result=dataclasses.replace(self.key.result, shares=())
+        )
+        with self.assertRaises(ValueError):
+            create_refresh(1, broken)
+        with self.assertRaises(ValueError):
+            refresh(self.contributions, broken)
 
 
 if __name__ == "__main__":
