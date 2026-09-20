@@ -15,11 +15,12 @@ create_signing_nonce_commitment / create_signing_round / create_signature_share
 / verify_signature_share / aggregate_signature / verify_signature, signing
 audit receipts: SigningAudit / create_audit / check_audit, the stateless
 nonce-reuse audit NonceReuse / find_nonce_reuse, leaked-share recovery from
-reused nonces via NonceLeak / recover_leaks, and publicly
+reused nonces via NonceLeak / recover_leaks, publicly
 verifiable key-rotation authorization: Rotation / rotation_payload /
-verify_rotation, plus the persistent, multi-hop authorization chain
+verify_rotation, the persistent, multi-hop authorization chain
 RotationChain / verify_rotation_chain / encode_rotation_chain /
-decode_rotation_chain.
+decode_rotation_chain, and the stateless, threshold-Schnorr-authenticated
+audit chain: AuditChain / audit_chain_payload / verify_audit_chain.
 """
 
 from __future__ import annotations
@@ -84,6 +85,9 @@ __all__ = [
     "verify_rotation_chain",
     "encode_rotation_chain",
     "decode_rotation_chain",
+    "AuditChain",
+    "audit_chain_payload",
+    "verify_audit_chain",
 ]
 
 # Mersenne prime 2**127 - 1: large enough for integer secrets, small enough that
@@ -3452,3 +3456,149 @@ def recover_leaks(
         )
     leaks.sort(key=lambda leak: (leak.signer_id, leak.commitment))
     return tuple(leaks)
+
+
+# ---------------------------------------------------------------------------
+# Stateless audit chains: a non-empty, order-preserving batch of
+# (message, SigningAudit) receipt records sealed by one threshold Schnorr
+# signature. The signed chain message commits to the verifying public key
+# and, at every record position, to the message digest and the receipt
+# digest, so deleting, inserting, reordering or cross-key-substituting a
+# receipt all invalidate the signature. The library keeps no state: the
+# chain is a plain value and every receipt is re-checked on verification.
+# ---------------------------------------------------------------------------
+
+AUDIT_CHAIN_TAG = b"ts/ac/v1"
+
+
+@dataclass(frozen=True)
+class AuditChain:
+    """A non-empty, order-preserving batch of audit receipts sealed by one signature.
+
+    ``records`` is the non-empty tuple of ``(message, audit)`` pairs in chain
+    order, each ``message`` the exact bytes its :class:`SigningAudit` receipt
+    was created for; ``signature`` is the threshold Schnorr
+    :class:`AggregateSignature` on :func:`audit_chain_payload` of the records
+    and the verifying public key. The dataclass is frozen, positionally
+    constructible and compared by value; the records keep their order and the
+    chain carries no network, storage or hidden state. Neither the container
+    nor the signature is checked at construction time —
+    :func:`verify_audit_chain` is the way to test a chain afterwards.
+    """
+
+    records: tuple[tuple[bytes, SigningAudit], ...]
+    signature: AggregateSignature
+
+
+def _minimal_be(value: int) -> bytes:
+    """Shortest unsigned big-endian encoding of a non-negative integer (0 -> b"\\x00")."""
+    return value.to_bytes((value.bit_length() + 7) // 8 or 1, "big", signed=False)
+
+
+def _check_audit_chain_records(records: object) -> int:
+    """Type- and structure-check the records container of an audit chain.
+
+    Records must be a non-empty tuple of ``(bytes, SigningAudit)`` pairs; the
+    receipts themselves are not decoded here (that is :func:`check_audit`'s
+    job during verification). Returns the record count.
+    """
+    if not isinstance(records, tuple):
+        raise TypeError("records must be a tuple")
+    try:
+        count = len(records)
+    except OverflowError:
+        raise ValueError("too many records") from None
+    if count == 0:
+        raise ValueError("records must be non-empty")
+    for record in records:
+        if not isinstance(record, tuple) or len(record) != 2:
+            raise TypeError("each record must be a (message, audit) tuple")
+        message, audit = record
+        if not isinstance(message, bytes):
+            raise TypeError("record message must be bytes")
+        if not isinstance(audit, SigningAudit):
+            raise TypeError("record audit must be a SigningAudit instance")
+        if not isinstance(audit.payload, bytes):
+            raise TypeError("record audit payload must be bytes")
+    return count
+
+
+def audit_chain_payload(
+    records: tuple[tuple[bytes, SigningAudit], ...], public_key: int
+) -> bytes:
+    """Encode the canonical chain message the threshold key signs.
+
+    ``records`` must be a non-empty tuple of ``(message, audit)`` pairs and
+    ``public_key`` the positive integer verification key the chain is sealed
+    for. Wrong types raise TypeError — a non-tuple record sequence, a record
+    that is not a ``(bytes, SigningAudit)`` pair, or a non-integer (including
+    boolean) public key; an empty chain, a non-positive public key or a
+    record count that does not fit the 8-byte counter raise ValueError.
+
+    The payload is, in order: the tag ``b"ts/ac/v1"``,
+    ``SHA256(BE(public_key))`` where ``BE`` is the key's shortest unsigned
+    big-endian encoding, the record count as an 8-byte unsigned big-endian
+    integer, and then one ``SHA256(message) || SHA256(audit.payload)`` pair
+    per record in tuple order. It carries no signature and keeps no state,
+    and is meant to be used as the ``SigningRound.message`` of the sealing
+    threshold signing protocol.
+    """
+    if not isinstance(public_key, int) or isinstance(public_key, bool):
+        raise TypeError("public_key must be an integer")
+    count = _check_audit_chain_records(records)
+    if public_key <= 0:
+        raise ValueError("public_key must be positive")
+    if count > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("too many records")
+
+    buffer = bytearray(AUDIT_CHAIN_TAG)
+    buffer += hashlib.sha256(_minimal_be(public_key)).digest()
+    buffer += count.to_bytes(8, "big", signed=False)
+    for message, audit in records:
+        buffer += hashlib.sha256(message).digest()
+        buffer += hashlib.sha256(audit.payload).digest()
+    return bytes(buffer)
+
+
+def verify_audit_chain(chain: AuditChain, key: SigningDKGResult) -> bool:
+    """Verify an audit chain against its records and the threshold key.
+
+    Every ``(message, audit)`` record of ``chain.records`` is first re-checked
+    in chain order with :func:`check_audit` against ``key`` (so both
+    successful and faithfully recorded failure receipts re-verify), and the
+    canonical :func:`audit_chain_payload` of the records and
+    ``key.public_key`` is then checked as ``chain.signature``'s threshold
+    Schnorr message via :func:`verify_signature`. Returns ``True`` only when
+    every receipt matches its message and the key and the signature seals the
+    exact record sequence; deleting or inserting a record, reordering
+    records, substituting a receipt from another key (cross-key replacement),
+    tampering with a receipt or the signature, or presenting the chain under
+    another key all return ``False`` for well-formed inputs.
+
+    A non-:class:`AuditChain` argument, a non-:class:`AggregateSignature`
+    signature or any wrong record/key field type raises TypeError; an empty
+    chain, a structurally illegal receipt or signature, or a malformed
+    ``key`` raises ValueError, exactly as :func:`check_audit` and
+    :func:`verify_signature` would.
+    """
+    if not isinstance(chain, AuditChain):
+        raise TypeError("chain must be an AuditChain instance")
+    if not isinstance(chain.signature, AggregateSignature):
+        raise TypeError("chain signature must be an AggregateSignature instance")
+    _check_audit_chain_records(chain.records)
+    _result, public_key, field_prime, group_prime, generator = _check_signing_setup(key)
+    _check_signing_dkg_structure(key)
+
+    for message, audit in chain.records:
+        if not check_audit(message, audit, key):
+            return False
+
+    payload = audit_chain_payload(chain.records, public_key)
+    return verify_signature(
+        payload,
+        chain.signature,
+        public_key,
+        group_prime=group_prime,
+        generator=generator,
+        prime=field_prime,
+    )

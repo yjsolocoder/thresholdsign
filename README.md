@@ -324,6 +324,40 @@ anchor/`old` 对不上的链照常返回，由 `verify_rotation_chain` 返回 `F
 `ValueError`；非 `bytes` 的解码入参抛 `TypeError`。链本身不含任何网络、
 存储或隐藏状态。
 
+### 门限 Schnorr 认证的无状态审计链
+
+`SigningAudit` 回执各自独立；`AuditChain` 把一批成功或失败回执按给定顺序
+封装，并用一把门限密钥的 Schnorr 聚合签名封口。冻结数据类
+`AuditChain(records, signature)` 可按位置构造、按值相等，`records` 为非空且
+保序的 `(message, SigningAudit)` 元组。链消息
+`audit_chain_payload(records, public_key)` 按
+
+```text
+b"ts/ac/v1" || H(BE(public_key)) || U64(len(records))
+            || Σ_i ( H(message_i) || H(audit_i.payload) )
+```
+
+拼接（`H = SHA256`，`BE` 为最短无符号大端，`U64` 为 8 字节无符号大端），
+作为旧密钥 `SigningRound.message` 走两轮协议签署：
+
+```python
+from thresholdsign import AuditChain, audit_chain_payload, verify_audit_chain
+
+# records = ((message, audit), ...)，audit 由 create_audit 生成，成功/失败回执均可
+payload = audit_chain_payload(records, key.public_key)
+signature = sign_threshold(key, payload)   # 门限 quorum 两轮签署该 payload
+chain = AuditChain(records, signature)
+assert verify_audit_chain(chain, key)      # 任何人持 key 即可核验
+```
+
+`verify_audit_chain` 先按链序对每个记录调用 `check_audit` 逐项复核，再对链
+消息调用 `verify_signature`。链消息同时绑定公钥、记录数、每条消息与每张回执
+的摘要，因此删除、插入、重排记录，跨密钥替换回执，调换消息或篡改任一字节都
+会使签名失效而返回 `False`；逐回执复核则保证封装的确实是该密钥下真实成功或
+如实记录失败的回执。类型错误（非元组记录、记录非 `(bytes, SigningAudit)`、
+非整数/布尔公钥等）抛 `TypeError`；空链、非正公钥、计数溢出（超过 2^64-1）
+或回执、签名结构非法抛 `ValueError`。链不含任何网络、存储或隐藏状态。
+
 
 ## 命令行演示
 
@@ -542,6 +576,25 @@ python3 -m thresholdsign
   非规范 anchor、帧内非法证书、计数不符、溢出、截断、尾随字节，成功后重编码
   必得到原字节；签名不匹配或衔接断裂由 `verify_rotation_chain` 返回 `False`。
   非 `bytes` 入参抛 `TypeError`，其余非法情形抛 `ValueError`
+- `AuditChain(records, signature)` — 冻结数据类，可按位置构造、按值相等；
+  由门限 Schnorr 签名认证的无状态审计链：`records` 为非空且保序的
+  `(message, SigningAudit)` 元组，链序即回执封装顺序，`signature` 为对
+  `audit_chain_payload(records, public_key)` 的 `AggregateSignature`；构造时不
+  校验，核验由 `verify_audit_chain` 负责
+- `audit_chain_payload(records, public_key) -> bytes` — 生成由门限密钥签署的
+  规范链消息（作为 `SigningRound.message`）：依次拼接标签 `b"ts/ac/v1"`、
+  `H(BE(public_key))`（`H = SHA256`，`BE` 为最短无符号大端，零为单字节 `00`）、
+  8 字节无符号大端记录数 `U64(len(records))`，并按元组顺序逐项追加
+  `H(message) || H(audit.payload)`；payload 不含签名。`records` 各项须为
+  `(bytes, SigningAudit)` 二元组，类型错误（含非元组序列、非整数/布尔公钥）
+  抛 `TypeError`；空链、非正公钥或计数超过 2^64-1 抛 `ValueError`
+- `verify_audit_chain(chain, key) -> bool` — 先按链序对每个记录调用
+  `check_audit(message, audit, key)` 逐项复核（成功回执与如实记录的失败回执
+  均可通过），再以 `key` 的群参数与 `key.public_key` 对
+  `audit_chain_payload` 的链消息调用 `verify_signature`；全部一致返回 `True`。
+  删除、插入、重排记录，跨密钥替换回执，调换消息，篡改回执或签名，或换一把
+  密钥核验均返回 `False`；非 `AuditChain`/`AggregateSignature` 入参或记录、
+  密钥字段类型错误抛 `TypeError`，空链、回执或签名结构非法抛 `ValueError`
 
 ### 门限 Schnorr 群参数与边界
 
