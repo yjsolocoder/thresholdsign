@@ -22,7 +22,8 @@ RotationChain / verify_rotation_chain / encode_rotation_chain /
 decode_rotation_chain, and the stateless, threshold-Schnorr-authenticated
 audit chain: AuditChain / audit_chain_payload / verify_audit_chain.
 Merkle inclusion proofs over a chain's records: AuditProof / make_proof /
-check_proof.
+check_proof, plus their canonical transport encoding encode_audit_proof /
+decode_audit_proof.
 """
 
 from __future__ import annotations
@@ -95,6 +96,8 @@ __all__ = [
     "AuditProof",
     "make_proof",
     "check_proof",
+    "encode_audit_proof",
+    "decode_audit_proof",
 ]
 
 # Mersenne prime 2**127 - 1: large enough for integer secrets, small enough that
@@ -3971,41 +3974,22 @@ def make_proof(
     return AUDIT_PROOF_ROOT_TAG + _audit_proof_u64(count) + root, proof
 
 
-def check_proof(
-    proof: AuditProof,
-    signature: AggregateSignature,
-    key: SigningDKGResult,
-) -> bool:
-    """Rebuild a proof's Merkle root and verify its record and sealing signature.
+def _validate_audit_proof_structure(
+    proof: object,
+) -> tuple[int, int, bytes, SigningAudit, tuple[bytes, ...]]:
+    """Type- and structure-check an :class:`AuditProof`, returning its fields.
 
-    The leaf digest is recomputed from ``proof.i``, ``proof.m`` and
-    ``proof.a`` exactly as in :func:`make_proof`, and the root is rebuilt
-    by hashing the ``proof.p`` siblings from the leaf level up, pairing an
-    even position on the left and an odd position on the right (the odd
-    duplicated tail rebuilds itself identically). The embedded record is
-    then re-checked with :func:`check_audit` against ``key``, and the
-    statement ``b"am/r" || U64(n) || root`` is checked as
-    ``signature``'s threshold Schnorr message via :func:`verify_signature`.
-    Returns ``True`` only when the rebuilt root matches the signed
-    statement, the receipt matches its message and the key, and the
-    signature verifies; a well-formed proof whose root, record or
-    signature was tampered with, or which is presented under another key,
-    returns ``False``.
-
-    A non-:class:`AuditProof` or non-:class:`AggregateSignature` argument
-    or any wrong field type (non-integer ``i``/``n`` including booleans,
-    non-bytes message, non-:class:`SigningAudit` receipt, a non-tuple path
-    or non-bytes path entry) raises TypeError; a non-positive or
-    over-64-bit ``n``, an out-of-range ``i``, a path entry that is not
-    exactly 32 bytes, a path whose length does not fit ``n``, or a
-    structurally illegal receipt, signature or ``key`` raises ValueError,
-    exactly as :func:`check_audit` and :func:`verify_signature` would.
+    Shared by :func:`check_proof` and the wire codec. Only the container
+    structure is checked: the receipt payload is kept opaque and neither it
+    nor the path is parsed or cryptographically verified here. The bounds are
+    ``0 < n < 2**64`` and ``0 <= i < n``; the path must hold exactly
+    ``(n - 1).bit_length()`` entries, each 32 bytes, and the receipt payload
+    must be non-empty (the message may be empty). Wrong field types raise
+    TypeError; illegal bounds, an empty receipt or a bad path shape raise
+    ValueError.
     """
     if not isinstance(proof, AuditProof):
         raise TypeError("proof must be an AuditProof instance")
-    if not isinstance(signature, AggregateSignature):
-        raise TypeError("signature must be an AggregateSignature instance")
-
     index = proof.i
     count = proof.n
     message = proof.m
@@ -4027,30 +4011,79 @@ def check_proof(
         if not isinstance(sibling, bytes):
             raise TypeError("proof.p entries must be bytes")
 
-    _result, public_key, field_prime, group_prime, generator = _check_signing_setup(key)
-    _check_signing_dkg_structure(key)
-
     if count <= 0:
         raise ValueError("proof.n must be positive")
     if count > 0xFFFFFFFFFFFFFFFF:
         raise ValueError("too many records")
     if index < 0 or index >= count:
         raise ValueError("proof.i out of range")
+    if not audit.payload:
+        raise ValueError("proof.a payload must be non-empty")
     expected_depth = (count - 1).bit_length()
     if len(path) != expected_depth:
         raise ValueError("proof.p has the wrong length for proof.n")
     for sibling in path:
         if len(sibling) != AUDIT_PROOF_DIGEST_SIZE:
             raise ValueError("proof.p entries must be exactly 32 bytes")
+    return index, count, message, audit, path
+
+
+def check_proof(
+    proof: AuditProof,
+    signature: AggregateSignature,
+    key: SigningDKGResult,
+) -> bool:
+    """Rebuild a proof's Merkle root and verify its record and sealing signature.
+
+    The leaf digest is recomputed from ``proof.i``, ``proof.m`` and
+    ``proof.a`` exactly as in :func:`make_proof`, and the root is rebuilt
+    level by level while tracking the current level's width. At each level
+    the current position is paired by its parity — an even position is
+    hashed on the left, an odd position on the right — except for an odd
+    tail: when the level has odd width and the current node is its last
+    member it has no companion, so it is paired with itself
+    (``H(node, node)``), exactly the last-node duplication the tree builder
+    uses; the supplied sibling at that level is then irrelevant. The width
+    for the next level is ``(width + 1) // 2``. The embedded record is then
+    re-checked with :func:`check_audit` against ``key``, and the statement
+    ``b"am/r" || U64(n) || root`` is checked as ``signature``'s threshold
+    Schnorr message via :func:`verify_signature`. Returns ``True`` only when
+    the rebuilt root matches the signed statement, the receipt matches its
+    message and the key, and the signature verifies; a well-formed proof
+    whose root, record or signature was tampered with, or which is presented
+    under another key, returns ``False``.
+
+    A non-:class:`AuditProof` or non-:class:`AggregateSignature` argument
+    or any wrong field type (non-integer ``i``/``n`` including booleans,
+    non-bytes message, non-:class:`SigningAudit` receipt, a non-tuple path
+    or non-bytes path entry) raises TypeError; a non-positive or
+    over-64-bit ``n``, an out-of-range ``i``, an empty receipt, a path
+    entry that is not exactly 32 bytes, a path whose length does not fit
+    ``n``, or a structurally illegal receipt, signature or ``key`` raises
+    ValueError, exactly as :func:`check_audit` and
+    :func:`verify_signature` would.
+    """
+    index, count, message, audit, path = _validate_audit_proof_structure(proof)
+    if not isinstance(signature, AggregateSignature):
+        raise TypeError("signature must be an AggregateSignature instance")
+
+    _result, public_key, field_prime, group_prime, generator = _check_signing_setup(key)
+    _check_signing_dkg_structure(key)
 
     node = _audit_proof_leaf(index, message, audit)
     position = index
+    width = count
     for sibling in path:
-        if position % 2 == 0:
+        if width % 2 == 1 and position == width - 1:
+            # Odd tail with no companion: pair the node with itself, as the
+            # tree builder duplicated its last node for pairing.
+            node = _audit_proof_node(node, node)
+        elif position % 2 == 0:
             node = _audit_proof_node(node, sibling)
         else:
             node = _audit_proof_node(sibling, node)
         position //= 2
+        width = (width + 1) // 2
 
     signed_message = AUDIT_PROOF_ROOT_TAG + _audit_proof_u64(count) + node
     if not check_audit(message, audit, key):
@@ -4063,3 +4096,136 @@ def check_proof(
         generator=generator,
         prime=field_prime,
     )
+
+
+# ---------------------------------------------------------------------------
+# Canonical audit-proof transport: a self-delimiting, byte-for-byte
+# reproducible encoding of an AuditProof for cross-implementation exchange and
+# persistence. Decoding restores structure only — the receipt is not parsed,
+# no signature is checked and no state is kept, so check_proof remains the
+# sole verifier afterwards.
+# ---------------------------------------------------------------------------
+
+AUDIT_PROOF_WIRE_TAG = b"thresholdsign/audit-proof/v1"
+
+
+def encode_audit_proof(proof: AuditProof) -> bytes:
+    """Canonically encode an audit proof for transport or persistence.
+
+    The encoding is the direct concatenation, in order, of the tag
+    ``b"thresholdsign/audit-proof/v1"``, ``VARINT(i)`` and ``VARINT(n)``, the
+    message frame, the receipt frame, the path count as a 4-byte unsigned
+    big-endian integer and then the raw 32-byte path entries. A ``VARINT`` is
+    a 4-byte unsigned big-endian body length followed by the shortest
+    unsigned big-endian value (zero is the single byte ``00`` and positive
+    values carry no leading zero); each frame is a 4-byte unsigned big-endian
+    length followed by the raw bytes. The message may be empty but the
+    receipt must be non-empty, ``n`` must satisfy ``0 < n < 2**64`` and
+    ``i`` must satisfy ``0 <= i < n``, and the path count must be
+    ``(n - 1).bit_length()`` entries of exactly 32 bytes.
+
+    Only a structurally legal :class:`AuditProof` is accepted — wrong field
+    types raise TypeError and illegal bounds, an empty receipt, a bad path
+    shape or an over-long frame raise ValueError, exactly as
+    :func:`check_proof`'s structural checks do — but the receipt is not
+    parsed and no signature is checked: :func:`check_proof` stays the way to
+    verify a proof afterwards. The output for a given proof is unique and
+    the encoding carries no network, storage or hidden state.
+    """
+    if not isinstance(proof, AuditProof):
+        raise TypeError("proof must be an AuditProof instance")
+    index, count, message, audit, path = _validate_audit_proof_structure(proof)
+    if len(message) > 0xFFFFFFFF:
+        raise ValueError("message encoding too long")
+    if len(audit.payload) > 0xFFFFFFFF:
+        raise ValueError("receipt encoding too long")
+
+    buffer = bytearray(AUDIT_PROOF_WIRE_TAG)
+    buffer += _encode_varint(index)
+    buffer += _encode_varint(count)
+    buffer += len(message).to_bytes(4, "big", signed=False)
+    buffer += message
+    buffer += len(audit.payload).to_bytes(4, "big", signed=False)
+    buffer += audit.payload
+    buffer += len(path).to_bytes(4, "big", signed=False)
+    for sibling in path:
+        buffer += sibling
+    return bytes(buffer)
+
+
+def _read_audit_proof_block(
+    stream: bytes, offset: int, *, what: str, allow_empty: bool = False
+) -> tuple[bytes, int]:
+    """Read one 4-byte-length-prefixed proof frame body at ``offset``."""
+    if offset + 4 > len(stream):
+        raise ValueError(f"truncated audit proof {what} length")
+    length = int.from_bytes(stream[offset:offset + 4], "big")
+    offset += 4
+    if length == 0 and not allow_empty:
+        raise ValueError(f"audit proof {what} must be non-empty")
+    if offset + length > len(stream):
+        raise ValueError(f"truncated audit proof {what}")
+    return bytes(stream[offset:offset + length]), offset + length
+
+
+def decode_audit_proof(payload: bytes) -> AuditProof:
+    """Decode the canonical encoding produced by :func:`encode_audit_proof`.
+
+    Accepts only the single canonical form: the tag
+    ``b"thresholdsign/audit-proof/v1"``, the length-prefixed integers ``i``
+    and ``n`` (each a 4-byte unsigned big-endian length followed by its
+    shortest unsigned big-endian value, zero encoded as the single byte
+    ``00``), the message frame (a 4-byte length, possibly zero, followed by
+    the raw message), the receipt frame (a 4-byte non-zero length followed by
+    the raw receipt bytes), the 4-byte path count and then exactly that many
+    raw 32-byte path entries. A non-bytes argument raises TypeError; a wrong
+    or missing tag, an empty receipt, an out-of-range ``i``, an over-64-bit
+    ``n``, a non-canonical integer (leading zero or over-long length),
+    truncation, trailing bytes, or a path count that does not equal
+    ``(n - 1).bit_length()`` (including entries that are not exactly 32
+    bytes) raises ValueError. A successfully decoded proof re-encodes to
+    exactly the input bytes.
+
+    Decoding only restores the structure: the receipt is stored opaque and
+    is neither parsed nor verified, no signature is checked and no state is
+    kept. A structurally legal proof whose receipt does not match its
+    message or whose sealing signature is invalid is returned normally, and
+    :func:`check_proof` reports it as ``False``.
+    """
+    if not isinstance(payload, bytes):
+        raise TypeError("payload must be bytes")
+    if not payload.startswith(AUDIT_PROOF_WIRE_TAG):
+        raise ValueError("bad audit proof tag")
+    offset = len(AUDIT_PROOF_WIRE_TAG)
+
+    index, offset = _read_varint(payload, offset, what="audit proof i")
+    count, offset = _read_varint(payload, offset, what="audit proof n")
+    message, offset = _read_audit_proof_block(
+        payload, offset, what="message", allow_empty=True
+    )
+    receipt, offset = _read_audit_proof_block(payload, offset, what="receipt")
+
+    if offset + 4 > len(payload):
+        raise ValueError("truncated audit proof path count")
+    path_count = int.from_bytes(payload[offset:offset + 4], "big")
+    offset += 4
+    path = []
+    for _ in range(path_count):
+        if offset + AUDIT_PROOF_DIGEST_SIZE > len(payload):
+            raise ValueError("truncated audit proof path")
+        path.append(bytes(payload[offset:offset + AUDIT_PROOF_DIGEST_SIZE]))
+        offset += AUDIT_PROOF_DIGEST_SIZE
+    if offset != len(payload):
+        raise ValueError("trailing bytes after audit proof")
+
+    proof = AuditProof(
+        i=index,
+        n=count,
+        m=message,
+        a=SigningAudit(payload=receipt),
+        p=tuple(path),
+    )
+    _validate_audit_proof_structure(proof)
+    if encode_audit_proof(proof) != payload:
+        raise ValueError("non-canonical audit proof")
+    return proof

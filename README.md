@@ -410,13 +410,32 @@ assert check_proof(proof, signature, key)  # 持 key 即可核验单条记录
 ```
 
 `check_proof(proof, signature, key) -> bool` 先由 `proof` 的叶与 `p` 自叶至根重建
-根（偶位置节点在左、奇位置在右，奇数复制尾自然重建），再对该记录调用
+根：逐层维护当前层宽度，偶位置节点在左、奇位置在右；当某层宽度为奇数且当前节点恰
+为最后一个时它没有同伴，以自身作兄弟（`H(node, node)`），该层所给兄弟随即无关，
+宽度按 `(width+1)//2` 上收。再对该记录调用
 `check_audit(m, a, key)` 复核回执，并对 `b"am/r"||U64(n)||root` 调用
 `verify_signature`；三者一致返回 `True`，合法但不匹配（篡改消息、回执、下标、
-路径兄弟或签名，换密钥核验等）返回 `False`。待签消息只绑定 `(n, root)`，故同一
+非奇数尾层的路径兄弟或签名，换密钥核验等）返回 `False`。待签消息只绑定 `(n, root)`，故同一
 棵树的一个根签名即可支撑任意叶的包含证明。非 `AuditProof`/`AggregateSignature`
-入参或字段类型错误抛 `TypeError`；`n` 非正或超过 2^64-1、`i` 越界、`p` 长度与
-`n` 不符或某项非 32 字节、回执或签名结构非法抛 `ValueError`。
+入参或字段类型错误抛 `TypeError`；`n` 非正或超过 2^64-1、`i` 越界、空回执、`p` 长度与
+`n` 不符（恰为 `(n-1).bit_length()`）或某项非 32 字节、回执或签名结构非法抛 `ValueError`。
+
+要跨实现传输或持久化证明，用 `encode_audit_proof` / `decode_audit_proof` 的公开规范
+编码，它只还原结构、不解析回执、不验签、不留状态：
+
+```python
+from thresholdsign import encode_audit_proof, decode_audit_proof
+
+blob = encode_audit_proof(proof)             # bytes，可自由传输/落盘，无隐藏状态
+restored = decode_audit_proof(blob)          # AuditProof
+assert encode_audit_proof(restored) == blob  # 成功解码必可逐字节复现
+```
+
+编码依次直拼标签 `b"thresholdsign/audit-proof/v1"`、`VARINT(i)`、`VARINT(n)`、
+消息帧、回执帧、4 字节路径数及逐字的 32 字节路径项。`VARINT` 为 4 字节无符号大端
+长度 + 最短无符号大端值（零是单字节 `00`，正数禁前导零）；消息/回执帧均为 4 字节
+无符号大端长度 + 原字节，消息可空、回执非空。约束 `0 < n < 2^64`、`0 <= i < n`、
+路径数恰为 `(n-1).bit_length()`。
 
 
 ## 命令行演示
@@ -681,12 +700,25 @@ python3 -m thresholdsign
   `H(b"am/n"||left||right)`，每层奇数尾节点复制自身配对；返回待签消息
   `b"am/r"||U64(n)||root` 与第 `i` 叶证明。索引非整数（含布尔）或记录类型错误
   抛 `TypeError`；空记录、计数超过 2^64-1 或 `i` 越界抛 `ValueError`
-- `check_proof(proof, signature, key) -> bool` — 按 `proof.p` 自叶至根重建根，
-  对 `(proof.m, proof.a)` 调用 `check_audit` 并对
+- `check_proof(proof, signature, key) -> bool` — 逐层维护宽度并按
+  `proof.p` 自叶至根重建根（奇数尾无同伴时以自身作兄弟），对
+  `(proof.m, proof.a)` 调用 `check_audit` 并对
   `b"am/r"||U64(n)||root` 调用 `verify_signature`；全部一致返回 `True`，结构
   合法但不匹配返回 `False`。非 `AuditProof`/`AggregateSignature` 入参或字段类型
-  错误抛 `TypeError`，`n` 非正或超 2^64-1、`i` 越界、路径长度不符或兄弟非
-  32 字节、回执/签名结构非法抛 `ValueError`
+  错误抛 `TypeError`，`n` 非正或超 2^64-1、`i` 越界、空回执、路径长度不符
+  （恰为 `(n-1).bit_length()`）或兄弟非 32 字节、回执/签名结构非法抛 `ValueError`
+- `encode_audit_proof(proof) -> bytes` — 证明的规范传输/持久化编码：依次直拼
+  标签 `b"thresholdsign/audit-proof/v1"`、`VARINT(i)`、`VARINT(n)`、消息帧、
+  回执帧、4 字节路径数及逐字 32 字节路径项；`VARINT` 为 4 字节长度 + 最短无符号
+  大端值（零为 `00`，正数禁前导零），消息可空、回执非空。只接受结构合法的
+  `AuditProof`（`0 < n < 2^64`、`0 <= i < n`、路径数恰为
+  `(n-1).bit_length()`），不解析回执、不验签；输出唯一、无状态。字段类型错误抛
+  `TypeError`，空回执、越界/溢出、路径不符或超长帧抛 `ValueError`
+- `decode_audit_proof(payload) -> AuditProof` — `encode_audit_proof` 的逆操作，
+  仅还原结构、不解析回执、不验签、不留状态：拒绝非 `bytes`、坏/缺标签、空回执、
+  越界或超 2^64-1 的 `n`、非规范整数（前导零或超长）、截断/尾随字节及计数/路径
+  不符；成功后重编码必逐字节等于输入。非 `bytes` 入参抛 `TypeError`，其余非法
+  情形抛 `ValueError`；结构合法但回执或签名不匹配由 `check_proof` 返回 `False`
 
 ### 门限 Schnorr 群参数与边界
 
