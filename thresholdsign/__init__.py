@@ -12,7 +12,10 @@ create_reshare / reshare, and the two-round
 threshold Schnorr protocol: SigningNonceCommitment /
 SigningRound / SignatureShare / SignatureShareRejection / AggregateSignature /
 create_signing_nonce_commitment / create_signing_round / create_signature_share
-/ verify_signature_share / aggregate_signature / verify_signature.
+/ verify_signature_share / aggregate_signature / verify_signature. The audit
+extension adds SigningAudit / create_audit / check_audit: a self-contained
+receipt recording one threshold signing instance, verifiable with the signing
+DKG result alone.
 """
 
 from __future__ import annotations
@@ -61,6 +64,9 @@ __all__ = [
     "aggregate_signature",
     "verify_signature",
     "schnorr_challenge",
+    "SigningAudit",
+    "create_audit",
+    "check_audit",
 ]
 
 # Mersenne prime 2**127 - 1: large enough for integer secrets, small enough that
@@ -2372,4 +2378,406 @@ def verify_signature(
     )
     return pow(generator, signature.z, group_prime) == (
         signature.R * pow(public_key, challenge, group_prime) % group_prime
+    )
+
+
+# ---------------------------------------------------------------------------
+# Signing audit receipts.
+#
+# A receipt freezes one signing instance into a single self-describing byte
+# string: the audit tag, SHA-256(message), the public key Y, the aggregate
+# commitment R, the challenge c, one row (signer id, R_i, z_i) per round
+# signer, the one-byte status/present flags and, only when every share
+# passed, the aggregate z. check_audit re-derives R, c, the per-share
+# verdicts, the status and the aggregate signature from the receipt and the
+# SigningDKGResult alone; the original SigningRound is not needed. Neither
+# nonces, secret shares nor polynomial coefficients ever enter the payload.
+# ---------------------------------------------------------------------------
+
+AUDIT_TAG = b"thresholdsign/audit/v1"
+
+
+@dataclass(frozen=True)
+class SigningAudit:
+    """A self-contained audit receipt of one threshold signing instance.
+
+    ``payload`` is the only field: a canonical byte string (see
+    :func:`create_audit` for the layout) that records the message digest, the
+    public key and round commitments, every submitted signature share, the
+    pass/fail status and, on full success, the aggregate signature. It
+    contains neither nonces, secret shares nor polynomial coefficients. As a
+    frozen single-field dataclass it supports positional construction
+    (``SigningAudit(payload)``) and equality by value.
+    """
+
+    payload: bytes
+
+
+def _audit_integer_width(group_prime: int) -> int:
+    """The Schnorr encoding width ``L = ceil(group_prime.bit_length() / 8)``."""
+    return (group_prime.bit_length() + 7) // 8
+
+
+def _take(payload: bytes, offset: int, length: int) -> tuple[int, int]:
+    """Read ``length`` unsigned big-endian bytes at ``offset`` or raise ValueError."""
+    if offset + length > len(payload):
+        raise ValueError("truncated audit payload")
+    value = int.from_bytes(payload[offset : offset + length], "big", signed=False)
+    return value, offset + length
+
+
+def _build_audit_payload(
+    message: bytes,
+    public_key: int,
+    R: int,
+    challenge: int,
+    rows: Sequence[tuple[int, int, int]],
+    status: int,
+    aggregate_z: int | None,
+    *,
+    field_prime: int,
+    group_prime: int,
+) -> bytes:
+    """Serialise one audit receipt in the canonical audit-v1 layout.
+
+    ``rows`` must already be ordered by ascending signer id; each row is
+    ``(signer_id, R_i, z_i)``. When ``status == 1`` ``aggregate_z`` is the
+    summed aggregate signature and is appended; when ``status == 0`` it must
+    be ``None`` and nothing is appended.
+    """
+    length = _audit_integer_width(group_prime)
+    buffer = bytearray(AUDIT_TAG)
+    buffer += hashlib.sha256(message).digest()
+    buffer += _encode_integer(public_key, length)
+    buffer += _encode_integer(R, length)
+    buffer += _encode_integer(challenge, length)
+    buffer += len(rows).to_bytes(4, "big")
+    for signer_id, commitment, share_z in rows:
+        buffer += _encode_integer(signer_id, length)
+        buffer += _encode_integer(commitment, length)
+        buffer += _encode_integer(share_z, length)
+    buffer.append(status)
+    buffer.append(status)
+    if status == 1:
+        assert aggregate_z is not None
+        buffer += _encode_integer(aggregate_z, length)
+    return bytes(buffer)
+
+
+def _parse_audit_payload(
+    payload: bytes,
+    *,
+    field_prime: int,
+    group_prime: int,
+) -> dict[str, object]:
+    """Decode and structurally validate an audit-v1 payload.
+
+    Malformed layout, trailing bytes, out-of-range integers, commitments off
+    the order-``field_prime`` subgroup, non-increasing signer ids, or
+    disagreeing status/present flags raise ValueError. Cryptographic
+    mismatches against a message or DKG result are not detectable here and
+    are left to :func:`check_audit`, which reports them as ``False``.
+    """
+    if not payload.startswith(AUDIT_TAG):
+        raise ValueError("audit payload must start with the thresholdsign/audit/v1 tag")
+    offset = len(AUDIT_TAG)
+    length = _audit_integer_width(group_prime)
+
+    if offset + hashlib.sha256().digest_size > len(payload):
+        raise ValueError("truncated audit payload")
+    message_digest = payload[offset : offset + hashlib.sha256().digest_size]
+    offset += hashlib.sha256().digest_size
+
+    public_key, offset = _take(payload, offset, length)
+    R, offset = _take(payload, offset, length)
+    challenge, offset = _take(payload, offset, length)
+    row_count, offset = _take(payload, offset, 4)
+    if row_count < 1:
+        raise ValueError("audit payload must record at least one signer row")
+
+    rows: list[tuple[int, int, int]] = []
+    previous_id = 0
+    seen_commitments: set[int] = set()
+    for _ in range(row_count):
+        signer_id, offset = _take(payload, offset, length)
+        commitment, offset = _take(payload, offset, length)
+        share_z, offset = _take(payload, offset, length)
+        if not 0 < signer_id < field_prime:
+            raise ValueError("audit row signer id must satisfy 1 <= id <= field_prime - 1")
+        if signer_id <= previous_id:
+            raise ValueError("audit rows must be ordered by unique ascending signer ids")
+        if not 1 < commitment < group_prime:
+            raise ValueError("audit row commitment must satisfy 1 < R_i < group_prime")
+        if pow(commitment, field_prime, group_prime) != 1:
+            raise ValueError("audit row commitment must lie in the order-field_prime subgroup")
+        if commitment in seen_commitments:
+            raise ValueError("audit row commitments must be unique")
+        if not 0 <= share_z < field_prime:
+            raise ValueError("audit row z_i must satisfy 0 <= z_i < field_prime")
+        seen_commitments.add(commitment)
+        rows.append((signer_id, commitment, share_z))
+        previous_id = signer_id
+
+    status, offset = _take(payload, offset, 1)
+    present, offset = _take(payload, offset, 1)
+    if status not in (0, 1):
+        raise ValueError("audit status must be 0 or 1")
+    if present != status:
+        raise ValueError("audit present flag must equal the status")
+
+    aggregate_z = None
+    if status == 1:
+        aggregate_z, offset = _take(payload, offset, length)
+        if not 0 <= aggregate_z < field_prime:
+            raise ValueError("audit aggregate z must satisfy 0 <= z < field_prime")
+
+    if offset != len(payload):
+        raise ValueError("audit payload has trailing bytes")
+
+    if not 0 < public_key < group_prime or pow(public_key, field_prime, group_prime) != 1:
+        raise ValueError("audit public key must lie in the order-field_prime subgroup")
+    if not 0 < R < group_prime or pow(R, field_prime, group_prime) != 1:
+        raise ValueError("audit R must lie in the order-field_prime subgroup")
+    if not 0 <= challenge < field_prime:
+        raise ValueError("audit challenge must satisfy 0 <= c < field_prime")
+
+    return {
+        "message_digest": message_digest,
+        "public_key": public_key,
+        "R": R,
+        "challenge": challenge,
+        "rows": tuple(rows),
+        "status": status,
+        "aggregate_z": aggregate_z,
+    }
+
+
+def create_audit(
+    message: bytes,
+    shares: Iterable[SignatureShare],
+    round_info: SigningRound,
+    dkg_result: SigningDKGResult,
+) -> SigningAudit:
+    """Freeze one signing instance into a :class:`SigningAudit` receipt.
+
+    Every signer of ``round_info`` must contribute exactly one
+    :class:`SignatureShare` (missing or duplicate shares raise ValueError,
+    wrong types TypeError); the input order is irrelevant because shares are
+    sorted by ``signer_id`` before re-verification and the receipt rows are
+    in that ascending order. ``message`` must be the exact byte string bound
+    by ``round_info``. Each share is re-verified with
+    :func:`verify_signature_share`; rows record the round's published ``R_i``
+    together with the submitted ``z_i``. The round's ``R`` and challenge are
+    re-derived from its commitments, so a hand-edited internally inconsistent
+    round raises ValueError.
+
+    When every share verifies, the status byte is ``1``, the present byte is
+    ``1`` and the aggregate ``z = sum(z_i) mod field_prime`` is appended;
+    otherwise the status and present bytes are ``0`` and no ``z`` is
+    appended. The payload is
+    ``tag || SHA256(message) || Y || R || c || n || rows || status ||
+    present [|| z]`` with ``tag = b"thresholdsign/audit/v1"``, ``n`` a
+    4-byte unsigned big-endian row count, and every other integer the
+    unsigned big-endian encoding in the existing Schnorr width
+    ``L = ceil(group_prime.bit_length() / 8)``. No nonce, secret share or
+    polynomial coefficient is included.
+    """
+    if not isinstance(message, bytes):
+        raise TypeError("message must be bytes")
+    if not isinstance(round_info, SigningRound):
+        raise TypeError("round_info must be a SigningRound instance")
+    result, public_key, field_prime, group_prime, _generator = _check_signing_setup(
+        dkg_result
+    )
+    _check_signing_dkg_structure(dkg_result)
+    _validate_signing_round(
+        round_info,
+        field_prime,
+        group_prime,
+        result.participant_ids,
+        len(result.commitment.values),
+    )
+    if isinstance(shares, (str, bytes)):
+        raise TypeError("shares must be an iterable of SignatureShare")
+    materialised = list(shares)
+    if not materialised:
+        raise ValueError("at least one signature share is required")
+    for share in materialised:
+        if not isinstance(share, SignatureShare):
+            raise TypeError("shares must be SignatureShare instances")
+        if not isinstance(share.signer_id, int) or isinstance(share.signer_id, bool):
+            raise TypeError("share signer_id must be an integer")
+        if not isinstance(share.z, int) or isinstance(share.z, bool):
+            raise TypeError("share z must be an integer")
+        if not isinstance(share.nonce_commitment, int) or isinstance(
+            share.nonce_commitment, bool
+        ):
+            raise TypeError("share nonce_commitment must be an integer")
+
+    share_ids = [share.signer_id for share in materialised]
+    if len(set(share_ids)) != len(share_ids):
+        raise ValueError("duplicate signature share from the same signer")
+    if set(share_ids) != set(round_info.signer_ids):
+        raise ValueError("each round signer must contribute exactly one share")
+    if message != round_info.message:
+        raise ValueError("message must match the message bound by the signing round")
+
+    # A receipt must describe an internally consistent round: re-derive R and
+    # the challenge exactly as create_signing_round fixed them.
+    derived_R = 1
+    for commitment in round_info.nonce_commitments:
+        derived_R = derived_R * commitment.commitment % group_prime
+    if derived_R != round_info.R:
+        raise ValueError("round R does not match its nonce commitments")
+    derived_challenge = schnorr_challenge(
+        round_info.message,
+        public_key,
+        derived_R,
+        round_info.signer_ids,
+        field_prime=field_prime,
+        group_prime=group_prime,
+    )
+    if derived_challenge != round_info.challenge:
+        raise ValueError("round challenge does not match its message, key and commitments")
+
+    ordered = sorted(materialised, key=lambda share: share.signer_id)
+    rows: list[tuple[int, int, int]] = []
+    all_passed = True
+    for share in ordered:
+        index = round_info.signer_ids.index(share.signer_id)
+        commitment = round_info.nonce_commitments[index].commitment
+        if not verify_signature_share(share, round_info, dkg_result):
+            all_passed = False
+        rows.append((share.signer_id, commitment, share.z))
+
+    if all_passed:
+        status = 1
+        aggregate_z = sum((share.z for share in ordered), start=0) % field_prime
+    else:
+        status = 0
+        aggregate_z = None
+    payload = _build_audit_payload(
+        message,
+        public_key,
+        round_info.R,
+        round_info.challenge,
+        rows,
+        status,
+        aggregate_z,
+        field_prime=field_prime,
+        group_prime=group_prime,
+    )
+    return SigningAudit(payload=payload)
+
+
+def check_audit(
+    message: bytes,
+    receipt: SigningAudit,
+    dkg_result: SigningDKGResult,
+) -> bool:
+    """Verify an audit receipt against ``message`` and the signing DKG result.
+
+    Decodes ``receipt.payload`` (malformed structure or encoding raises
+    ValueError, wrong types TypeError) and independently re-derives
+    everything it claims:
+
+    * the message digest must equal ``SHA256(message)`` and the recorded ``Y``
+      must equal ``dkg_result.public_key``;
+    * the recorded rows must cover at least ``threshold`` DKG participants,
+      one ascending id each;
+    * ``R`` is recomputed as the product of the rows' ``R_i`` and the
+      Fiat-Shamir challenge is recomputed from the message, ``Y``, ``R`` and
+      the row ids;
+    * each row is re-verified as a :class:`SignatureShare`
+      (``g ** z_i == R_i * Y_i ** (c * lambda_i)``);
+    * the status byte must be ``1`` exactly when every row passes; in that
+      case the present byte must be ``1``, the appended ``z`` must equal
+      ``sum(z_i) mod field_prime`` and the aggregate signature must satisfy
+      ``g ** z == R * Y ** c``; otherwise the present byte must be ``0`` and
+      no ``z`` may be present.
+
+    Returns ``True`` only when every recomputation agrees; a well-formed
+    receipt whose contents were tampered with (or which belongs to another
+    message, round, signer set or key) returns ``False``.
+    """
+    if not isinstance(message, bytes):
+        raise TypeError("message must be bytes")
+    if not isinstance(receipt, SigningAudit):
+        raise TypeError("receipt must be a SigningAudit instance")
+    if not isinstance(receipt.payload, bytes):
+        raise TypeError("receipt.payload must be bytes")
+    result, public_key, field_prime, group_prime, generator = _check_signing_setup(
+        dkg_result
+    )
+    _check_signing_dkg_structure(dkg_result)
+
+    parsed = _parse_audit_payload(
+        receipt.payload, field_prime=field_prime, group_prime=group_prime
+    )
+    rows = parsed["rows"]
+    threshold = len(result.commitment.values)
+    if len(rows) < threshold:
+        raise ValueError("audit receipt must cover at least threshold signers")
+    signer_ids = tuple(row[0] for row in rows)
+    if any(signer_id not in result.participant_ids for signer_id in signer_ids):
+        raise ValueError("every audited signer must be a DKG participant")
+
+    if parsed["message_digest"] != hashlib.sha256(message).digest():
+        return False
+    if parsed["public_key"] != public_key:
+        return False
+
+    R = 1
+    for _signer_id, commitment, _share_z in rows:
+        R = R * commitment % group_prime
+    if R != parsed["R"]:
+        return False
+    challenge = schnorr_challenge(
+        message,
+        public_key,
+        R,
+        signer_ids,
+        field_prime=field_prime,
+        group_prime=group_prime,
+    )
+    if challenge != parsed["challenge"]:
+        return False
+
+    rebuilt_round = SigningRound(
+        message=message,
+        signer_ids=signer_ids,
+        nonce_commitments=tuple(
+            SigningNonceCommitment(signer_id=signer_id, commitment=commitment)
+            for signer_id, commitment, _share_z in rows
+        ),
+        R=R,
+        challenge=challenge,
+    )
+    all_passed = True
+    for signer_id, commitment, share_z in rows:
+        share = SignatureShare(
+            signer_id=signer_id, nonce_commitment=commitment, z=share_z
+        )
+        if not verify_signature_share(share, rebuilt_round, dkg_result):
+            all_passed = False
+
+    expected_status = 1 if all_passed else 0
+    if parsed["status"] != expected_status:
+        return False
+    if expected_status == 0:
+        return True
+
+    aggregate_z = (
+        sum((share_z for _signer_id, _commitment, share_z in rows), start=0)
+        % field_prime
+    )
+    if parsed["aggregate_z"] != aggregate_z:
+        return False
+    return verify_signature(
+        message,
+        AggregateSignature(R=R, z=aggregate_z, signer_ids=signer_ids),
+        public_key,
+        prime=field_prime,
+        group_prime=group_prime,
+        generator=generator,
     )

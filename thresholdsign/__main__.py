@@ -7,10 +7,13 @@ from itertools import combinations
 from . import (
     AggregateSignature,
     DKGResult,
+    SigningAudit,
     SigningDKGResult,
     aggregate_dkg,
     aggregate_signature,
     aggregate_signing_dkg,
+    check_audit,
+    create_audit,
     create_dkg_contribution,
     create_signature_share,
     create_signing_contribution,
@@ -170,6 +173,13 @@ def main() -> int:
             f"  verification on a different message -> "
             f"{verify_signature(tampered, signature, signing_outcome.public_key, prime=DKG_FIELD_PRIME, group_prime=DKG_GROUP_PRIME, generator=DKG_GENERATOR)}"
         )
+
+        print()
+        print("signing audit receipt")
+        receipt = create_audit(message, reversed(signature_shares), round_info, signing_outcome)
+        print(f"  payload {len(receipt.payload)} bytes, status={receipt.payload[-4]} present={receipt.payload[-3]}")
+        print(f"  check_audit against the message and key -> {check_audit(message, receipt, signing_outcome)}")
+        print(f"  check_audit on a different message -> {check_audit(tampered, receipt, signing_outcome)}")
     else:
         print(f"  rejected signature shares from: {[r.signer_id for r in signature]}")
     return 0
