@@ -13,6 +13,8 @@ from thresholdsign import (
     create_signing_contribution,
     create_signing_nonce_commitment,
     create_signing_round,
+    decode_rotation,
+    encode_rotation,
     rotation_payload,
     verify_rotation,
 )
@@ -429,6 +431,355 @@ class VerifyRotationTest(unittest.TestCase):
             LARGE_FIELD, LARGE_GROUP, LARGE_G, sig,
         )
         self.assertTrue(verify_rotation(cert))
+
+
+class RotationEncodingTest(unittest.TestCase):
+    CERT_TAG = b"thresholdsign/rotation-cert/v1"
+
+    def setUp(self):
+        self.old_key = make_key(participant_ids=(1, 2, 3), threshold=2)
+        self.new_key = make_key(participant_ids=(2, 3, 4, 5), threshold=3)
+        self.ids = (2, 3, 4, 5)
+        self.t = 3
+        payload = rotation_payload(
+            self.old_key.public_key,
+            self.new_key.public_key,
+            self.ids,
+            self.t,
+            FIELD_PRIME,
+            GROUP_PRIME,
+            GENERATOR,
+        )
+        self.sig = sign_message(self.old_key, payload, (1, 3))
+        self.cert = Rotation(
+            self.old_key.public_key,
+            self.new_key.public_key,
+            self.ids,
+            self.t,
+            FIELD_PRIME,
+            GROUP_PRIME,
+            GENERATOR,
+            self.sig,
+        )
+        self.encoded = encode_rotation(self.cert)
+
+    def _parse(self, blob):
+        """Parse one certificate the way the spec dictates; return field values."""
+        self.assertTrue(blob.startswith(self.CERT_TAG))
+        offset = len(self.CERT_TAG)
+
+        def read_uint():
+            nonlocal offset
+            length = int.from_bytes(blob[offset:offset + 4], "big")
+            offset += 4
+            value = int.from_bytes(blob[offset:offset + length], "big")
+            offset += length
+            return length, value
+
+        def read_count():
+            nonlocal offset
+            count = int.from_bytes(blob[offset:offset + 4], "big")
+            offset += 4
+            return count
+
+        fields = {}
+        fields["old_length"], fields["old"] = read_uint()
+        fields["new_length"], fields["new"] = read_uint()
+        fields["id_count"] = read_count()
+        fields["ids"] = tuple(read_uint()[1] for _ in range(fields["id_count"]))
+        for name in ("t", "q", "p", "g", "R", "z"):
+            fields[name + "_length"], fields[name] = read_uint()
+        fields["signer_count"] = read_count()
+        fields["signer_ids"] = tuple(
+            read_uint()[1] for _ in range(fields["signer_count"])
+        )
+        fields["end"] = offset
+        return fields
+
+    def test_exact_layout(self):
+        fields = self._parse(self.encoded)
+        self.assertEqual(fields["end"], len(self.encoded))
+        self.assertEqual(fields["old"], self.old_key.public_key)
+        self.assertEqual(fields["new"], self.new_key.public_key)
+        self.assertEqual(fields["id_count"], 4)
+        self.assertEqual(fields["ids"], self.ids)
+        self.assertEqual((fields["t"], fields["q"], fields["p"], fields["g"]),
+                         (self.t, FIELD_PRIME, GROUP_PRIME, GENERATOR))
+        self.assertEqual(fields["R"], self.sig.R)
+        self.assertEqual(fields["z"], self.sig.z)
+        self.assertEqual(fields["signer_count"], 2)
+        self.assertEqual(fields["signer_ids"], self.sig.signer_ids)
+
+    def test_encoding_is_deterministic(self):
+        self.assertEqual(encode_rotation(self.cert), self.encoded)
+
+    def test_round_trip_is_byte_exact(self):
+        decoded = decode_rotation(self.encoded)
+        self.assertEqual(decoded, self.cert)
+        self.assertEqual(encode_rotation(decoded), self.encoded)
+        self.assertTrue(verify_rotation(decoded))
+
+    def test_minimal_integer_encoding(self):
+        # Every length prefix matches the shortest big-endian width: zero is a
+        # single 0x00 byte and positive values carry no leading zero.
+        fields = self._parse(self.encoded)
+        positive_lengths = [
+            fields["old_length"], fields["new_length"],
+            fields["t_length"], fields["q_length"], fields["p_length"],
+            fields["g_length"], fields["R_length"], fields["z_length"],
+        ]
+        for length in positive_lengths:
+            self.assertGreaterEqual(length, 1)
+        offset = len(self.CERT_TAG)
+        # old is the first length-prefixed integer; inspect its body directly.
+        length = int.from_bytes(self.encoded[offset:offset + 4], "big")
+        body = self.encoded[offset + 4:offset + 4 + length]
+        self.assertNotEqual(body[0], 0)
+
+        # z == 0 encodes as a four-byte length 1 followed by one zero byte.
+        zero_sig = AggregateSignature(
+            R=self.sig.R, z=0, signer_ids=self.sig.signer_ids
+        )
+        zero_cert = Rotation(
+            self.old_key.public_key, self.new_key.public_key, self.ids, self.t,
+            FIELD_PRIME, GROUP_PRIME, GENERATOR, zero_sig,
+        )
+        blob = encode_rotation(zero_cert)
+        self.assertEqual(decode_rotation(blob), zero_cert)
+        self.assertFalse(verify_rotation(decode_rotation(blob)))
+        # The five-byte pattern 00 00 00 01 00 (length 1, body 0x00) appears.
+        self.assertIn(b"\x00\x00\x00\x01\x00", blob)
+        self.assertEqual(encode_rotation(decode_rotation(blob)), blob)
+
+    def test_structurally_legal_but_unsigned_certificate_round_trips(self):
+        # Encoding never requires the signature to match; only verify_rotation
+        # answers the authorization question.
+        bad_sig = AggregateSignature(
+            R=self.sig.R, z=(self.sig.z + 1) % FIELD_PRIME,
+            signer_ids=self.sig.signer_ids,
+        )
+        cert = Rotation(
+            self.old_key.public_key, self.new_key.public_key, self.ids, self.t,
+            FIELD_PRIME, GROUP_PRIME, GENERATOR, bad_sig,
+        )
+        blob = encode_rotation(cert)
+        decoded = decode_rotation(blob)
+        self.assertEqual(decoded, cert)
+        self.assertEqual(encode_rotation(decoded), blob)
+        self.assertFalse(verify_rotation(decoded))
+
+    def test_decode_type_error(self):
+        with self.assertRaises(TypeError):
+            decode_rotation("cert")
+        with self.assertRaises(TypeError):
+            decode_rotation(bytearray(self.encoded))
+
+    def test_decode_rejects_bad_tag_and_truncation(self):
+        with self.assertRaises(ValueError):
+            decode_rotation(b"")
+        with self.assertRaises(ValueError):
+            decode_rotation(self.CERT_TAG)  # tag only, no fields
+        wrong_tag = b"thresholdsign/rotation-cert/v0" + self.encoded[
+            len(self.CERT_TAG):
+        ]
+        with self.assertRaises(ValueError):
+            decode_rotation(wrong_tag)
+        for cut in range(len(self.CERT_TAG), len(self.encoded)):
+            with self.assertRaises(ValueError, msg=f"cut at {cut}"):
+                decode_rotation(self.encoded[:cut])
+
+    def test_decode_rejects_trailing_bytes(self):
+        with self.assertRaises(ValueError):
+            decode_rotation(self.encoded + b"\x00")
+        with self.assertRaises(ValueError):
+            decode_rotation(self.encoded + b"extra")
+
+    def test_decode_rejects_non_canonical_integers(self):
+        first = len(self.CERT_TAG)
+        length = int.from_bytes(self.encoded[first:first + 4], "big")
+
+        zero_length = bytearray(self.encoded)
+        zero_length[first:first + 4] = (0).to_bytes(4, "big")
+        with self.assertRaises(ValueError):
+            decode_rotation(bytes(zero_length))
+
+        padded = bytearray(self.encoded)
+        padded[first:first + 4] = (length + 1).to_bytes(4, "big")
+        padded[first + 4:first + 4] = b"\x00"
+        with self.assertRaises(ValueError):
+            decode_rotation(bytes(padded))
+
+    def test_decode_rejects_count_mismatch_and_empty_lists(self):
+        # Position of the member-id count: after old and new.
+        offset = len(self.CERT_TAG)
+        for _ in range(2):
+            length = int.from_bytes(self.encoded[offset:offset + 4], "big")
+            offset += 4 + length
+        id_count_offset = offset
+
+        too_many = bytearray(self.encoded)
+        too_many[id_count_offset:id_count_offset + 4] = (5).to_bytes(4, "big")
+        with self.assertRaises(ValueError):
+            decode_rotation(bytes(too_many))
+
+        empty_ids = bytearray(self.encoded)
+        empty_ids[id_count_offset:id_count_offset + 4] = (0).to_bytes(4, "big")
+        with self.assertRaises(ValueError):
+            decode_rotation(bytes(empty_ids))
+
+        # The signer-id count is the last four bytes before the signer entries;
+        # a zero there is reached by parsing: trim the encoded cert down to the
+        # start of the R field and rebuild is fiddly, so locate it by parsing.
+        signer_offset = self._find_signer_count_offset()
+        empty_signers = bytearray(self.encoded)
+        empty_signers[signer_offset:signer_offset + 4] = (0).to_bytes(4, "big")
+        with self.assertRaises(ValueError):
+            decode_rotation(bytes(empty_signers))
+
+    def _find_signer_count_offset(self):
+        offset = len(self.CERT_TAG)
+
+        def skip():
+            nonlocal offset
+            length = int.from_bytes(self.encoded[offset:offset + 4], "big")
+            offset += 4 + length
+
+        skip(); skip()  # old, new
+        id_count = int.from_bytes(self.encoded[offset:offset + 4], "big")
+        offset += 4
+        for _ in range(id_count):
+            skip()
+        for _ in range(6):  # t, q, p, g, R, z
+            skip()
+        return offset
+
+    def test_decode_rejects_illegal_structure(self):
+        # Replace R with a value outside the order-q subgroup: bytes parse
+        # fine, structural validation must raise ValueError.
+        offset = len(self.CERT_TAG)
+
+        def skip():
+            nonlocal offset
+            length = int.from_bytes(self.encoded[offset:offset + 4], "big")
+            offset += 4 + length
+
+        skip(); skip()
+        id_count = int.from_bytes(self.encoded[offset:offset + 4], "big")
+        offset += 4
+        for _ in range(id_count):
+            skip()
+        for _ in range(4):  # t, q, p, g
+            skip()
+        r_offset = offset
+        bad = bytearray(self.encoded)
+        raw = (3).to_bytes(1, "big")
+        bad[r_offset:r_offset + 4] = (1).to_bytes(4, "big")
+        bad[r_offset + 4:r_offset + 5] = raw
+        # The old R body may be wider than one byte; drop the surplus bytes.
+        old_length = int.from_bytes(self.encoded[r_offset:r_offset + 4], "big")
+        if old_length > 1:
+            del bad[r_offset + 5:r_offset + 4 + old_length]
+        with self.assertRaises(ValueError):
+            decode_rotation(bytes(bad))
+
+    def test_encode_type_errors(self):
+        good = [
+            self.old_key.public_key, self.new_key.public_key, self.ids, self.t,
+            FIELD_PRIME, GROUP_PRIME, GENERATOR, self.sig,
+        ]
+        with self.assertRaises(TypeError):
+            encode_rotation("cert")
+        for position, bad in (
+            (0, "1"),
+            (1, True),
+            (2, [2, 3, 4, 5]),
+            (2, (2, "3")),
+            (3, 2.0),
+            (4, None),
+            (5, "p"),
+            (6, True),
+            (7, "sig"),
+        ):
+            args = list(good)
+            args[position] = bad
+            with self.assertRaises(TypeError, msg=f"position {position}"):
+                encode_rotation(Rotation(*args))
+        for bad_sig in (
+            AggregateSignature(R="2", z=self.sig.z, signer_ids=self.sig.signer_ids),
+            AggregateSignature(R=self.sig.R, z=1.5, signer_ids=self.sig.signer_ids),
+            AggregateSignature(R=self.sig.R, z=self.sig.z, signer_ids=[1, 3]),
+            AggregateSignature(R=self.sig.R, z=self.sig.z, signer_ids=(1, "3")),
+        ):
+            args = list(good)
+            args[7] = bad_sig
+            with self.assertRaises(TypeError):
+                encode_rotation(Rotation(*args))
+
+    def test_encode_value_errors(self):
+        good = [
+            self.old_key.public_key, self.new_key.public_key, self.ids, self.t,
+            FIELD_PRIME, GROUP_PRIME, GENERATOR, self.sig,
+        ]
+        for position, bad in (
+            (0, 3),                    # old not in the subgroup
+            (1, GROUP_PRIME),          # new out of range
+            (2, (2, 3, 4, 4)),         # duplicate member id
+            (2, (3, 2, 4, 5)),         # ids not increasing
+            (2, (0, 2, 3, 4)),         # id out of range
+            (3, 5),                    # threshold above member count
+            (4, 2018),                 # q not prime
+            (6, 3),                    # g not in the subgroup
+        ):
+            args = list(good)
+            args[position] = bad
+            with self.assertRaises(ValueError, msg=f"position {position}"):
+                encode_rotation(Rotation(*args))
+        for bad_sig in (
+            AggregateSignature(R=3, z=self.sig.z, signer_ids=self.sig.signer_ids),
+            AggregateSignature(R=self.sig.R, z=FIELD_PRIME,
+                               signer_ids=self.sig.signer_ids),
+            AggregateSignature(R=self.sig.R, z=self.sig.z, signer_ids=()),
+            AggregateSignature(R=self.sig.R, z=self.sig.z, signer_ids=(3, 3)),
+            AggregateSignature(R=self.sig.R, z=-1, signer_ids=self.sig.signer_ids),
+        ):
+            args = list(good)
+            args[7] = bad_sig
+            with self.assertRaises(ValueError):
+                encode_rotation(Rotation(*args))
+        args = list(good)
+        args[0] = -1
+        with self.assertRaises(ValueError):
+            encode_rotation(Rotation(*args))
+
+    def test_large_group_round_trip(self):
+        old_key = make_key(
+            participant_ids=(1, 2, 3), threshold=2,
+            field_prime=LARGE_FIELD, group_prime=LARGE_GROUP,
+            generator=LARGE_G, blinding_generator=LARGE_H,
+        )
+        contributions = [
+            create_signing_contribution(
+                pid, (1, 2, 3), 2,
+                prime=LARGE_FIELD, group_prime=LARGE_GROUP,
+                generator=LARGE_G, blinding_generator=LARGE_H,
+                randbelow=fixed_random(pid + 50),
+            )
+            for pid in (1, 2, 3)
+        ]
+        new_key = aggregate_signing_dkg(contributions)
+        payload = rotation_payload(
+            old_key.public_key, new_key.public_key, (1, 2, 3), 2,
+            LARGE_FIELD, LARGE_GROUP, LARGE_G,
+        )
+        sig = sign_message(old_key, payload, (2, 3), seed=21)
+        cert = Rotation(
+            old_key.public_key, new_key.public_key, (1, 2, 3), 2,
+            LARGE_FIELD, LARGE_GROUP, LARGE_G, sig,
+        )
+        blob = encode_rotation(cert)
+        self.assertEqual(decode_rotation(blob), cert)
+        self.assertEqual(encode_rotation(decode_rotation(blob)), blob)
+        self.assertTrue(verify_rotation(decode_rotation(blob)))
 
 
 if __name__ == "__main__":

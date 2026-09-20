@@ -76,6 +76,8 @@ __all__ = [
     "Rotation",
     "rotation_payload",
     "verify_rotation",
+    "encode_rotation",
+    "decode_rotation",
 ]
 
 # Mersenne prime 2**127 - 1: large enough for integer secrets, small enough that
@@ -2813,6 +2815,204 @@ def verify_rotation(cert: Rotation) -> bool:
         generator=cert.g,
         prime=cert.q,
     )
+
+
+# ---------------------------------------------------------------------------
+# Canonical transport encoding of a rotation certificate: a self-contained,
+# byte-for-byte reproducible form that any implementation can parse. It carries
+# only the public Rotation fields and the signature; encoding and decoding use
+# no network, no storage and no hidden state. Decoding validates structure only
+# via the same checks as rotation_payload / verify_signature — whether the
+# signature actually authorizes the rotation remains verify_rotation's job.
+# ---------------------------------------------------------------------------
+
+ROTATION_CERT_TAG = b"thresholdsign/rotation-cert/v1"
+
+
+def _minimal_uint_bytes(value: int) -> bytes:
+    """Shortest unsigned big-endian encoding of a non-negative integer.
+
+    Zero is the single byte ``0x00``; positive values never carry leading
+    zero bytes, so the encoding of each integer is unique.
+    """
+    return value.to_bytes(max(1, (value.bit_length() + 7) // 8), "big")
+
+
+def _encode_length_prefixed_uint(value: int) -> bytes:
+    """4-byte unsigned big-endian length followed by the minimal uint bytes."""
+    raw = _minimal_uint_bytes(value)
+    if len(raw) > 0xFFFFFFFF:
+        raise ValueError("integer too large for the 4-byte length prefix")
+    return len(raw).to_bytes(4, "big") + raw
+
+
+def _encode_count(count: int, what: str) -> bytes:
+    """4-byte unsigned big-endian element count, rejecting overflow."""
+    if count > 0xFFFFFFFF:
+        raise ValueError(f"too many {what} for the 4-byte count prefix")
+    return count.to_bytes(4, "big")
+
+
+def _check_uint_field(name: str, value: object) -> None:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"{name} must be an integer")
+    if value < 0:
+        raise ValueError(f"{name} must be non-negative")
+
+
+def _check_id_tuple(name: str, values: object) -> None:
+    if not isinstance(values, tuple):
+        raise TypeError(f"{name} must be a tuple")
+    for member_id in values:
+        if not isinstance(member_id, int) or isinstance(member_id, bool):
+            raise TypeError(f"{name} entries must be integers")
+        if member_id <= 0:
+            raise ValueError(f"{name} entries must be positive")
+
+
+def encode_rotation(cert: Rotation) -> bytes:
+    """Encode a rotation certificate into its canonical transport form.
+
+    The result starts with the tag ``b"thresholdsign/rotation-cert/v1"`` and
+    then contains, with no separators: ``old``, ``new``, the new ``ids`` (a
+    4-byte unsigned big-endian element count followed by the entries), ``t``,
+    ``q``, ``p``, ``g`` and finally the signature as ``R``, ``z`` and the
+    ``signer_ids`` (again a 4-byte count then the entries). Every integer is a
+    4-byte unsigned big-endian length followed by its shortest unsigned
+    big-endian value: zero is the single byte ``0x00`` and positive values
+    never carry leading zeros, so the encoding of a given certificate is
+    unique and :func:`decode_rotation` reproduces the bytes exactly.
+
+    Only the certificate's *structure* is validated — a structurally legal
+    certificate whose signature does not match encodes just fine; use
+    :func:`verify_rotation` to check authorization. Wrong argument or field
+    types (including nested signature fields) raise TypeError; negative
+    integers, length-prefix overflow, empty or non-increasing/duplicate id
+    lists, illegal group parameters, public keys or signature structure raise
+    ValueError.
+    """
+    if not isinstance(cert, Rotation):
+        raise TypeError("cert must be a Rotation instance")
+    sig = cert.sig
+    if not isinstance(sig, AggregateSignature):
+        raise TypeError("cert.sig must be an AggregateSignature instance")
+    for name, value in (
+        ("old", cert.old),
+        ("new", cert.new),
+        ("t", cert.t),
+        ("q", cert.q),
+        ("p", cert.p),
+        ("g", cert.g),
+        ("signature R", sig.R),
+        ("signature z", sig.z),
+    ):
+        _check_uint_field(name, value)
+    _check_id_tuple("ids", cert.ids)
+    _check_id_tuple("signer_ids", sig.signer_ids)
+
+    # Full structural validation of the group, public keys, ids, threshold and
+    # signature ranges. verify_signature raises ValueError on a malformed
+    # signature structure; its True/False cryptographic verdict is irrelevant
+    # to encoding and deliberately ignored.
+    message = rotation_payload(cert.old, cert.new, cert.ids, cert.t, cert.q, cert.p, cert.g)
+    verify_signature(
+        message,
+        sig,
+        cert.old,
+        group_prime=cert.p,
+        generator=cert.g,
+        prime=cert.q,
+    )
+
+    buffer = bytearray(ROTATION_CERT_TAG)
+    for value in (cert.old, cert.new):
+        buffer += _encode_length_prefixed_uint(value)
+    buffer += _encode_count(len(cert.ids), "member ids")
+    for member_id in cert.ids:
+        buffer += _encode_length_prefixed_uint(member_id)
+    for value in (cert.t, cert.q, cert.p, cert.g, sig.R, sig.z):
+        buffer += _encode_length_prefixed_uint(value)
+    buffer += _encode_count(len(sig.signer_ids), "signer ids")
+    for signer_id in sig.signer_ids:
+        buffer += _encode_length_prefixed_uint(signer_id)
+    return bytes(buffer)
+
+
+def decode_rotation(payload: bytes) -> Rotation:
+    """Decode a rotation certificate produced by :func:`encode_rotation`.
+
+    Parses the tag-prefixed canonical form and rebuilds the
+    :class:`Rotation`. The input must be exactly one certificate: a wrong or
+    truncated tag, a truncated value, a non-canonical integer encoding (an
+    empty body or a leading zero byte), a declared count that does not match
+    the entries present, trailing bytes, or an illegal decoded structure
+    (negative-free rules, group parameters, public keys, member or signer
+    ids, threshold or signature ranges) all raise ValueError; a payload that
+    is not ``bytes`` raises TypeError.
+
+    Decoding checks structure only — it never verifies the signature, so a
+    well-formed certificate whose signature does not authorize the rotation
+    decodes successfully and :func:`verify_rotation` then returns ``False``.
+    Re-encoding the result always yields exactly the original bytes.
+    """
+    if not isinstance(payload, bytes):
+        raise TypeError("payload must be bytes")
+    if not payload.startswith(ROTATION_CERT_TAG):
+        raise ValueError("not a thresholdsign rotation certificate: bad tag")
+
+    offset = len(ROTATION_CERT_TAG)
+
+    def read_uint(what: str) -> int:
+        nonlocal offset
+        if len(payload) - offset < 4:
+            raise ValueError(f"truncated rotation certificate: missing {what} length")
+        length = int.from_bytes(payload[offset:offset + 4], "big")
+        offset += 4
+        if length == 0:
+            raise ValueError(f"non-canonical rotation certificate: empty {what}")
+        if len(payload) - offset < length:
+            raise ValueError(f"truncated rotation certificate: missing {what} value")
+        raw = payload[offset:offset + length]
+        offset += length
+        if length > 1 and raw[0] == 0:
+            raise ValueError(f"non-canonical rotation certificate: leading zero in {what}")
+        return int.from_bytes(raw, "big")
+
+    def read_count(what: str) -> int:
+        nonlocal offset
+        if len(payload) - offset < 4:
+            raise ValueError(f"truncated rotation certificate: missing {what} count")
+        count = int.from_bytes(payload[offset:offset + 4], "big")
+        offset += 4
+        return count
+
+    old = read_uint("old public key")
+    new = read_uint("new public key")
+    id_count = read_count("member id")
+    if id_count == 0:
+        raise ValueError("non-canonical rotation certificate: empty member id list")
+    ids = tuple(read_uint(f"member id {index}") for index in range(id_count))
+    t = read_uint("threshold")
+    q = read_uint("field prime")
+    p = read_uint("group prime")
+    g = read_uint("generator")
+    R = read_uint("signature R")
+    z = read_uint("signature z")
+    signer_count = read_count("signer id")
+    if signer_count == 0:
+        raise ValueError("non-canonical rotation certificate: empty signer id list")
+    signer_ids = tuple(read_uint(f"signer id {index}") for index in range(signer_count))
+    if offset != len(payload):
+        raise ValueError("trailing bytes after rotation certificate")
+
+    # Structural validation only: rotation_payload raises on an illegal group,
+    # public key, id list or threshold, and verify_signature raises on an
+    # illegal signature structure. Its cryptographic verdict is ignored here —
+    # verify_rotation is the authorization check.
+    message = rotation_payload(old, new, ids, t, q, p, g)
+    sig = AggregateSignature(R=R, z=z, signer_ids=signer_ids)
+    verify_signature(message, sig, old, group_prime=p, generator=g, prime=q)
+    return Rotation(old=old, new=new, ids=ids, t=t, q=q, p=p, g=g, sig=sig)
 
 
 # ---------------------------------------------------------------------------
