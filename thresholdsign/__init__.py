@@ -13,7 +13,9 @@ threshold Schnorr protocol: SigningNonceCommitment /
 SigningRound / SignatureShare / SignatureShareRejection / AggregateSignature /
 create_signing_nonce_commitment / create_signing_round / create_signature_share
 / verify_signature_share / aggregate_signature / verify_signature, and signing
-audit receipts: SigningAudit / create_audit / check_audit.
+audit receipts: SigningAudit / create_audit / check_audit. The key-rotation
+extension adds publicly verifiable rotation certificates: Rotation /
+rotation_payload / verify_rotation.
 """
 
 from __future__ import annotations
@@ -65,6 +67,9 @@ __all__ = [
     "SigningAudit",
     "create_audit",
     "check_audit",
+    "Rotation",
+    "rotation_payload",
+    "verify_rotation",
 ]
 
 # Mersenne prime 2**127 - 1: large enough for integer secrets, small enough that
@@ -2671,3 +2676,162 @@ def check_audit(
         ):
             return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# Key rotation certificates: a publicly verifiable authorisation to replace
+# the joint public key ``old`` with ``new``. The new key comes out of a fresh
+# signing DKG; the old key's holders approve the switch by threshold-signing
+# the canonical rotation payload with the old key. The certificate carries
+# only public values and the aggregate signature — never an old or new secret
+# share, a nonce or a polynomial coefficient. The library keeps no state:
+# handing the new shares over to the members and retiring the old ones is the
+# caller's responsibility.
+# ---------------------------------------------------------------------------
+
+ROTATION_TAG = b"thresholdsign/rotation/v1"
+
+
+@dataclass(frozen=True)
+class Rotation:
+    """A frozen, self-contained key-rotation certificate.
+
+    ``old`` and ``new`` are the previous and the replacement joint public
+    keys; ``ids`` is the new member set and ``t`` its threshold; ``q``, ``p``
+    and ``g`` are the field prime, group prime and generator both keys live
+    over; ``sig`` is the :class:`AggregateSignature` with which the old
+    key's holders signed :func:`rotation_payload` over exactly these values.
+    The certificate contains no old or new secret share, no nonce and no
+    polynomial coefficient.
+    """
+
+    old: int
+    new: int
+    ids: tuple[int, ...]
+    t: int
+    q: int
+    p: int
+    g: int
+    sig: AggregateSignature
+
+
+def rotation_payload(
+    old: int,
+    new: int,
+    ids: Iterable[int],
+    t: int,
+    q: int,
+    p: int,
+    g: int,
+) -> bytes:
+    """Build the canonical rotation message the old key's holders sign.
+
+    The payload is meant to be used verbatim as ``SigningRound.message`` of a
+    signing round under the old key; the resulting aggregate signature goes into
+    the :class:`Rotation` certificate. The byte layout, with
+    ``L = ceil(p.bit_length() / 8)``, is the tag
+    ``b"thresholdsign/rotation/v1"`` followed by ``q``, ``p``, ``g``,
+    ``old``, ``new`` (each an unsigned big-endian integer in exactly ``L``
+    bytes), the member count as a 4-byte unsigned big-endian integer, ``t``
+    in ``L`` bytes and the member ids in ascending order, each in ``L``
+    bytes. There are no separators or length prefixes; the ids are delimited
+    solely by the member count. The signature itself is never part of the
+    payload.
+
+    Wrong types raise TypeError; an illegal group (non-prime ``q``/``p``,
+    ``q`` not dividing ``p - 1``, or ``g`` not a generator of the order-``q``
+    subgroup), a public key outside the order-``q`` subgroup, empty,
+    duplicate or out-of-range member ids, and a threshold outside
+    ``1 .. len(ids)`` raise ValueError.
+    """
+    for name, value in (
+        ("old", old),
+        ("new", new),
+        ("t", t),
+        ("q", q),
+        ("p", p),
+        ("g", g),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"{name} must be an integer")
+    if isinstance(ids, (str, bytes)):
+        raise TypeError("ids must be an iterable of integers")
+    try:
+        id_list = list(ids)
+    except TypeError:
+        raise TypeError("ids must be an iterable of integers") from None
+    for member_id in id_list:
+        if not isinstance(member_id, int) or isinstance(member_id, bool):
+            raise TypeError("member ids must be integers")
+
+    _validate_feldman_parameters(q, p, g)
+    for name, key in (("old", old), ("new", new)):
+        if not 0 < key < p:
+            raise ValueError(f"{name} must satisfy 0 < {name} < p")
+        if pow(key, q, p) != 1:
+            raise ValueError(f"{name} must lie in the order-q subgroup")
+    if not id_list:
+        raise ValueError("at least one member id is required")
+    if len(set(id_list)) != len(id_list):
+        raise ValueError("member ids must be unique")
+    for member_id in id_list:
+        if not 0 < member_id < q:
+            raise ValueError("member ids must satisfy 1 <= id <= q - 1")
+    if t < 1:
+        raise ValueError("threshold must be at least 1")
+    if t > len(id_list):
+        raise ValueError("threshold must not exceed the member count")
+
+    length = (p.bit_length() + 7) // 8
+    buffer = bytearray(ROTATION_TAG)
+    for value in (q, p, g, old, new):
+        buffer += _encode_integer(value, length)
+    buffer += len(id_list).to_bytes(4, "big", signed=False)
+    buffer += _encode_integer(t, length)
+    for member_id in sorted(id_list):
+        buffer += _encode_integer(member_id, length)
+    return bytes(buffer)
+
+
+def verify_rotation(cert: Rotation) -> bool:
+    """Verify a rotation certificate against the old public key it carries.
+
+    Rebuilds the canonical payload from the certificate's ``old``, ``new``,
+    ``ids``, ``t``, ``q``, ``p`` and ``g`` and verifies ``cert.sig`` as a
+    threshold Schnorr signature on that payload under the public key
+    ``old``, exactly as :func:`verify_signature` does. Returns ``True`` when
+    the signature matches; a well-formed certificate whose signature was
+    made over different values, or under a different key, returns ``False``.
+    Wrong types raise TypeError; a structurally illegal certificate (illegal
+    group, public key, member ids, threshold or signature fields) raises
+    ValueError.
+    """
+    if not isinstance(cert, Rotation):
+        raise TypeError("cert must be a Rotation instance")
+    for name, value in (
+        ("old", cert.old),
+        ("new", cert.new),
+        ("t", cert.t),
+        ("q", cert.q),
+        ("p", cert.p),
+        ("g", cert.g),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"cert.{name} must be an integer")
+    if not isinstance(cert.ids, tuple):
+        raise TypeError("cert.ids must be a tuple")
+    for member_id in cert.ids:
+        if not isinstance(member_id, int) or isinstance(member_id, bool):
+            raise TypeError("member ids must be integers")
+    if not isinstance(cert.sig, AggregateSignature):
+        raise TypeError("cert.sig must be an AggregateSignature instance")
+
+    payload = rotation_payload(cert.old, cert.new, cert.ids, cert.t, cert.q, cert.p, cert.g)
+    return verify_signature(
+        payload,
+        cert.sig,
+        cert.old,
+        group_prime=cert.p,
+        generator=cert.g,
+        prime=cert.q,
+    )
