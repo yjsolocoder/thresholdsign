@@ -225,6 +225,44 @@ else:
 dealer 缺失/重复/非法或参数不一致抛 `ValueError`。新份额的分配与旧份额的销毁由
 调用方负责，库不保存任何状态。
 
+### 密钥轮换授权
+
+重共享保持公钥不变；要**换一把全新的密钥**（新成员跑一次新的签名 DKG，得到新
+`public_key`），需要让旧密钥的阈值签名公开授权这次切换。`rotation_payload` 生成
+由旧密钥签署的规范消息，`Rotation` 证书把新旧公钥、新成员集合、新 threshold 与
+群参数连同旧密钥的聚合签名捆在一起，`verify_rotation` 让任何持有旧公钥的人都能
+核验授权——证书本身不含新旧秘密份额、nonce 或系数：
+
+```python
+from thresholdsign import Rotation, rotation_payload, verify_rotation
+
+# old_key / new_key 均为 SigningDKGResult；new_key 由新成员重新跑签名 DKG 得到
+payload = rotation_payload(
+    old_key.public_key, new_key.public_key,
+    new_key.result.participant_ids,      # 新成员编号（严格递增）
+    len(new_key.result.commitment.values),  # 新 threshold
+    q, p, g,                             # 共享的域素数、群素数、生成元
+)
+# payload 作为 SigningRound.message，由旧密钥的阈值 quorum 走两轮协议签署
+round_info = create_signing_round(payload, signer_ids, nonce_commitments, old_key)
+sig = aggregate_signature(shares, round_info, old_key)
+cert = Rotation(
+    old_key.public_key, new_key.public_key,
+    new_key.result.participant_ids, len(new_key.result.commitment.values),
+    q, p, g, sig,
+)
+assert verify_rotation(cert)             # 任何人都能核验
+```
+
+payload 依次拼接标签 `b"thresholdsign/rotation/v1"`、`q`、`p`、`g`、`old`、`new`、
+4 字节无符号大端成员数、`t`、升序成员编号；除成员数外每个整数都是
+`L = ceil(p.bit_length()/8)` 字节无符号大端，无分隔符或长度前缀，编号仅由成员数
+定界，payload 不含签名。`rotation_payload` 对类型错误抛 `TypeError`，对非法群
+参数、公钥（不在 q 阶子群）、编号（越界/重复/未递增）或 threshold 抛
+`ValueError`；`verify_rotation` 重建 payload 并以 `old` 验签，一致返回 `True`，
+合法但不匹配返回 `False`，类型错误抛 `TypeError`，证书结构非法（含签名结构）
+抛 `ValueError`。新密钥的 DKG 执行与份额交接由调用方负责，库不保存任何状态。
+
 
 ## 命令行演示
 
@@ -386,6 +424,22 @@ python3 -m thresholdsign
   或份额方程失败都计入重算 status=0，与记录的 status 对比而非直接判负，因此
   原样生成的失败回执复核为 `True`；重算结论与回执一致返回 `True`，合法篡改
   或消息/密钥不匹配返回 `False`
+- `Rotation(old, new, ids, t, q, p, g, sig)` — 冻结数据类，可按位置构造、按值
+  相等；公开可验证的密钥轮换授权证书：`old`/`new` 为新旧联合公钥，`ids` 为严格
+  递增的新成员编号元组，`t` 为新 threshold，`q`/`p`/`g` 为域素数、群素数与
+  生成元，`sig` 为旧密钥对 `rotation_payload` 规范消息的 `AggregateSignature`；
+  不含新旧秘密份额、nonce 或系数
+- `rotation_payload(old, new, ids, t, q, p, g) -> bytes` — 生成由旧密钥签署的
+  规范消息（作为 `SigningRound.message`）：依次拼接标签
+  `b"thresholdsign/rotation/v1"`、`q`、`p`、`g`、`old`、`new`、4 字节无符号大端
+  成员数、`t`、升序成员编号；除成员数外每个整数均为
+  `L = ceil(p.bit_length()/8)` 字节无符号大端，无分隔符或长度前缀，编号仅由
+  成员数定界，payload 不含签名。类型错误抛 `TypeError`，非法群参数、公钥、
+  编号或 threshold 抛 `ValueError`
+- `verify_rotation(cert) -> bool` — 由证书字段重建 payload 并以 `old` 验签：
+  一致返回 `True`，结构合法但签名/字段不匹配返回 `False`；类型错误抛
+  `TypeError`，证书结构非法（群参数、公钥、编号、threshold 或签名结构）抛
+  `ValueError`。新密钥的生成与份额交接由调用方负责
 
 ### 门限 Schnorr 群参数与边界
 
