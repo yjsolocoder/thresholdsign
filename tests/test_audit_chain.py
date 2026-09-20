@@ -498,6 +498,27 @@ class EncodeAuditChainTest(unittest.TestCase):
         chain = AuditChain(((b"m", SigningAudit(b"a")),), sig)
         wire = encode_audit_chain(chain)
         self.assertIn(b"\x00\x00\x00\x01\x00", wire)
+        # z=0 stays legal and round-trips; only R=0 is forbidden.
+        self.assertEqual(decode_audit_chain(wire), chain)
+
+    def test_record_count_overflow_raises_value_error(self):
+        class HugeTuple(tuple):
+            def __len__(self):
+                return 2 ** 32
+
+        sig = self.chain.signature
+        records = HugeTuple((self.records[0],))
+        with self.assertRaises(ValueError):
+            encode_audit_chain(AuditChain(records, sig))
+
+    def test_signer_count_overflow_raises_value_error(self):
+        class HugeIds(tuple):
+            def __len__(self):
+                return 2 ** 32
+
+        sig = dataclasses.replace(self.chain.signature, signer_ids=HugeIds((1,)))
+        with self.assertRaises(ValueError):
+            encode_audit_chain(AuditChain((self.records[0],), sig))
 
     def test_deterministic_and_order_bound(self):
         wire = encode_audit_chain(self.chain)
@@ -585,6 +606,11 @@ class EncodeAuditChainTest(unittest.TestCase):
             ValueError,
             encode_audit_chain,
             AuditChain(self.records, dataclasses.replace(sig, R=-1)),
+        )
+        self.assertRaises(
+            ValueError,
+            encode_audit_chain,
+            AuditChain(self.records, dataclasses.replace(sig, R=0)),
         )
         self.assertRaises(
             ValueError,
@@ -687,6 +713,17 @@ class DecodeAuditChainTest(unittest.TestCase):
         self.assertRaises(ValueError, decode_audit_chain, bytes(wire))
         # Declared two records but three frames follow -> trailing bytes.
         wire[count_offset:count_offset + 4] = (2).to_bytes(4, "big")
+        self.assertRaises(ValueError, decode_audit_chain, bytes(wire))
+
+    def test_rejects_zero_R(self):
+        # A wire encoding with R=0 must be rejected even though z=0 is legal.
+        sig = AggregateSignature(R=2, z=0, signer_ids=(1,))
+        chain = AuditChain(((b"m", SigningAudit(b"a")),), sig)
+        wire = bytearray(encode_audit_chain(chain))
+        # R sits right after the record frame; its varint is 00000001 02.
+        pos = len(WIRE_TAG) + 4 + 4 + 1 + 4 + 1
+        self.assertEqual(bytes(wire[pos:pos + 5]), (1).to_bytes(4, "big") + b"\x02")
+        wire[pos + 4] = 0
         self.assertRaises(ValueError, decode_audit_chain, bytes(wire))
 
     def test_rejects_zero_length_receipt(self):

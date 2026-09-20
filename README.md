@@ -370,12 +370,53 @@ b"thresholdsign/audit-chain/v1" || U32(len(records))
 
 其中 `U32` 为 4 字节无符号大端，`VARINT` 为 4 字节无符号大端长度加最短无符号
 大端值（零为单字节 `00`，正数禁前导零），记录顺序严格跟随 `records` 元组、
-签名者编号严格升序。空消息允许、空回执不允许，链至少一条记录。入口仅校验字段
-类型与结构（不要求回执或签名匹配）；解码只恢复结构，不解析回执、不验签、不
-引入隐藏状态，结构合法但签名不匹配的链照常返回，由 `verify_audit_chain` 报告
-`False`。非 `bytes` 或字段类型错误抛 `TypeError`；标签错误、空链、零长回执、
-截断、尾随字节、计数不符及非规范整数抛 `ValueError`；成功解码后重编码必得到原
-字节。
+签名者编号严格升序。空消息允许、空回执不允许，链至少一条记录；签名的 `R` 必须
+为正（与 `verify_signature` 对群元素的要求一致），`z` 可为零并编码为单字节
+`00`。入口仅校验字段类型与结构（不要求回执或签名匹配）；解码只恢复结构，不解析
+回执、不验签、不引入隐藏状态，结构合法但签名不匹配的链照常返回，由
+`verify_audit_chain` 报告 `False`。非 `bytes` 或字段类型错误抛 `TypeError`；
+标签错误、空链、零长回执、`R` 为零、记录或签名者计数超过 2^32-1、截断、尾随
+字节、计数不符及非规范整数抛 `ValueError`；成功解码后重编码必得到原字节。
+
+### 审计链记录的 Merkle 包含证明
+
+需要向第三方证明某一条记录确实位于链所封的记录序列中，而又不必公开整批记录时，
+可用 SHA256 Merkle 包含证明。冻结数据类 `AuditProof(i, n, m, a, p)` 字段依次为
+叶下标 `int`、记录总数 `int`、该记录的消息 `bytes`、回执 `SigningAudit` 与自叶
+至根的兄弟摘要元组 `tuple[bytes, ...]`（每项恰为 32 字节；单记录树时为空元组），
+可按位置构造、按值相等。叶与内部节点按域分离前缀构造（`H = SHA256`，`U64` 为
+8 字节无符号大端）：
+
+```text
+leaf_i = H(b"am/l" || U64(i) || H(message_i) || H(audit_i.payload))
+node   = H(b"am/n" || left || right)      # 每层奇数尾节点复制自身配对
+```
+
+`make_proof(records, i) -> tuple[bytes, AuditProof]` 沿用
+`AuditChain.records` 的非空保序结构构建整棵树，返回第 `i` 叶的证明与待签消息
+
+```text
+b"am/r" || U64(n) || root
+```
+
+该消息作为普通门限 Schnorr 消息由 quorum 两轮签署：
+
+```python
+from thresholdsign import make_proof, check_proof
+
+message, proof = make_proof(records, i)
+signature = sign_threshold(key, message)   # 门限 quorum 签署 b"am/r"||U64(n)||root
+assert check_proof(proof, signature, key)  # 持 key 即可核验单条记录
+```
+
+`check_proof(proof, signature, key) -> bool` 先由 `proof` 的叶与 `p` 自叶至根重建
+根（偶位置节点在左、奇位置在右，奇数复制尾自然重建），再对该记录调用
+`check_audit(m, a, key)` 复核回执，并对 `b"am/r"||U64(n)||root` 调用
+`verify_signature`；三者一致返回 `True`，合法但不匹配（篡改消息、回执、下标、
+路径兄弟或签名，换密钥核验等）返回 `False`。待签消息只绑定 `(n, root)`，故同一
+棵树的一个根签名即可支撑任意叶的包含证明。非 `AuditProof`/`AggregateSignature`
+入参或字段类型错误抛 `TypeError`；`n` 非正或超过 2^64-1、`i` 越界、`p` 长度与
+`n` 不符或某项非 32 字节、回执或签名结构非法抛 `ValueError`。
 
 
 ## 命令行演示
@@ -620,15 +661,32 @@ python3 -m thresholdsign
   大端消息长度及原始 `message`（允许空），再写 4 字节无符号大端回执长度及
   `SigningAudit.payload`（不允许空）；签名帧依次写 `VARINT(R)`、`VARINT(z)`、
   4 字节无符号大端 `signer_ids` 数量及升序编号，`VARINT` 为 4 字节无符号大端
-  长度加最短无符号大端值（零为单字节 `00`，正数禁前导零）。输出唯一，只校验
-  字段类型与结构、不要求回执或签名匹配；类型错误抛 `TypeError`，空链、空回执、
-  负数/溢出或编号非升序等结构非法抛 `ValueError`
+  长度加最短无符号大端值（`R` 必须为正；`z` 可为零，零为单字节 `00`，正数禁
+  前导零）。输出唯一，只校验字段类型与结构、不要求回执或签名匹配；类型错误抛
+  `TypeError`，空链、空回执、非正 `R`、负 `z`、计数超过 2^32-1、溢出或编号非
+  升序等结构非法抛 `ValueError`
 - `decode_audit_chain(payload) -> AuditChain` — `encode_audit_chain` 的逆操作，
   只恢复结构：回执不解析、签名不核验且不引入任何网络、存储或隐藏状态。拒绝
-  错误/缺失标签、空链、零长回执、截断、尾随字节、计数不符、空/零/重复/非升序
-  签名者编号及非规范整数（前导零或零长整数帧）；成功后重编码必得到原字节。
-  非 `bytes` 入参抛 `TypeError`，其余非法情形抛 `ValueError`；结构合法但签名
-  不匹配由 `verify_audit_chain` 返回 `False`
+  错误/缺失标签、空链、零长回执、`R` 为零、截断、尾随字节、计数不符、
+  空/零/重复/非升序签名者编号及非规范整数（前导零或零长整数帧）；成功后重编码
+  必得到原字节。非 `bytes` 入参抛 `TypeError`，其余非法情形抛 `ValueError`；
+  结构合法但签名不匹配由 `verify_audit_chain` 返回 `False`
+- `AuditProof(i, n, m, a, p)` — 冻结数据类，字段依次为叶下标 `int`、记录总数
+  `int`、记录消息 `bytes`、`SigningAudit` 回执、自叶至根的 32 字节兄弟摘要
+  `tuple[bytes, ...]`（单记录树为空元组）；可按位置构造、按值相等；构造时不
+  校验，核验由 `check_proof` 负责
+- `make_proof(records, i) -> tuple[bytes, AuditProof]` — 对沿用
+  `AuditChain.records` 的非空保序 `(message, SigningAudit)` 元组建 SHA256
+  Merkle 树：叶为 `H(b"am/l"||U64(i)||H(message)||H(audit.payload))`，父节点为
+  `H(b"am/n"||left||right)`，每层奇数尾节点复制自身配对；返回待签消息
+  `b"am/r"||U64(n)||root` 与第 `i` 叶证明。索引非整数（含布尔）或记录类型错误
+  抛 `TypeError`；空记录、计数超过 2^64-1 或 `i` 越界抛 `ValueError`
+- `check_proof(proof, signature, key) -> bool` — 按 `proof.p` 自叶至根重建根，
+  对 `(proof.m, proof.a)` 调用 `check_audit` 并对
+  `b"am/r"||U64(n)||root` 调用 `verify_signature`；全部一致返回 `True`，结构
+  合法但不匹配返回 `False`。非 `AuditProof`/`AggregateSignature` 入参或字段类型
+  错误抛 `TypeError`，`n` 非正或超 2^64-1、`i` 越界、路径长度不符或兄弟非
+  32 字节、回执/签名结构非法抛 `ValueError`
 
 ### 门限 Schnorr 群参数与边界
 
