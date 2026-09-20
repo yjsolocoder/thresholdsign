@@ -1,5 +1,6 @@
 """Tests for Merkle inclusion proofs over audit-chain records:
-AuditProof / make_proof / check_proof."""
+AuditProof / make_proof / check_proof and the canonical transport
+encoding encode_audit_proof / decode_audit_proof."""
 
 import dataclasses
 import hashlib
@@ -11,6 +12,8 @@ from thresholdsign import (
     AuditProof,
     SigningAudit,
     check_proof,
+    decode_audit_proof,
+    encode_audit_proof,
     make_proof,
     verify_signature,
 )
@@ -26,10 +29,31 @@ from test_audit_chain import (
 LEAF_TAG = b"am/l"
 NODE_TAG = b"am/n"
 ROOT_TAG = b"am/r"
+PROOF_WIRE_TAG = b"thresholdsign/audit-proof/v1"
 
 
 def u64(value: int) -> bytes:
     return value.to_bytes(8, "big", signed=False)
+
+
+def varint(value: int) -> bytes:
+    body = value.to_bytes((value.bit_length() + 7) // 8 or 1, "big")
+    return len(body).to_bytes(4, "big") + body
+
+
+def build_proof_wire(proof) -> bytes:
+    """Independently build the audit-proof wire format straight from the spec."""
+    out = bytearray(PROOF_WIRE_TAG)
+    out += varint(proof.i)
+    out += varint(proof.n)
+    out += len(proof.m).to_bytes(4, "big", signed=False)
+    out += proof.m
+    out += len(proof.a.payload).to_bytes(4, "big", signed=False)
+    out += proof.a.payload
+    out += len(proof.p).to_bytes(4, "big", signed=False)
+    for sibling in proof.p:
+        out += sibling
+    return bytes(out)
 
 
 def digest(data: bytes) -> bytes:
@@ -390,6 +414,173 @@ class CheckProofTest(unittest.TestCase):
         bad_sig = AggregateSignature(R=GROUP_PRIME, z=0, signer_ids=(1, 3))
         with self.assertRaises(ValueError):
             check_proof(proof, bad_sig, self.key)
+
+
+class AuditProofEncodingTest(unittest.TestCase):
+    def setUp(self):
+        self.key = make_key()
+        self.records = tuple(
+            make_record(self.key, f"message-{i}".encode(), seed=100 + 10 * i)
+            for i in range(5)
+        )
+
+    def _records_of_size(self, n):
+        base = list(self.records)
+        if n > len(base):
+            base.extend(
+                make_record(self.key, f"extra-{j}".encode(), seed=400 + j)
+                for j in range(n - len(base))
+            )
+        return tuple(base[:n])
+
+    def test_wire_layout_matches_independent_builder(self):
+        for n in range(1, 9):
+            records = self._records_of_size(n)
+            for index in range(n):
+                _message, proof = make_proof(records, index)
+                wire = encode_audit_proof(proof)
+                self.assertTrue(wire.startswith(PROOF_WIRE_TAG))
+                self.assertEqual(wire, build_proof_wire(proof))
+
+    def test_round_trip_for_every_leaf_and_size(self):
+        for n in range(1, 9):
+            records = self._records_of_size(n)
+            for index in range(n):
+                _message, proof = make_proof(records, index)
+                decoded = decode_audit_proof(encode_audit_proof(proof))
+                self.assertEqual(decoded, proof)
+
+    def test_decode_reencode_is_byte_identical(self):
+        for n in range(1, 9):
+            records = self._records_of_size(n)
+            for index in range(n):
+                _message, proof = make_proof(records, index)
+                wire = encode_audit_proof(proof)
+                self.assertEqual(encode_audit_proof(decode_audit_proof(wire)), wire)
+
+    def test_empty_message_and_single_record(self):
+        records = ((b"", self.records[0][1]),)
+        _message, proof = make_proof(records, 0)
+        self.assertEqual(proof.m, b"")
+        self.assertEqual(proof.p, ())
+        wire = encode_audit_proof(proof)
+        self.assertEqual(wire, build_proof_wire(proof))
+        self.assertEqual(decode_audit_proof(wire), proof)
+
+    def test_deterministic(self):
+        _message, proof = make_proof(self.records, 2)
+        self.assertEqual(encode_audit_proof(proof), encode_audit_proof(proof))
+
+    def test_decode_restores_structure_without_verifying(self):
+        # A structurally legal proof whose receipt and path prove nothing
+        # still decodes; check_proof remains the sole verifier.
+        proof = AuditProof(
+            1, 3, b"m", SigningAudit(b"not-a-real-receipt"), (b"s" * 32, b"t" * 32)
+        )
+        wire = encode_audit_proof(proof)
+        decoded = decode_audit_proof(wire)
+        self.assertEqual(decoded, proof)
+        self.assertEqual(decoded.a.payload, b"not-a-real-receipt")
+
+    def test_encode_type_errors(self):
+        _message, proof = make_proof(self.records, 2)
+        with self.assertRaises(TypeError):
+            encode_audit_proof("proof")
+        for bad in (
+            dataclasses.replace(proof, i=True),
+            dataclasses.replace(proof, i="2"),
+            dataclasses.replace(proof, n=True),
+            dataclasses.replace(proof, n=2.0),
+            dataclasses.replace(proof, m=bytearray(b"m")),
+            dataclasses.replace(proof, a=b"receipt"),
+            dataclasses.replace(proof, a=SigningAudit(bytearray(b"a"))),
+            dataclasses.replace(proof, p=[b"s" * 32] * 3),
+            dataclasses.replace(proof, p=(b"s" * 32, b"t" * 32, 33)),
+        ):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                encode_audit_proof(bad)
+
+    def test_encode_value_errors(self):
+        _message, proof = make_proof(self.records, 2)
+        thirty_two = b"s" * 32
+        for bad in (
+            dataclasses.replace(proof, n=0),
+            dataclasses.replace(proof, n=-1),
+            dataclasses.replace(proof, n=2 ** 64),
+            dataclasses.replace(proof, i=-1),
+            dataclasses.replace(proof, i=5),
+            dataclasses.replace(proof, a=SigningAudit(b"")),
+            dataclasses.replace(proof, p=()),
+            dataclasses.replace(proof, p=(thirty_two,)),
+            dataclasses.replace(proof, p=(thirty_two,) * 4),
+            dataclasses.replace(proof, p=(b"s" * 31,) * 3),
+            dataclasses.replace(proof, p=(b"s" * 33,) * 3),
+        ):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                encode_audit_proof(bad)
+
+    def test_decode_type_errors(self):
+        for bad in ("wire", bytearray(b"wire"), None, 42):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                decode_audit_proof(bad)
+
+    def test_decode_bad_tag(self):
+        _message, proof = make_proof(self.records, 2)
+        wire = encode_audit_proof(proof)
+        for bad in (b"", b"thresholdsign/audit-proof/v2" + wire[len(PROOF_WIRE_TAG):],
+                    wire[len(PROOF_WIRE_TAG):]):
+            with self.assertRaises(ValueError, msg=repr(bad[:8])):
+                decode_audit_proof(bad)
+
+    def test_decode_truncation(self):
+        _message, proof = make_proof(self.records, 2)
+        wire = encode_audit_proof(proof)
+        for cut in range(len(wire)):
+            with self.assertRaises(ValueError, msg=f"cut={cut}"):
+                decode_audit_proof(wire[:cut])
+
+    def test_decode_trailing_bytes(self):
+        _message, proof = make_proof(self.records, 2)
+        wire = encode_audit_proof(proof)
+        with self.assertRaises(ValueError):
+            decode_audit_proof(wire + b"\x00")
+
+    def test_decode_non_canonical_varint(self):
+        _message, proof = make_proof(self.records, 2)
+        wire = encode_audit_proof(proof)
+        body = wire[len(PROOF_WIRE_TAG):]
+        # i = 2 as a two-byte body with a leading zero.
+        leading_zero = PROOF_WIRE_TAG + (2).to_bytes(4, "big") + b"\x00\x02" + body[5:]
+        with self.assertRaises(ValueError):
+            decode_audit_proof(leading_zero)
+        # A zero-length integer body is never legal.
+        empty_body = PROOF_WIRE_TAG + (0).to_bytes(4, "big") + body[5:]
+        with self.assertRaises(ValueError):
+            decode_audit_proof(empty_body)
+
+    def test_decode_out_of_range_and_empty_receipt(self):
+        _message, proof = make_proof(self.records, 2)
+        for bad in (
+            dataclasses.replace(proof, i=5),
+            dataclasses.replace(proof, n=0, p=()),
+            dataclasses.replace(proof, n=2 ** 64),
+            dataclasses.replace(proof, a=SigningAudit(b"")),
+        ):
+            # Encode the fields by hand since encode_audit_proof rejects them.
+            wire = build_proof_wire(bad)
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                decode_audit_proof(wire)
+
+    def test_decode_path_count_mismatch(self):
+        _message, proof = make_proof(self.records, 2)
+        # One path entry too many: the count no longer fits (n - 1).bit_length().
+        bad = dataclasses.replace(proof, p=proof.p + (b"x" * 32,))
+        with self.assertRaises(ValueError):
+            decode_audit_proof(build_proof_wire(bad))
+        # One entry too few.
+        bad = dataclasses.replace(proof, p=proof.p[:-1])
+        with self.assertRaises(ValueError):
+            decode_audit_proof(build_proof_wire(bad))
 
 
 if __name__ == "__main__":

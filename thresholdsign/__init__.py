@@ -22,7 +22,8 @@ RotationChain / verify_rotation_chain / encode_rotation_chain /
 decode_rotation_chain, and the stateless, threshold-Schnorr-authenticated
 audit chain: AuditChain / audit_chain_payload / verify_audit_chain.
 Merkle inclusion proofs over a chain's records: AuditProof / make_proof /
-check_proof.
+check_proof, plus their canonical transport encoding encode_audit_proof /
+decode_audit_proof.
 """
 
 from __future__ import annotations
@@ -95,6 +96,8 @@ __all__ = [
     "AuditProof",
     "make_proof",
     "check_proof",
+    "encode_audit_proof",
+    "decode_audit_proof",
 ]
 
 # Mersenne prime 2**127 - 1: large enough for integer secrets, small enough that
@@ -4063,3 +4066,180 @@ def check_proof(
         generator=generator,
         prime=field_prime,
     )
+
+
+# ---------------------------------------------------------------------------
+# Canonical audit-proof transport: a self-delimiting, byte-for-byte
+# reproducible encoding of an AuditProof for cross-implementation exchange
+# and persistence. Decoding restores structure only — the receipt payload is
+# stored opaque, no receipt is parsed and no signature is checked, so
+# check_proof remains the sole verifier of a proof.
+# ---------------------------------------------------------------------------
+
+AUDIT_PROOF_WIRE_TAG = b"thresholdsign/audit-proof/v1"
+
+
+def _check_audit_proof_types(proof: AuditProof) -> None:
+    """Type-check every field of an audit proof, raising TypeError."""
+    if not isinstance(proof.i, int) or isinstance(proof.i, bool):
+        raise TypeError("proof.i must be an integer")
+    if not isinstance(proof.n, int) or isinstance(proof.n, bool):
+        raise TypeError("proof.n must be an integer")
+    if not isinstance(proof.m, bytes):
+        raise TypeError("proof.m must be bytes")
+    if not isinstance(proof.a, SigningAudit):
+        raise TypeError("proof.a must be a SigningAudit instance")
+    if not isinstance(proof.a.payload, bytes):
+        raise TypeError("proof.a payload must be bytes")
+    if not isinstance(proof.p, tuple):
+        raise TypeError("proof.p must be a tuple")
+    for sibling in proof.p:
+        if not isinstance(sibling, bytes):
+            raise TypeError("proof.p entries must be bytes")
+
+
+def _check_audit_proof_structure(proof: AuditProof) -> None:
+    """Validate the bounds and path shape of an audit proof (ValueError).
+
+    Only the self-contained structural rules the wire framing needs are
+    checked: ``0 < n < 2**64``, ``0 <= i < n``, a non-empty receipt, frames
+    that fit the 4-byte lengths, a path of exactly ``(n - 1).bit_length()``
+    entries and 32-byte siblings. Whether the proof actually verifies against
+    a key and signature is :func:`check_proof`'s job alone.
+    """
+    if proof.n <= 0:
+        raise ValueError("proof.n must be positive")
+    if proof.n > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("proof.n must fit the 64-bit counter")
+    if proof.i < 0 or proof.i >= proof.n:
+        raise ValueError("proof.i must satisfy 0 <= i < n")
+    if not proof.a.payload:
+        raise ValueError("proof receipt must be non-empty")
+    if len(proof.m) > 0xFFFFFFFF:
+        raise ValueError("proof message encoding too long")
+    if len(proof.a.payload) > 0xFFFFFFFF:
+        raise ValueError("proof receipt encoding too long")
+    if len(proof.p) != (proof.n - 1).bit_length():
+        raise ValueError("proof.p has the wrong length for proof.n")
+    for sibling in proof.p:
+        if len(sibling) != AUDIT_PROOF_DIGEST_SIZE:
+            raise ValueError("proof.p entries must be exactly 32 bytes")
+
+
+def encode_audit_proof(proof: AuditProof) -> bytes:
+    """Canonically encode an audit proof for transport or persistence.
+
+    The encoding starts with the tag ``b"thresholdsign/audit-proof/v1"`` and
+    then writes, in order: ``i`` and ``n``, each as a 4-byte unsigned
+    big-endian length followed by the shortest unsigned big-endian value
+    (zero is the single body byte ``00``, positive values carry no leading
+    zero); the message frame (4-byte unsigned big-endian length followed by
+    the raw ``proof.m``, which may be empty); the receipt frame (4-byte
+    unsigned big-endian length followed by the raw ``SigningAudit.payload``,
+    which must be non-empty); the path entry count as a 4-byte unsigned
+    big-endian integer; and finally the raw 32-byte path entries in tuple
+    order, with no per-entry length.
+
+    Only a structurally legal proof is accepted — ``0 < n < 2**64``,
+    ``0 <= i < n``, a non-empty receipt, a path of exactly
+    ``(n - 1).bit_length()`` entries of 32 bytes each — but neither the
+    receipt nor the path is required to prove anything:
+    :func:`check_proof` stays the way to test a proof afterwards. Wrong
+    field types raise TypeError (a non-:class:`AuditProof` argument,
+    non-integer or boolean ``i``/``n``, a non-bytes message, a
+    non-:class:`SigningAudit` receipt, a non-tuple path or non-bytes path
+    entries); an out-of-range ``i``, a non-positive or over-64-bit ``n``, an
+    empty receipt, an over-long frame, a path of the wrong length or a path
+    entry that is not exactly 32 bytes raises ValueError. The output for a
+    given proof is unique and the encoding carries no network, storage or
+    hidden state.
+    """
+    if not isinstance(proof, AuditProof):
+        raise TypeError("proof must be an AuditProof instance")
+    _check_audit_proof_types(proof)
+    _check_audit_proof_structure(proof)
+
+    buffer = bytearray(AUDIT_PROOF_WIRE_TAG)
+    buffer += _encode_varint(proof.i)
+    buffer += _encode_varint(proof.n)
+    buffer += len(proof.m).to_bytes(4, "big", signed=False)
+    buffer += proof.m
+    buffer += len(proof.a.payload).to_bytes(4, "big", signed=False)
+    buffer += proof.a.payload
+    buffer += len(proof.p).to_bytes(4, "big", signed=False)
+    for sibling in proof.p:
+        buffer += sibling
+    return bytes(buffer)
+
+
+def _read_audit_proof_block(
+    stream: bytes, offset: int, *, what: str, allow_empty: bool = False
+) -> tuple[bytes, int]:
+    """Read one 4-byte-length-prefixed audit proof frame body at ``offset``."""
+    if offset + 4 > len(stream):
+        raise ValueError(f"truncated audit proof {what} length")
+    length = int.from_bytes(stream[offset:offset + 4], "big")
+    offset += 4
+    if length == 0 and not allow_empty:
+        raise ValueError(f"audit proof {what} must be non-empty")
+    if offset + length > len(stream):
+        raise ValueError(f"truncated audit proof {what}")
+    return bytes(stream[offset:offset + length]), offset + length
+
+
+def decode_audit_proof(payload: bytes) -> AuditProof:
+    """Decode the canonical encoding produced by :func:`encode_audit_proof`.
+
+    Accepts only the single canonical form: the tag
+    ``b"thresholdsign/audit-proof/v1"``, the length-prefixed shortest-form
+    integers ``i`` and ``n`` (zero is the single byte ``00``, positive values
+    carry no leading zero), the message frame (a 4-byte length that may be
+    zero, then the raw message), the receipt frame (a 4-byte length, never
+    zero, then the raw receipt), the 4-byte unsigned big-endian path entry
+    count and that many raw 32-byte path entries. A non-bytes argument
+    raises TypeError; a wrong or missing tag, a non-canonical integer
+    (leading zero or over-long length), a non-positive or over-64-bit ``n``,
+    an ``i`` outside ``0 <= i < n``, an empty receipt, a path count that
+    does not equal ``(n - 1).bit_length()``, truncation or trailing bytes
+    raises ValueError. A successfully decoded proof re-encodes to exactly
+    the input bytes.
+
+    Decoding only restores the structure: the receipt payload is stored
+    opaque, no receipt is parsed, no signature is checked and no state is
+    kept. A structurally legal proof whose record, path or root does not
+    verify is returned normally, and :func:`check_proof` reports it as
+    ``False``.
+    """
+    if not isinstance(payload, bytes):
+        raise TypeError("payload must be bytes")
+    if not payload.startswith(AUDIT_PROOF_WIRE_TAG):
+        raise ValueError("bad audit proof tag")
+    offset = len(AUDIT_PROOF_WIRE_TAG)
+
+    index, offset = _read_varint(payload, offset, what="audit proof i")
+    count, offset = _read_varint(payload, offset, what="audit proof n")
+    message, offset = _read_audit_proof_block(
+        payload, offset, what="message", allow_empty=True
+    )
+    receipt, offset = _read_audit_proof_block(payload, offset, what="receipt")
+
+    if offset + 4 > len(payload):
+        raise ValueError("truncated audit proof path count")
+    path_count = int.from_bytes(payload[offset:offset + 4], "big")
+    offset += 4
+    if offset + path_count * AUDIT_PROOF_DIGEST_SIZE > len(payload):
+        raise ValueError("truncated audit proof path")
+    path = []
+    for _ in range(path_count):
+        path.append(bytes(payload[offset:offset + AUDIT_PROOF_DIGEST_SIZE]))
+        offset += AUDIT_PROOF_DIGEST_SIZE
+    if offset != len(payload):
+        raise ValueError("trailing bytes after audit proof")
+
+    proof = AuditProof(
+        i=index, n=count, m=message, a=SigningAudit(payload=receipt), p=tuple(path)
+    )
+    _check_audit_proof_structure(proof)
+    if encode_audit_proof(proof) != payload:
+        raise ValueError("non-canonical audit proof")
+    return proof
