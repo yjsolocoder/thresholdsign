@@ -435,6 +435,20 @@ python3 -m thresholdsign
   解码行的 `(signer_id, R_i)` 分组，同一对不同 payload 至少出现两次才报告
   复用（重复提交同一回执不制造告警）；结果按 `signer_id`、`nonce_commitment`
   升序，与输入顺序无关；函数只检查本批输入，不留历史
+- `NonceLeak(signer_id, commitment, share, receipts)` — 冻结数据类，可按位置
+  构造、按值相等；仅凭公开回执恢复出的签名者秘密份额：前三项为整数，末项为
+  所用两张 status=1 `SigningAudit` 回执（按 `payload` 升序）的元组；
+  `share` 满足 `g^share = Y_i mod p`
+- `recover_leaks(records, dkg_result) -> tuple[NonceLeak, ...]` — 泄露份额
+  恢复：`records` 各项为 `(message, receipt)`，先调用 `find_nonce_reuse`
+  分组，沿用其回执复核、status=1 筛选、去重与排序规则（参数或记录类型错抛
+  `TypeError`，非法或不匹配回执抛 `ValueError`）。对同组回执按各自签名者
+  集合求零点权重 `λ_i`，令 `a = c·λ_i mod q`；选 payload 字节序最小且
+  `a1 ≠ a2` 的回执对，从其行中取 `z1`、`z2`，恢复
+  `s = (z1-z2)·(a1-a2)⁻¹ mod q`。恢复值必须满足 `g^share = Y_i mod p`，
+  否则抛 `ValueError`；每组至多输出一项，`receipts` 为所用两回执且按
+  payload 升序，结果按 `signer_id`、`commitment` 升序；不存在可逆对
+  （各回执 `a` 相同）的组被忽略
 - `Rotation(old, new, ids, t, q, p, g, sig)` — 冻结数据类，可按位置构造、按值
   相等；公开可验证的密钥轮换授权证书：`old`/`new` 为新旧联合公钥，`ids` 为严格
   递增的新成员编号元组，`t` 为新 threshold，`q`/`p`/`g` 为域素数、群素数与

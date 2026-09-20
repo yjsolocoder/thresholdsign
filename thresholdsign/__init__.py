@@ -14,7 +14,8 @@ SigningRound / SignatureShare / SignatureShareRejection / AggregateSignature /
 create_signing_nonce_commitment / create_signing_round / create_signature_share
 / verify_signature_share / aggregate_signature / verify_signature, signing
 audit receipts: SigningAudit / create_audit / check_audit, the stateless
-nonce-reuse audit NonceReuse / find_nonce_reuse, and publicly
+nonce-reuse audit NonceReuse / find_nonce_reuse, the leaked-share
+recovery NonceLeak / recover_leaks, and publicly
 verifiable key-rotation authorization: Rotation / rotation_payload /
 verify_rotation.
 """
@@ -70,6 +71,8 @@ __all__ = [
     "check_audit",
     "NonceReuse",
     "find_nonce_reuse",
+    "NonceLeak",
+    "recover_leaks",
     "Rotation",
     "rotation_payload",
     "verify_rotation",
@@ -2906,3 +2909,130 @@ def find_nonce_reuse(
         )
     findings.sort(key=lambda finding: (finding.signer_id, finding.nonce_commitment))
     return tuple(findings)
+
+
+# ---------------------------------------------------------------------------
+# Leaked-share recovery: a reused round-one commitment R_i exposes the
+# signer's secret share. From the same receipts the nonce-reuse audit groups,
+# the two round-two responses z_i = r_i + a * s_i (with a = c * lambda_i for
+# the receipt's own signer set) solve to s_i = (z1 - z2) / (a1 - a2) mod q.
+# Recovery re-runs find_nonce_reuse, so it inherits its receipt re-check,
+# status-1 filter, deduplication and ordering.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class NonceLeak:
+    """One signer's secret share recovered from a reused round-one nonce.
+
+    ``signer_id`` names the DKG participant, ``commitment`` the round-one
+    value ``R_i`` that two distinct verified receipts share, ``share`` the
+    recovered secret share ``s_i`` (it satisfies ``g ** share == Y_i`` for
+    the signer's verification share), and ``receipts`` holds the two
+    status-1 :class:`SigningAudit` receipts used in the recovery, ordered by
+    their ``payload`` bytes. The recovery uses only public receipts, so the
+    leak is verifiable by anyone holding the key's public material.
+    """
+
+    signer_id: int
+    commitment: int
+    share: int
+    receipts: tuple[SigningAudit, ...]
+
+
+def recover_leaks(
+    records: Iterable[tuple[bytes, SigningAudit]],
+    dkg_result: SigningDKGResult,
+) -> tuple[NonceLeak, ...]:
+    """Recover every secret share exposed by a reused round-one nonce.
+
+    ``records`` pairs each audited message with its receipt, exactly as for
+    :func:`find_nonce_reuse`, and ``dkg_result`` is the signing key the
+    receipts were created under. The receipts are first grouped with
+    :func:`find_nonce_reuse`, so its rules apply unchanged: every receipt is
+    re-verified with :func:`check_audit`, only status-1 receipts take part,
+    a group needs two distinct payloads, and the receipts are deduplicated
+    and ordered by payload. Wrong argument or record element types raise
+    TypeError; a structurally illegal receipt or one that does not match its
+    message or the key raises ValueError.
+
+    For each ``(signer_id, R_i)`` group the Lagrange zero-point weight
+    ``lambda_i`` is computed from each receipt's own signer set and
+    ``a = c * lambda_i mod q``. The two payload-smallest receipts whose
+    ``a`` values differ form the invertible pair; their rows give
+    ``z1`` / ``z2`` and the share is
+    ``s = (z1 - z2) * (a1 - a2) ** -1 mod q``. The recovered value must
+    satisfy ``g ** s == Y_i mod p``, otherwise ValueError is raised. Each
+    group with an invertible pair yields one :class:`NonceLeak` whose
+    ``receipts`` are the two used receipts ordered by ascending payload; the
+    findings are returned sorted by ascending ``signer_id`` then
+    ``commitment``. A group whose receipts all share the same ``a`` is
+    ignored, since no invertible pair exists.
+    """
+    result, _public_key, field_prime, group_prime, generator = (
+        _check_signing_setup(dkg_result)
+    )
+    _check_signing_dkg_structure(dkg_result)
+
+    findings = find_nonce_reuse(records, dkg_result)
+
+    leaks = []
+    for finding in findings:
+        signer_id = finding.signer_id
+        commitment = finding.nonce_commitment
+
+        candidates = []
+        for receipt in finding.receipts:
+            _digest, _Y, _R, challenge, rows, _status, _z = _decode_audit_payload(
+                receipt.payload, field_prime, group_prime
+            )
+            signer_ids = tuple(row[0] for row in rows)
+            for row_signer_id, row_commitment, z_i in rows:
+                if row_signer_id == signer_id and row_commitment == commitment:
+                    weight = _lagrange_weight(signer_id, signer_ids, field_prime)
+                    a_value = challenge * weight % field_prime
+                    candidates.append((receipt, a_value, z_i))
+                    break
+
+        pair = None
+        for first_index in range(len(candidates)):
+            for second_index in range(first_index + 1, len(candidates)):
+                receipt_one, a_one, z_one = candidates[first_index]
+                receipt_two, a_two, z_two = candidates[second_index]
+                if a_one != a_two:
+                    # Candidates are in ascending payload order, so the first
+                    # differing pair is the payload-smallest one.
+                    pair = (
+                        receipt_one,
+                        a_one,
+                        z_one,
+                        receipt_two,
+                        a_two,
+                        z_two,
+                    )
+                    break
+            if pair is not None:
+                break
+        if pair is None:
+            continue
+
+        receipt_one, a_one, z_one, receipt_two, a_two, z_two = pair
+        denominator = (a_one - a_two) % field_prime
+        share = ((z_one - z_two) % field_prime) * pow(denominator, -1, field_prime) % field_prime
+
+        share_index = result.participant_ids.index(signer_id)
+        verification_share = dkg_result.verification_shares[share_index]
+        if pow(generator, share, group_prime) != verification_share:
+            raise ValueError("recovered share does not match the signer verification share")
+
+        leaks.append(
+            NonceLeak(
+                signer_id=signer_id,
+                commitment=commitment,
+                share=share,
+                receipts=(receipt_one, receipt_two),
+            )
+        )
+
+    leaks.sort(key=lambda leak: (leak.signer_id, leak.commitment))
+    return tuple(leaks)
