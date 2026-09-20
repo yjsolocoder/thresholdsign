@@ -324,6 +324,31 @@ anchor/`old` 对不上的链照常返回，由 `verify_rotation_chain` 返回 `F
 `ValueError`；非 `bytes` 的解码入参抛 `TypeError`。链本身不含任何网络、
 存储或隐藏状态。
 
+### 门限 Schnorr 认证的无状态审计链
+
+把一批签名轮次的审计回执（成功或失败的回执均可）按给定顺序与各自的消息组成
+`(message, audit)` 记录，再由同一把密钥的门限 quorum 对整条链消息签名，即得到
+无状态审计链 `AuditChain`。冻结数据类 `AuditChain(records, signature)` 可按位置
+构造、按值相等，`records` 为非空且保序的记录元组；签名是否有效由
+`verify_audit_chain` 在核验时保证，构造时不验签：
+
+```python
+from thresholdsign import AuditChain, audit_chain_payload, verify_audit_chain
+
+records = ((message1, audit1), (message2, audit2))   # 顺序即封装顺序
+payload = audit_chain_payload(records, key.public_key)   # 作为 SigningRound.message
+# quorum 走两轮门限 Schnorr 协议签署 payload，得到 AggregateSignature
+chain = AuditChain(records, signature)
+assert verify_audit_chain(chain, key)
+```
+
+链消息依次为标签 `b"ts/ac/v1"`、`H(BE(public_key))`、8 字节无符号大端记录数
+`U64(len(records))`，以及按序每条记录的 `H(message) || H(audit.payload)`
+（`H = SHA256`，`BE` 为公钥的最短无符号大端编码，无分隔符，记录数唯一界定）。
+删除、插入、重排任一记录，替换消息或回执，都会改变链消息而使签名失效；核验时
+对每条记录再以 `check_audit` 逐项复核，因此把回执换成另一把密钥下的回执也会被
+识别。链不保存任何网络、存储或隐藏状态。
+
 
 ## 命令行演示
 
@@ -485,6 +510,25 @@ python3 -m thresholdsign
   或份额方程失败都计入重算 status=0，与记录的 status 对比而非直接判负，因此
   原样生成的失败回执复核为 `True`；重算结论与回执一致返回 `True`，合法篡改
   或消息/密钥不匹配返回 `False`
+- `AuditChain(records, signature)` — 冻结数据类，可按位置构造、按值相等；
+  `records` 为非空且保序的 `(message: bytes, audit: SigningAudit)` 元组的元组，
+  `signature` 为该密钥对 `audit_chain_payload` 的 `AggregateSignature`；构造时
+  不验签，由 `verify_audit_chain` 核验
+- `audit_chain_payload(records, public_key) -> bytes` — 生成由门限 quorum 签署的
+  链消息（作为 `SigningRound.message`）：依次拼接标签 `b"ts/ac/v1"`、
+  `H(BE(public_key))`（32 字节）、`U64(len(records))`（8 字节无符号大端计数），
+  再按序拼接每条记录的 `H(message) || H(audit.payload)`（各 32 字节）；
+  `H = SHA256`，`BE` 为最短无符号大端整数编码，无分隔符，计数唯一界定记录对；
+  `records` 可为任意可迭代对象（内部物化为元组）且必须非空。类型错误抛
+  `TypeError`，空记录、非正公钥或计数溢出 64 位抛 `ValueError`
+- `verify_audit_chain(chain, key) -> bool` — 先按链序对每条记录调用
+  `check_audit(message, audit, key)` 逐项复核（结构非法抛 `ValueError`，合法
+  回执但消息或密钥不匹配返回 `False`），再以 `key.public_key` 重建链消息并调用
+  `verify_signature` 核验 `chain.signature`；删除、插入、重排记录，替换消息或
+  回执值，或换用另一把密钥下的回执（跨密钥替换）均返回 `False`。非
+  `AuditChain` 入参、非元组记录序列、记录元素类型错误或签名类型错误抛
+  `TypeError`；空链、非正公钥、计数溢出、回执结构非法或签名结构非法抛
+  `ValueError`
 - `NonceReuse(signer_id, nonce_commitment, receipts)` — 冻结数据类，可按位置
   构造、按值相等；同一签名者重复使用同一轮次一承诺 `R_i` 的证据：`receipts`
   为含该 `(signer_id, R_i)` 行的 status=1 审计回执，按 `payload` 字节序去重

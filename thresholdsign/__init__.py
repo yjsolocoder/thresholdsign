@@ -15,7 +15,9 @@ create_signing_nonce_commitment / create_signing_round / create_signature_share
 / verify_signature_share / aggregate_signature / verify_signature, signing
 audit receipts: SigningAudit / create_audit / check_audit, the stateless
 nonce-reuse audit NonceReuse / find_nonce_reuse, leaked-share recovery from
-reused nonces via NonceLeak / recover_leaks, and publicly
+reused nonces via NonceLeak / recover_leaks, the stateless threshold-Schnorr
+signed audit chain AuditChain / audit_chain_payload / verify_audit_chain,
+and publicly
 verifiable key-rotation authorization: Rotation / rotation_payload /
 verify_rotation, plus the persistent, multi-hop authorization chain
 RotationChain / verify_rotation_chain / encode_rotation_chain /
@@ -75,6 +77,9 @@ __all__ = [
     "find_nonce_reuse",
     "NonceLeak",
     "recover_leaks",
+    "AuditChain",
+    "audit_chain_payload",
+    "verify_audit_chain",
     "Rotation",
     "rotation_payload",
     "verify_rotation",
@@ -3452,3 +3457,174 @@ def recover_leaks(
         )
     leaks.sort(key=lambda leak: (leak.signer_id, leak.commitment))
     return tuple(leaks)
+
+
+# ---------------------------------------------------------------------------
+# Stateless audit chains: an ordered, non-empty batch of
+# (message, SigningAudit) records authenticated by a single threshold Schnorr
+# signature under one key. The canonical chain message folds in the key and
+# every message and receipt payload, so deleting, inserting, reordering or
+# swapping a record across keys breaks the signature; each receipt is
+# additionally re-verified with check_audit against the same key.
+# ---------------------------------------------------------------------------
+
+AUDIT_CHAIN_TAG = b"ts/ac/v1"
+
+
+@dataclass(frozen=True)
+class AuditChain:
+    """A non-empty, order-preserving batch of audit records with one signature.
+
+    ``records`` is the non-empty tuple of ``(message, audit)`` pairs in chain
+    order, each ``message`` a ``bytes`` value and each ``audit`` a
+    :class:`SigningAudit`; ``signature`` is the signing key's threshold
+    Schnorr signature on :func:`audit_chain_payload` of the records and the
+    key. Like :class:`RotationChain`, the dataclass is frozen, positionally
+    constructible and compared by value; the signature's validity is enforced
+    by :func:`verify_audit_chain`, not by construction.
+    """
+
+    records: tuple[tuple[bytes, SigningAudit], ...]
+    signature: AggregateSignature
+
+
+def _check_audit_chain_records(records: object) -> tuple[tuple[bytes, SigningAudit], ...]:
+    """Type- and structure-check a non-empty ``(message, audit)`` record tuple.
+
+    Wrong types raise TypeError; a non-tuple sequence, an empty sequence, a
+    record that is not a 2-tuple, a non-bytes message, a non-SigningAudit
+    receipt or a receipt with a non-bytes payload raise ValueError/TypeError.
+    The record count must fit an unsigned 64-bit integer.
+    """
+    if not isinstance(records, tuple):
+        raise TypeError("records must be a tuple")
+    if not records:
+        raise ValueError("records must be non-empty")
+    if len(records) > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("too many records")
+    for record in records:
+        if not isinstance(record, tuple) or len(record) != 2:
+            raise TypeError("records must contain (message, audit) tuples")
+        message, audit = record
+        if not isinstance(message, bytes):
+            raise TypeError("record message must be bytes")
+        if not isinstance(audit, SigningAudit):
+            raise TypeError("record audit must be a SigningAudit instance")
+        if not isinstance(audit.payload, bytes):
+            raise TypeError("record audit payload must be bytes")
+    return records
+
+
+def _check_audit_chain_signature(signature: object) -> None:
+    """Type-check the container's AggregateSignature and its signer id set."""
+    if not isinstance(signature, AggregateSignature):
+        raise TypeError("signature must be an AggregateSignature instance")
+    if not isinstance(signature.R, int) or isinstance(signature.R, bool):
+        raise TypeError("signature.R must be an integer")
+    if not isinstance(signature.z, int) or isinstance(signature.z, bool):
+        raise TypeError("signature.z must be an integer")
+    if not isinstance(signature.signer_ids, tuple):
+        raise TypeError("signature.signer_ids must be a tuple")
+    for signer_id in signature.signer_ids:
+        if not isinstance(signer_id, int) or isinstance(signer_id, bool):
+            raise TypeError("signer ids must be integers")
+    if not signature.signer_ids:
+        raise ValueError("at least one signer is required")
+    if any(
+        signature.signer_ids[index] >= signature.signer_ids[index + 1]
+        for index in range(len(signature.signer_ids) - 1)
+    ):
+        raise ValueError("signer ids must be strictly increasing and unique")
+
+
+def audit_chain_payload(
+    records: Iterable[tuple[bytes, SigningAudit]],
+    public_key: int,
+) -> bytes:
+    """Encode the canonical chain message the audit key signs.
+
+    The payload is, in order: the tag ``b"ts/ac/v1"``, the 32-byte SHA-256
+    digest of the public key's shortest unsigned big-endian encoding, the
+    record count as an 8-byte unsigned big-endian integer, and then one
+    ``SHA256(message) || SHA256(audit.payload)`` pair per record in the given
+    order. Every digest is 32 bytes and there are no separators: the count
+    alone delimits the record pairs. The result is meant to be used as the
+    ``SigningRound.message`` signed by the threshold quorum.
+
+    ``records`` may be any iterable of ``(message, audit)`` tuples (it is
+    materialised); it must be non-empty. Wrong argument or record element
+    types raise TypeError; an empty record batch, a non-positive public key
+    or a record count that does not fit 64 bits raises ValueError.
+    """
+    if not isinstance(public_key, int) or isinstance(public_key, bool):
+        raise TypeError("public_key must be an integer")
+    if public_key <= 0:
+        raise ValueError("public_key must be positive")
+    if isinstance(records, (str, bytes)):
+        raise TypeError("records must be an iterable of (message, audit) tuples")
+    materialised = tuple(records)
+    if not materialised:
+        raise ValueError("records must be non-empty")
+    if len(materialised) > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("too many records")
+    for record in materialised:
+        if not isinstance(record, tuple) or len(record) != 2:
+            raise TypeError("records must contain (message, audit) tuples")
+        message, audit = record
+        if not isinstance(message, bytes):
+            raise TypeError("record message must be bytes")
+        if not isinstance(audit, SigningAudit):
+            raise TypeError("record audit must be a SigningAudit instance")
+        if not isinstance(audit.payload, bytes):
+            raise TypeError("record audit payload must be bytes")
+
+    key_bytes = public_key.to_bytes(
+        (public_key.bit_length() + 7) // 8, "big", signed=False
+    )
+    buffer = bytearray(AUDIT_CHAIN_TAG)
+    buffer += hashlib.sha256(key_bytes).digest()
+    buffer += len(materialised).to_bytes(8, "big", signed=False)
+    for message, audit in materialised:
+        buffer += hashlib.sha256(message).digest()
+        buffer += hashlib.sha256(audit.payload).digest()
+    return bytes(buffer)
+
+
+def verify_audit_chain(chain: AuditChain, key: SigningDKGResult) -> bool:
+    """Verify an audit chain against ``key``.
+
+    Every record of ``chain`` is first re-verified with :func:`check_audit`
+    against ``key``, in chain order: a receipt that does not match its message
+    or the key returns ``False`` and a structurally illegal receipt raises
+    ValueError. The chain message is then rebuilt with
+    :func:`audit_chain_payload` from the records and ``key``'s public key and
+    ``chain.signature`` is checked as a threshold Schnorr signature on it via
+    :func:`verify_signature`. Returns ``True`` only when every receipt
+    re-verifies and the signature matches; deleting, inserting or reordering
+    records, swapping a message or receipt, or substituting a receipt signed
+    under another key all change the signed message and return ``False``.
+
+    Wrong argument or record element types raise TypeError; an empty chain, a
+    non-tuple record sequence, a non-positive key, an over-long count, a
+    structurally illegal receipt or a structurally illegal signature raises
+    ValueError.
+    """
+    if not isinstance(chain, AuditChain):
+        raise TypeError("chain must be an AuditChain instance")
+    records = _check_audit_chain_records(chain.records)
+    _check_audit_chain_signature(chain.signature)
+    _result, public_key, field_prime, group_prime, generator = _check_signing_setup(key)
+    _check_signing_dkg_structure(key)
+
+    for message, audit in records:
+        if not check_audit(message, audit, key):
+            return False
+    chain_message = audit_chain_payload(records, public_key)
+    return verify_signature(
+        chain_message,
+        chain.signature,
+        public_key,
+        group_prime=group_prime,
+        generator=generator,
+        prime=field_prime,
+    )
