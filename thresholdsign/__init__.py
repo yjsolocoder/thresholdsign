@@ -17,7 +17,9 @@ audit receipts: SigningAudit / create_audit / check_audit, the stateless
 nonce-reuse audit NonceReuse / find_nonce_reuse, leaked-share recovery from
 reused nonces via NonceLeak / recover_leaks, and publicly
 verifiable key-rotation authorization: Rotation / rotation_payload /
-verify_rotation.
+verify_rotation, plus the persistent, multi-hop authorization chain
+RotationChain / verify_rotation_chain / encode_rotation_chain /
+decode_rotation_chain.
 """
 
 from __future__ import annotations
@@ -78,6 +80,10 @@ __all__ = [
     "verify_rotation",
     "encode_rotation",
     "decode_rotation",
+    "RotationChain",
+    "verify_rotation_chain",
+    "encode_rotation_chain",
+    "decode_rotation_chain",
 ]
 
 # Mersenne prime 2**127 - 1: large enough for integer secrets, small enough that
@@ -3054,6 +3060,192 @@ def decode_rotation(payload: bytes) -> Rotation:
     if encode_rotation(cert) != payload:
         raise ValueError("non-canonical rotation certificate")
     return cert
+
+
+# ---------------------------------------------------------------------------
+# Persistent rotation chains: a sequence of Rotation certificates that lets an
+# observer starting from a trusted old public key verify repeated key
+# rotations hop by hop. The anchor names the out-of-band trusted key and each
+# certificate links to the next via new == next.old. A chain is a plain value
+# — it carries no network, storage or hidden state, and each certificate's
+# authorization remains verify_rotation's sole job.
+# ---------------------------------------------------------------------------
+
+ROTATION_CHAIN_TAG = b"thresholdsign/rotation-chain/v1"
+
+
+@dataclass(frozen=True)
+class RotationChain:
+    """A non-empty, order-preserving chain of :class:`Rotation` certificates.
+
+    ``anchor`` is the trusted public key the chain starts from and
+    ``certificates`` the non-empty tuple of rotation certificates in chain
+    order: the first certificate's ``old`` must equal ``anchor`` and every
+    adjacent pair must satisfy ``certificates[i].new == certificates[i + 1].old``
+    (enforced by :func:`verify_rotation_chain`, not by construction). Like
+    :class:`Rotation`, the dataclass is frozen, positionally constructible and
+    compared by value.
+    """
+
+    anchor: int
+    certificates: tuple[Rotation, ...]
+
+
+def verify_rotation_chain(chain: RotationChain) -> bool:
+    """Verify every hop of a rotation chain starting from the trusted anchor.
+
+    ``chain.anchor`` must equal the first certificate's ``old`` and each
+    adjacent pair must satisfy ``cert.new == next_cert.old``; every
+    certificate is then checked with :func:`verify_rotation`. The result is
+    the logical AND of the linkage checks and all per-certificate
+    verifications. A wrong argument type raises TypeError; an empty chain, a
+    non-tuple certificate sequence, a non-:class:`Rotation` element, a
+    non-integer anchor or a boolean anchor raise ValueError, exactly as the
+    structural checks of :func:`encode_rotation_chain` do.
+    """
+    if not isinstance(chain, RotationChain):
+        raise TypeError("chain must be a RotationChain instance")
+    _check_rotation_chain_fields(chain.anchor, chain.certificates)
+
+    result = chain.anchor == chain.certificates[0].old
+    previous_new = chain.certificates[0].new
+    for cert in chain.certificates[1:]:
+        result = (previous_new == cert.old) and result
+        previous_new = cert.new
+    for cert in chain.certificates:
+        result = verify_rotation(cert) and result
+    return result
+
+
+def _check_rotation_chain_fields(
+    anchor: int, certificates: tuple[Rotation, ...]
+) -> None:
+    """Type- and structure-check the chain container, without verifying certs."""
+    if not isinstance(anchor, int) or isinstance(anchor, bool):
+        raise TypeError("anchor must be an integer")
+    if not isinstance(certificates, tuple):
+        raise TypeError("certificates must be a tuple")
+    if not certificates:
+        raise ValueError("certificates must be non-empty")
+    for cert in certificates:
+        if not isinstance(cert, Rotation):
+            raise TypeError("certificates must contain Rotation instances")
+
+
+def encode_rotation_chain(chain: RotationChain) -> bytes:
+    """Canonically encode a rotation chain for transport or persistence.
+
+    The encoding starts with the tag
+    ``b"thresholdsign/rotation-chain/v1"`` followed by the certificate count
+    as a 4-byte unsigned big-endian integer, the anchor frame and then one
+    frame per certificate in chain order. Both frame kinds are a 4-byte
+    unsigned big-endian length followed by the frame content: the anchor
+    content is the anchor's shortest unsigned big-endian integer (zero is the
+    single byte ``00``) and the certificate content is
+    :func:`encode_rotation` of the certificate.
+
+    Only the chain container and the certificate structures are checked —
+    the anchor is merely required to be a non-negative integer and the
+    signatures need not match; :func:`verify_rotation_chain` remains the way
+    to test the linkage and authorizations. Wrong types raise TypeError and
+    an empty chain, a non-tuple or non-:class:`Rotation` sequence, a negative
+    or over-long anchor, or an illegal certificate raises ValueError. The
+    output for a given chain is unique and carries no network, storage or
+    hidden state.
+    """
+    if not isinstance(chain, RotationChain):
+        raise TypeError("chain must be a RotationChain instance")
+    _check_rotation_chain_fields(chain.anchor, chain.certificates)
+    if chain.anchor < 0:
+        raise ValueError("anchor must be non-negative")
+
+    anchor_body = chain.anchor.to_bytes(
+        (chain.anchor.bit_length() + 7) // 8 or 1, "big", signed=False
+    )
+    if len(anchor_body) > 0xFFFFFFFF:
+        raise ValueError("anchor encoding too long")
+    count = len(chain.certificates)
+    if count > 0xFFFFFFFF:
+        raise ValueError("too many certificates")
+
+    frames = [
+        len(anchor_body).to_bytes(4, "big", signed=False) + anchor_body
+    ]
+    for cert in chain.certificates:
+        body = encode_rotation(cert)
+        if len(body) > 0xFFFFFFFF:
+            raise ValueError("certificate encoding too long")
+        frames.append(len(body).to_bytes(4, "big", signed=False) + body)
+
+    buffer = bytearray(ROTATION_CHAIN_TAG)
+    buffer += count.to_bytes(4, "big", signed=False)
+    for frame in frames:
+        buffer += frame
+    return bytes(buffer)
+
+
+def _read_frame(stream: bytes, offset: int, *, what: str) -> tuple[bytes, int]:
+    """Read one 4-byte-length-prefixed frame body at ``offset``."""
+    if offset + 4 > len(stream):
+        raise ValueError(f"truncated rotation chain {what}")
+    length = int.from_bytes(stream[offset:offset + 4], "big")
+    offset += 4
+    if length == 0 or offset + length > len(stream):
+        raise ValueError(f"truncated rotation chain {what}")
+    return bytes(stream[offset:offset + length]), offset + length
+
+
+def decode_rotation_chain(payload: bytes) -> RotationChain:
+    """Decode the canonical encoding produced by :func:`encode_rotation_chain`.
+
+    Accepts only the single canonical form: the tag
+    ``b"thresholdsign/rotation-chain/v1"``, the 4-byte unsigned big-endian
+    certificate count, one anchor frame and then exactly that many
+    certificate frames, each a 4-byte unsigned big-endian length followed by
+    its content — the shortest unsigned big-endian anchor (zero is ``00``)
+    and an :func:`encode_rotation` certificate. A non-bytes argument raises
+    TypeError; an empty chain, a negative or non-canonical anchor, an illegal
+    certificate, a count mismatch, truncation, trailing bytes or a
+    non-canonical frame raise ValueError, as does any certificate that
+    :func:`decode_rotation` rejects. A successfully decoded chain re-encodes
+    to exactly the input bytes.
+
+    Decoding never verifies the certificates or the linkage: a structurally
+    legal chain whose signatures do not authorize the rotations, or whose
+    anchor and ``old`` keys do not line up, is returned normally and
+    :func:`verify_rotation_chain` reports it as ``False``.
+    """
+    if not isinstance(payload, bytes):
+        raise TypeError("payload must be bytes")
+    if not payload.startswith(ROTATION_CHAIN_TAG):
+        raise ValueError("bad rotation chain tag")
+    offset = len(ROTATION_CHAIN_TAG)
+
+    if offset + 4 > len(payload):
+        raise ValueError("truncated rotation chain certificate count")
+    count = int.from_bytes(payload[offset:offset + 4], "big")
+    offset += 4
+    if count == 0:
+        raise ValueError("certificates must be non-empty")
+
+    anchor_body, offset = _read_frame(payload, offset, what="anchor")
+    if len(anchor_body) > 1 and anchor_body[0] == 0:
+        raise ValueError("non-canonical anchor encoding")
+    anchor = int.from_bytes(anchor_body, "big", signed=False)
+
+    certificates = []
+    for index in range(count):
+        body, offset = _read_frame(
+            payload, offset, what=f"certificate {index + 1}"
+        )
+        certificates.append(decode_rotation(body))
+    if offset != len(payload):
+        raise ValueError("trailing bytes after rotation chain")
+
+    chain = RotationChain(anchor=anchor, certificates=tuple(certificates))
+    if encode_rotation_chain(chain) != payload:
+        raise ValueError("non-canonical rotation chain")
+    return chain
 
 
 # ---------------------------------------------------------------------------

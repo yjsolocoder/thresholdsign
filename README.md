@@ -285,6 +285,45 @@ assert verify_rotation(restored)            # 授权仍由 verify_rotation 核�
 类型错误（含嵌套字段）抛 `TypeError`，负数、长度溢出、空编号、编号未递增/重复、
 群参数、公钥或签名结构非法抛 `ValueError`。
 
+### 可持久化的轮换授权链
+
+单张证书只覆盖一次轮换；`RotationChain` 把多张 `Rotation` 按链序组成授权链，
+使观察者从受信旧公钥 `anchor` 出发逐跳核验多次密钥轮换。冻结数据类
+`RotationChain(anchor, certificates)` 可按位置构造、按值相等，
+`certificates` 为非空且保序的证书元组。`verify_rotation_chain` 要求
+`anchor == certificates[0].old`、相邻证书满足 `cert.new == next_cert.old`，
+并对每张证书调用 `verify_rotation`，返回以上全部结果的逻辑与：
+
+```python
+from thresholdsign import RotationChain, verify_rotation_chain
+
+# cert0/cert1/... 依次由上一把密钥签署，cert_i.new == cert_{i+1}.old
+chain = RotationChain(old_key.public_key, (cert0, cert1))
+assert verify_rotation_chain(chain)        # 从 anchor 逐跳核验
+```
+
+链的规范传输/持久化编码以标签 `b"thresholdsign/rotation-chain/v1"` 开头，
+其后依次是 4 字节无符号大端的证书数、anchor 帧、链序证书帧；两类帧均为
+4 字节无符号大端长度加内容，anchor 内容为其最短无符号大端整数（零为单字节
+`00`），证书内容为 `encode_rotation(cert)`：
+
+```python
+from thresholdsign import encode_rotation_chain, decode_rotation_chain
+
+blob = encode_rotation_chain(chain)            # bytes，无隐藏状态
+restored = decode_rotation_chain(blob)         # RotationChain，不验签
+assert encode_rotation_chain(restored) == blob
+assert verify_rotation_chain(restored)
+```
+
+`decode_rotation_chain` 不验签、不校验衔接：结构合法但签名不匹配或
+anchor/`old` 对不上的链照常返回，由 `verify_rotation_chain` 返回 `False`。
+非 `RotationChain` 入参、非整数 anchor（含布尔）、非元组证书序列、元组中含
+非 `Rotation` 元素抛 `TypeError`；空链、负数 anchor、长度溢出、空/零长帧、
+非规范 anchor、证书数与帧数不符、截断、尾随字节或帧内证书非法抛
+`ValueError`；非 `bytes` 的解码入参抛 `TypeError`。链本身不含任何网络、
+存储或隐藏状态。
+
 
 ## 命令行演示
 
@@ -483,6 +522,25 @@ python3 -m thresholdsign
 - `decode_rotation(payload) -> Rotation` — `encode_rotation` 的逆操作：拒绝
   错误/缺失标签、非规范整数、截断、尾随字节或计数不符，成功后重编码必得到原
   字节；不验签，结构合法但签名不匹配由 `verify_rotation` 返回 `False`。
+  非 `bytes` 入参抛 `TypeError`，其余非法情形抛 `ValueError`
+- `RotationChain(anchor, certificates)` — 冻结数据类，可按位置构造、按值
+  相等；`anchor` 为受信旧公钥整数，`certificates` 为非空且保序的
+  `Rotation` 元组，链序相邻证书须满足前一张 `new` 等于下一张 `old`
+- `verify_rotation_chain(chain) -> bool` — 要求 `anchor` 等于首张证书的
+  `old`、相邻证书 `new == next.old`，并逐张调用 `verify_rotation`，返回
+  上述结果的逻辑与；结构合法但衔接断裂或签名不匹配返回 `False`；非
+  `RotationChain` 入参、anchor/证书元素类型错误抛 `TypeError`，空链或证书
+  结构非法抛 `ValueError`
+- `encode_rotation_chain(chain) -> bytes` — 授权链的规范编码：以标签
+  `b"thresholdsign/rotation-chain/v1"` 开头，其后为 4 字节无符号大端证书数、
+  anchor 帧、链序证书帧；两类帧均为 4 字节无符号大端长度加内容，anchor
+  内容为最短无符号大端整数（零为单字节 `00`），证书内容为
+  `encode_rotation(cert)`；输出唯一、不验签。类型错误抛 `TypeError`，空链、
+  负数/溢出 anchor 或非法证书抛 `ValueError`
+- `decode_rotation_chain(payload) -> RotationChain` —
+  `encode_rotation_chain` 的逆操作，不验签：拒绝错误/缺失标签、空链、负数或
+  非规范 anchor、帧内非法证书、计数不符、溢出、截断、尾随字节，成功后重编码
+  必得到原字节；签名不匹配或衔接断裂由 `verify_rotation_chain` 返回 `False`。
   非 `bytes` 入参抛 `TypeError`，其余非法情形抛 `ValueError`
 
 ### 门限 Schnorr 群参数与边界
