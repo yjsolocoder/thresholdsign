@@ -20,6 +20,8 @@ from thresholdsign import (
     create_signing_contribution,
     create_signing_nonce_commitment,
     create_signing_round,
+    decode_audit_chain,
+    encode_audit_chain,
     verify_audit_chain,
 )
 
@@ -31,6 +33,37 @@ GENERATOR = 16
 BLINDING_GENERATOR = 256
 
 CHAIN_TAG = b"ts/ac/v1"
+WIRE_TAG = b"thresholdsign/audit-chain/v1"
+
+
+def varint(value: int) -> bytes:
+    body = value.to_bytes((value.bit_length() + 7) // 8 or 1, "big")
+    return len(body).to_bytes(4, "big") + body
+
+
+def build_wire(records, signature):
+    """Independently build the audit-chain wire format straight from the spec."""
+    out = bytearray(WIRE_TAG)
+    out += len(records).to_bytes(4, "big", signed=False)
+    for message, audit in records:
+        out += len(message).to_bytes(4, "big", signed=False)
+        out += message
+        out += len(audit.payload).to_bytes(4, "big", signed=False)
+        out += audit.payload
+    out += varint(signature.R)
+    out += varint(signature.z)
+    out += len(signature.signer_ids).to_bytes(4, "big", signed=False)
+    for signer_id in signature.signer_ids:
+        out += varint(signer_id)
+    return bytes(out)
+
+
+def _wire_varint(stream, offset):
+    """Read one length-prefixed integer from a wire encoding in tests."""
+    length = int.from_bytes(stream[offset:offset + 4], "big")
+    offset += 4
+    value = int.from_bytes(stream[offset:offset + length], "big")
+    return value, offset + length
 
 
 def fixed_random(seed=1):
@@ -407,6 +440,318 @@ class VerifyAuditChainTest(unittest.TestCase):
         chain = AuditChain(self.records, bad_sig)
         with self.assertRaises(ValueError):
             verify_audit_chain(chain, self.key)
+
+
+class EncodeAuditChainTest(unittest.TestCase):
+    def setUp(self):
+        self.key = make_key()
+        self.records = tuple(
+            make_record(self.key, f"message-{i}".encode(), seed=100 + 10 * i)
+            for i in range(3)
+        )
+        self.chain = seal_chain(self.key, self.records, seed=900)
+
+    def test_layout_matches_independent_builder(self):
+        wire = encode_audit_chain(self.chain)
+        self.assertEqual(wire, build_wire(self.records, self.chain.signature))
+
+    def test_tag_count_and_frames_in_order(self):
+        wire = encode_audit_chain(self.chain)
+        self.assertTrue(wire.startswith(WIRE_TAG))
+        offset = len(WIRE_TAG)
+        self.assertEqual(int.from_bytes(wire[offset:offset + 4], "big"), 3)
+        offset += 4
+        for message, audit in self.records:
+            message_len = int.from_bytes(wire[offset:offset + 4], "big")
+            offset += 4
+            self.assertEqual(wire[offset:offset + message_len], message)
+            offset += message_len
+            receipt_len = int.from_bytes(wire[offset:offset + 4], "big")
+            offset += 4
+            self.assertEqual(wire[offset:offset + receipt_len], audit.payload)
+            offset += receipt_len
+        # Walk the signature frame explicitly.
+        R, offset = _wire_varint(wire, offset)
+        z, offset = _wire_varint(wire, offset)
+        self.assertEqual(R, self.chain.signature.R)
+        self.assertEqual(z, self.chain.signature.z)
+        signer_count = int.from_bytes(wire[offset:offset + 4], "big")
+        offset += 4
+        self.assertEqual(signer_count, len(self.chain.signature.signer_ids))
+        signer_ids = []
+        for _ in range(signer_count):
+            signer_id, offset = _wire_varint(wire, offset)
+            signer_ids.append(signer_id)
+        self.assertEqual(tuple(signer_ids), self.chain.signature.signer_ids)
+        self.assertEqual(offset, len(wire))
+
+    def test_empty_message_frame(self):
+        empty_record = make_record(self.key, b"", seed=940)
+        chain = seal_chain(self.key, (empty_record,), seed=941)
+        wire = encode_audit_chain(chain)
+        offset = len(WIRE_TAG) + 4
+        self.assertEqual(wire[offset:offset + 4], (0).to_bytes(4, "big"))
+        self.assertEqual(decode_audit_chain(wire), chain)
+
+    def test_zero_integer_encodes_as_single_00(self):
+        sig = AggregateSignature(R=2, z=0, signer_ids=(1,))
+        chain = AuditChain(((b"m", SigningAudit(b"a")),), sig)
+        wire = encode_audit_chain(chain)
+        self.assertIn(b"\x00\x00\x00\x01\x00", wire)
+
+    def test_deterministic_and_order_bound(self):
+        wire = encode_audit_chain(self.chain)
+        self.assertEqual(wire, encode_audit_chain(self.chain))
+        reordered = AuditChain(
+            (self.records[1], self.records[0], self.records[2]),
+            self.chain.signature,
+        )
+        self.assertNotEqual(wire, encode_audit_chain(reordered))
+
+    def test_roundtrip(self):
+        decoded = decode_audit_chain(encode_audit_chain(self.chain))
+        self.assertEqual(decoded, self.chain)
+        self.assertEqual(
+            encode_audit_chain(decoded), encode_audit_chain(self.chain)
+        )
+
+    def test_encode_does_not_require_matching_receipts_or_signature(self):
+        # An opaque payload that is not a real audit receipt still encodes and
+        # round-trips; verify_audit_chain is the first thing to inspect it and
+        # raises ValueError on the structurally illegal receipt.
+        broken = AuditChain(
+            ((b"m", SigningAudit(b"totally-not-an-audit")),),
+            self.chain.signature,
+        )
+        decoded = decode_audit_chain(encode_audit_chain(broken))
+        self.assertEqual(decoded, broken)
+        self.assertRaises(ValueError, verify_audit_chain, decoded, self.key)
+
+    def test_type_errors(self):
+        sig = self.chain.signature
+        for bad in ("chain", None, 42, object()):
+            self.assertRaises(TypeError, encode_audit_chain, bad)
+        self.assertRaises(
+            TypeError, encode_audit_chain, AuditChain([self.records[0]], sig)
+        )
+        self.assertRaises(
+            TypeError, encode_audit_chain, AuditChain((b"m",), sig)
+        )
+        self.assertRaises(
+            TypeError,
+            encode_audit_chain,
+            AuditChain(((b"m", b"receipt"),), sig),
+        )
+        self.assertRaises(
+            TypeError,
+            encode_audit_chain,
+            AuditChain(((bytearray(b"m"), self.records[0][1]),), sig),
+        )
+        self.assertRaises(
+            TypeError, encode_audit_chain, AuditChain(self.records, "sig")
+        )
+        self.assertRaises(
+            TypeError,
+            encode_audit_chain,
+            AuditChain(self.records, dataclasses.replace(sig, R="1")),
+        )
+        self.assertRaises(
+            TypeError,
+            encode_audit_chain,
+            AuditChain(self.records, dataclasses.replace(sig, R=True)),
+        )
+        self.assertRaises(
+            TypeError,
+            encode_audit_chain,
+            AuditChain(self.records, dataclasses.replace(sig, signer_ids=[1, 3])),
+        )
+        self.assertRaises(
+            TypeError,
+            encode_audit_chain,
+            AuditChain(
+                self.records, dataclasses.replace(sig, signer_ids=(1, "3"))
+            ),
+        )
+
+    def test_value_errors(self):
+        sig = self.chain.signature
+        self.assertRaises(ValueError, encode_audit_chain, AuditChain((), sig))
+        self.assertRaises(
+            ValueError,
+            encode_audit_chain,
+            AuditChain(((b"m", SigningAudit(b"")),), sig),
+        )
+        self.assertRaises(
+            ValueError,
+            encode_audit_chain,
+            AuditChain(self.records, dataclasses.replace(sig, R=-1)),
+        )
+        self.assertRaises(
+            ValueError,
+            encode_audit_chain,
+            AuditChain(self.records, dataclasses.replace(sig, z=-1)),
+        )
+        self.assertRaises(
+            ValueError,
+            encode_audit_chain,
+            AuditChain(self.records, dataclasses.replace(sig, signer_ids=())),
+        )
+        self.assertRaises(
+            ValueError,
+            encode_audit_chain,
+            AuditChain(
+                self.records, dataclasses.replace(sig, signer_ids=(0, 1))
+            ),
+        )
+        self.assertRaises(
+            ValueError,
+            encode_audit_chain,
+            AuditChain(
+                self.records, dataclasses.replace(sig, signer_ids=(3, 1))
+            ),
+        )
+        self.assertRaises(
+            ValueError,
+            encode_audit_chain,
+            AuditChain(
+                self.records, dataclasses.replace(sig, signer_ids=(1, 1))
+            ),
+        )
+
+
+class DecodeAuditChainTest(unittest.TestCase):
+    def setUp(self):
+        self.key = make_key()
+        self.records = tuple(
+            make_record(self.key, f"message-{i}".encode(), seed=100 + 10 * i)
+            for i in range(3)
+        )
+        self.chain = seal_chain(self.key, self.records, seed=900)
+
+    def test_roundtrip_value_equality(self):
+        decoded = decode_audit_chain(encode_audit_chain(self.chain))
+        self.assertEqual(decoded, self.chain)
+        self.assertEqual(
+            encode_audit_chain(decoded), encode_audit_chain(self.chain)
+        )
+
+    def test_decoded_chain_still_verifies(self):
+        decoded = decode_audit_chain(encode_audit_chain(self.chain))
+        self.assertTrue(verify_audit_chain(decoded, self.key))
+
+    def test_bad_signature_decodes_without_verification(self):
+        bad_sig = AggregateSignature(
+            R=self.chain.signature.R,
+            z=(self.chain.signature.z + 1) % FIELD_PRIME,
+            signer_ids=self.chain.signature.signer_ids,
+        )
+        chain = AuditChain(self.records, bad_sig)
+        decoded = decode_audit_chain(encode_audit_chain(chain))
+        self.assertEqual(decoded, chain)
+        self.assertFalse(verify_audit_chain(decoded, self.key))
+
+    def test_rejects_bad_argument_types(self):
+        wire = encode_audit_chain(self.chain)
+        for bad in ("wire", bytearray(wire), None, 42):
+            self.assertRaises(TypeError, decode_audit_chain, bad)
+
+    def test_rejects_bad_tag(self):
+        wire = encode_audit_chain(self.chain)
+        self.assertRaises(ValueError, decode_audit_chain, b"x" + wire[1:])
+        self.assertRaises(ValueError, decode_audit_chain, WIRE_TAG)
+        self.assertRaises(ValueError, decode_audit_chain, b"")
+        # The signed chain-message tag must not be accepted as the wire tag.
+        self.assertRaises(ValueError, decode_audit_chain, CHAIN_TAG + wire[8:])
+
+    def test_rejects_zero_count(self):
+        self.assertRaises(
+            ValueError, decode_audit_chain, WIRE_TAG + (0).to_bytes(4, "big")
+        )
+
+    def test_rejects_truncation_at_every_cut(self):
+        wire = encode_audit_chain(self.chain)
+        for cut in range(len(wire)):
+            with self.assertRaises(ValueError, msg=f"cut {cut}"):
+                decode_audit_chain(wire[:cut])
+
+    def test_rejects_trailing_bytes(self):
+        wire = encode_audit_chain(self.chain)
+        self.assertRaises(ValueError, decode_audit_chain, wire + b"\x00")
+        self.assertRaises(ValueError, decode_audit_chain, wire + b"extra")
+
+    def test_rejects_count_mismatch(self):
+        wire = bytearray(encode_audit_chain(self.chain))
+        count_offset = len(WIRE_TAG)
+        # Declared four records but frames for three follow -> truncation.
+        wire[count_offset:count_offset + 4] = (4).to_bytes(4, "big")
+        self.assertRaises(ValueError, decode_audit_chain, bytes(wire))
+        # Declared two records but three frames follow -> trailing bytes.
+        wire[count_offset:count_offset + 4] = (2).to_bytes(4, "big")
+        self.assertRaises(ValueError, decode_audit_chain, bytes(wire))
+
+    def test_rejects_zero_length_receipt(self):
+        # One record: empty (allowed) message then a zero-length receipt.
+        wire = (
+            WIRE_TAG
+            + (1).to_bytes(4, "big")
+            + (0).to_bytes(4, "big")
+            + (0).to_bytes(4, "big")
+        )
+        self.assertRaises(ValueError, decode_audit_chain, wire)
+
+    def test_rejects_zero_length_integer_body(self):
+        wire = (
+            WIRE_TAG
+            + (1).to_bytes(4, "big")
+            + (1).to_bytes(4, "big") + b"m"
+            + (1).to_bytes(4, "big") + b"a"
+            + (0).to_bytes(4, "big")
+        )
+        self.assertRaises(ValueError, decode_audit_chain, wire)
+
+    def test_rejects_non_canonical_integer(self):
+        sig = AggregateSignature(R=256, z=3, signer_ids=(1, 3))
+        chain = AuditChain(((b"m", SigningAudit(b"a")),), sig)
+        wire = bytearray(encode_audit_chain(chain))
+        # Offset of R's length prefix: tag, count, message frame, receipt frame.
+        pos = len(WIRE_TAG) + 4 + 4 + 1 + 4 + 1
+        self.assertEqual(bytes(wire[pos:pos + 4]), (2).to_bytes(4, "big"))
+        # Pad R's body with a forbidden leading zero and stretch its length.
+        wire[pos:pos + 6] = (3).to_bytes(4, "big") + b"\x00\x01\x00"
+        self.assertRaises(ValueError, decode_audit_chain, bytes(wire))
+
+    def test_rejects_bad_signer_sets(self):
+        base = (
+            WIRE_TAG
+            + (1).to_bytes(4, "big")
+            + (1).to_bytes(4, "big") + b"m"
+            + (1).to_bytes(4, "big") + b"a"
+            + varint(5) + varint(7)
+        )
+        self.assertRaises(
+            ValueError, decode_audit_chain, base + (0).to_bytes(4, "big")
+        )
+        self.assertRaises(
+            ValueError,
+            decode_audit_chain,
+            base + (1).to_bytes(4, "big") + varint(0),
+        )
+        self.assertRaises(
+            ValueError,
+            decode_audit_chain,
+            base + (2).to_bytes(4, "big") + varint(3) + varint(2),
+        )
+        self.assertRaises(
+            ValueError,
+            decode_audit_chain,
+            base + (2).to_bytes(4, "big") + varint(2) + varint(2),
+        )
+        # Two signers declared but only one id follows -> truncation.
+        self.assertRaises(
+            ValueError,
+            decode_audit_chain,
+            base + (2).to_bytes(4, "big") + varint(2),
+        )
 
 
 if __name__ == "__main__":

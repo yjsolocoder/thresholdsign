@@ -358,6 +358,25 @@ assert verify_audit_chain(chain, key)      # 任何人持 key 即可核验
 非整数/布尔公钥等）抛 `TypeError`；空链、非正公钥、计数溢出（超过 2^64-1）
 或回执、签名结构非法抛 `ValueError`。链不含任何网络、存储或隐藏状态。
 
+`encode_audit_chain(chain)` / `decode_audit_chain(payload)` 为链提供可跨实现
+传输与持久化的自定界规范编码，逐字节唯一、与链消息标签 `b"ts/ac/v1"` 无关：
+
+```text
+b"thresholdsign/audit-chain/v1" || U32(len(records))
+|| Σ_i ( U32(len(message_i)) || message_i
+         || U32(len(audit_i.payload)) || audit_i.payload )
+|| VARINT(R) || VARINT(z) || U32(len(signer_ids)) || Σ_j VARINT(signer_id_j)
+```
+
+其中 `U32` 为 4 字节无符号大端，`VARINT` 为 4 字节无符号大端长度加最短无符号
+大端值（零为单字节 `00`，正数禁前导零），记录顺序严格跟随 `records` 元组、
+签名者编号严格升序。空消息允许、空回执不允许，链至少一条记录。入口仅校验字段
+类型与结构（不要求回执或签名匹配）；解码只恢复结构，不解析回执、不验签、不
+引入隐藏状态，结构合法但签名不匹配的链照常返回，由 `verify_audit_chain` 报告
+`False`。非 `bytes` 或字段类型错误抛 `TypeError`；标签错误、空链、零长回执、
+截断、尾随字节、计数不符及非规范整数抛 `ValueError`；成功解码后重编码必得到原
+字节。
+
 
 ## 命令行演示
 
@@ -595,6 +614,21 @@ python3 -m thresholdsign
   删除、插入、重排记录，跨密钥替换回执，调换消息，篡改回执或签名，或换一把
   密钥核验均返回 `False`；非 `AuditChain`/`AggregateSignature` 入参或记录、
   密钥字段类型错误抛 `TypeError`，空链、回执或签名结构非法抛 `ValueError`
+- `encode_audit_chain(chain) -> bytes` — 审计链的规范传输/持久化编码：以标签
+  `b"thresholdsign/audit-chain/v1"` 开头，其后为 4 字节无符号大端记录数，再按
+  `records` 元组顺序逐条写记录帧与最后的签名帧。每条记录先写 4 字节无符号
+  大端消息长度及原始 `message`（允许空），再写 4 字节无符号大端回执长度及
+  `SigningAudit.payload`（不允许空）；签名帧依次写 `VARINT(R)`、`VARINT(z)`、
+  4 字节无符号大端 `signer_ids` 数量及升序编号，`VARINT` 为 4 字节无符号大端
+  长度加最短无符号大端值（零为单字节 `00`，正数禁前导零）。输出唯一，只校验
+  字段类型与结构、不要求回执或签名匹配；类型错误抛 `TypeError`，空链、空回执、
+  负数/溢出或编号非升序等结构非法抛 `ValueError`
+- `decode_audit_chain(payload) -> AuditChain` — `encode_audit_chain` 的逆操作，
+  只恢复结构：回执不解析、签名不核验且不引入任何网络、存储或隐藏状态。拒绝
+  错误/缺失标签、空链、零长回执、截断、尾随字节、计数不符、空/零/重复/非升序
+  签名者编号及非规范整数（前导零或零长整数帧）；成功后重编码必得到原字节。
+  非 `bytes` 入参抛 `TypeError`，其余非法情形抛 `ValueError`；结构合法但签名
+  不匹配由 `verify_audit_chain` 返回 `False`
 
 ### 门限 Schnorr 群参数与边界
 
