@@ -368,19 +368,24 @@ python3 -m thresholdsign
   `TypeError`/`ValueError`
 - `SigningAudit(payload)` — 冻结数据类，仅含 `payload` 一个字段；一次签名轮次第
   二轮校验的审计回执，自包含的字节编码中不含 nonce、秘密份额或系数
-- `create_audit(message, shares, round_info, dkg_result)` — 轮次中每名签名者必须
+- `create_audit(message, shares, round_info, dkg_result)` — `message` 必须与轮次
+  消息一致（不一致抛 `ValueError`）；轮次中每名签名者必须
   恰好提交一份份额（重复/缺失抛 `ValueError`，类型错误抛 `TypeError`），按
   `signer_id` 升序以 `verify_signature_share` 重验后生成 `SigningAudit`：payload
   依次拼接标签 `b"thresholdsign/audit/v1"`、32 字节 `SHA256(message)`、`Y`、`R`、
   `c`（均为 Schnorr 宽度 `L` 字节无符号大端）、4 字节无符号大端行数 `n`、按
   `signer_id` 升序的 `n` 行（每行 `id`、`R_i`、`z_i` 各 `L` 字节）、1 字节
-  status 与 1 字节 present；全部份额通过时 status=1、present=1 并追加聚合
-  `z = Σ z_i mod q`（`L` 字节），否则 status=0、present=0 且不追加 `z`
+  status 与 1 字节 present；行内原样记录提交的 `nonce_commitment` 与 `z`，
+  承诺错配或份额方程失败不改写行值；全部份额通过时 status=1、present=1 并追加
+  聚合 `z = Σ z_i mod q`（`L` 字节），否则 status=0、present=0 且不追加 `z`
 - `check_audit(message, receipt, dkg_result)` — 解码回执（结构或解码非法抛
-  `ValueError`，类型错误抛 `TypeError`）并重算消息摘要、公钥、由各行 `R_i` 之积
-  得到的 `R`、Fiat-Shamir 挑战、逐行份额校验 `g^z_i = R_i·Y_i^(c·λ_i)` 以及
-  status 为 1 时的聚合 `z` 与聚合签名 `g^z = R·Y^c`；全部一致返回 `True`，
-  合法篡改或消息/密钥不匹配返回 `False`
+  `ValueError`，类型错误抛 `TypeError`；行数少于 threshold、编号非参与者或不
+  递增、`R_i` 不是 q 阶子群非单位元同属非法）并以头部 `R`、`c` 重算消息摘要、
+  公钥、Fiat-Shamir 挑战、逐行份额校验 `g^z_i = R_i·Y_i^(c·λ_i)` 以及 status
+  为 1 时的聚合 `z` 与聚合签名 `g^z = R·Y^c`；各行 `R_i` 之积异于头部 `R`
+  或份额方程失败都计入重算 status=0，与记录的 status 对比而非直接判负，因此
+  原样生成的失败回执复核为 `True`；重算结论与回执一致返回 `True`，合法篡改
+  或消息/密钥不匹配返回 `False`
 
 ### 门限 Schnorr 群参数与边界
 

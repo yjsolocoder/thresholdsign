@@ -2413,6 +2413,7 @@ def create_audit(
 ) -> SigningAudit:
     """Verify the round-two shares of a signing round and record the outcome.
 
+    ``message`` must be the round's message, otherwise ValueError is raised.
     Every signer of ``round_info`` must contribute exactly one share, in any
     order; duplicate or missing signers raise ValueError and wrong types raise
     TypeError, exactly as in :func:`aggregate_signature`. The shares are
@@ -2425,9 +2426,13 @@ def create_audit(
     a 4-byte unsigned big-endian integer, one row per signer sorted by
     ascending ``signer_id`` (each row the L-byte encodings of ``id``,
     ``R_i`` and ``z_i``), a one-byte status and a one-byte present flag. The
-    status is 1 when every share verifies — then present is 1 and the
-    aggregated ``z = sum(z_i) mod field_prime`` is appended in L bytes — and
-    0 otherwise, in which case present is 0 and no ``z`` is appended.
+    rows record the submitted ``nonce_commitment`` and ``z`` verbatim, even
+    for shares whose commitment mismatches the round or whose share equation
+    fails — such shares still yield a status-0 receipt and their row values
+    are never rewritten. The status is 1 when every share verifies — then
+    present is 1 and the aggregated ``z = sum(z_i) mod field_prime`` is
+    appended in L bytes — and 0 otherwise, in which case present is 0 and
+    no ``z`` is appended.
     """
     if not isinstance(message, bytes):
         raise TypeError("message must be bytes")
@@ -2440,6 +2445,8 @@ def create_audit(
         result.participant_ids,
         len(result.commitment.values),
     )
+    if message != round_info.message:
+        raise ValueError("message must match the signing round message")
 
     materialised = list(shares)
     if not materialised:
@@ -2566,6 +2573,8 @@ def _decode_audit_payload(
         previous_id = signer_id
         if not 1 < nonce_commitment < group_prime:
             raise ValueError("audit R_i must satisfy 1 < R_i < group_prime")
+        if pow(nonce_commitment, field_prime, group_prime) != 1:
+            raise ValueError("audit R_i must lie in the order-field_prime subgroup")
         if not 0 <= z_i < field_prime:
             raise ValueError("audit z_i must satisfy 0 <= z_i < field_prime")
     if z is not None and not 0 <= z < field_prime:
@@ -2581,14 +2590,22 @@ def check_audit(
     """Re-verify an audit receipt against the message and the signing key.
 
     Decodes ``receipt.payload`` (structural or decoding defects raise
-    ValueError, wrong types raise TypeError) and recomputes everything from
+    ValueError, wrong types raise TypeError; this includes rows fewer than
+    ``threshold``, signer ids that are not DKG participants, rows not
+    strictly increasing, or a row ``R_i`` that is not a non-identity element
+    of the order-``field_prime`` subgroup) and recomputes everything from
     the message and ``dkg_result``: the message digest, the public key, the
-    aggregate ``R`` from the row commitments, the Fiat-Shamir challenge, the
-    per-row share verification ``g ** z_i == R_i * Y_i ** (c * lambda_i)``
-    and, when the status byte is 1, the aggregated ``z`` and the aggregate
-    signature ``g ** z == R * Y ** c``. Returns ``True`` only if every
-    recomputed value matches the payload; a well-formed payload that was
-    tampered with, or belongs to another message or key, returns ``False``.
+    Fiat-Shamir challenge from the header ``R``, the aggregate ``R`` from
+    the row commitments, the per-row share verification
+    ``g ** z_i == R_i * Y_i ** (c * lambda_i)`` and, when the status byte is
+    1, the aggregated ``z`` and the aggregate signature
+    ``g ** z == R * Y ** c``. A row-``R_i`` product that differs from the
+    header ``R`` or a failed share equation does not fail the receipt
+    outright: it determines the recomputed status, which must equal the
+    recorded one — so a faithfully created failure receipt re-verifies as
+    ``True``. Returns ``True`` only if every recomputed value is consistent
+    with the payload; a well-formed payload that was tampered with, or
+    belongs to another message or key, returns ``False``.
     """
     if not isinstance(message, bytes):
         raise TypeError("message must be bytes")
@@ -2604,21 +2621,20 @@ def check_audit(
         receipt.payload, field_prime, group_prime
     )
 
+    signer_ids = tuple(row[0] for row in rows)
+    if len(signer_ids) < threshold:
+        raise ValueError("audit rows must cover at least threshold signers")
+    if any(signer_id not in result.participant_ids for signer_id in signer_ids):
+        raise ValueError("audit signer ids must be DKG participants")
+
     if digest != hashlib.sha256(message).digest():
         return False
     if Y != public_key:
-        return False
-    signer_ids = tuple(row[0] for row in rows)
-    if any(signer_id not in result.participant_ids for signer_id in signer_ids):
-        return False
-    if len(signer_ids) < threshold:
         return False
 
     recomputed_R = 1
     for _signer_id, nonce_commitment, _z_i in rows:
         recomputed_R = recomputed_R * nonce_commitment % group_prime
-    if recomputed_R != R:
-        return False
     recomputed_challenge = schnorr_challenge(
         message,
         public_key,
@@ -2630,7 +2646,7 @@ def check_audit(
     if recomputed_challenge != challenge:
         return False
 
-    all_verified = True
+    all_verified = recomputed_R == R
     z_total = 0
     for signer_id, nonce_commitment, z_i in rows:
         weight = _lagrange_weight(signer_id, signer_ids, field_prime)
