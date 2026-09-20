@@ -20,7 +20,8 @@ verifiable key-rotation authorization: Rotation / rotation_payload /
 verify_rotation, the persistent, multi-hop authorization chain
 RotationChain / verify_rotation_chain / encode_rotation_chain /
 decode_rotation_chain, and the stateless, threshold-Schnorr-authenticated
-audit chain: AuditChain / audit_chain_payload / verify_audit_chain.
+audit chain: AuditChain / audit_chain_payload / verify_audit_chain /
+encode_audit_chain / decode_audit_chain.
 """
 
 from __future__ import annotations
@@ -88,6 +89,8 @@ __all__ = [
     "AuditChain",
     "audit_chain_payload",
     "verify_audit_chain",
+    "encode_audit_chain",
+    "decode_audit_chain",
 ]
 
 # Mersenne prime 2**127 - 1: large enough for integer secrets, small enough that
@@ -2855,17 +2858,20 @@ def _encode_varint(value: int) -> bytes:
     return len(body).to_bytes(4, "big", signed=False) + body
 
 
-def _read_varint(stream: bytes, offset: int) -> tuple[int, int]:
+def _read_varint(
+    stream: bytes, offset: int, *, what: str = "rotation certificate"
+) -> tuple[int, int]:
     """Read one length-prefixed integer at ``offset``, returning ``(value, next)``.
 
     Raises ValueError on truncation, an over-long or leading-zero body.
+    ``what`` names the surrounding structure for the error message.
     """
     if offset + 4 > len(stream):
-        raise ValueError("truncated rotation certificate")
+        raise ValueError(f"truncated {what}")
     length = int.from_bytes(stream[offset:offset + 4], "big")
     offset += 4
     if length == 0 or offset + length > len(stream):
-        raise ValueError("truncated rotation certificate")
+        raise ValueError(f"truncated {what}")
     body = stream[offset:offset + length]
     # The single byte 00 is the canonical zero; any longer body starting
     # with 00 (including 00 00) carries a forbidden leading zero.
@@ -2874,17 +2880,19 @@ def _read_varint(stream: bytes, offset: int) -> tuple[int, int]:
     return int.from_bytes(body, "big", signed=False), offset + length
 
 
-def _read_id_list(stream: bytes, offset: int, *, name: str) -> tuple[tuple[int, ...], int]:
+def _read_id_list(
+    stream: bytes, offset: int, *, name: str, what: str = "rotation certificate"
+) -> tuple[tuple[int, ...], int]:
     """Read a 4-byte-counted, strictly increasing list of positive integers."""
     if offset + 4 > len(stream):
-        raise ValueError("truncated rotation certificate")
+        raise ValueError(f"truncated {what}")
     count = int.from_bytes(stream[offset:offset + 4], "big")
     offset += 4
     if count == 0:
         raise ValueError(f"{name} must be non-empty")
     ids = []
     for _ in range(count):
-        member_id, offset = _read_varint(stream, offset)
+        member_id, offset = _read_varint(stream, offset, what=what)
         if member_id == 0:
             raise ValueError(f"{name} must be positive")
         if ids and member_id <= ids[-1]:
@@ -3602,3 +3610,185 @@ def verify_audit_chain(chain: AuditChain, key: SigningDKGResult) -> bool:
         generator=generator,
         prime=field_prime,
     )
+
+
+# ---------------------------------------------------------------------------
+# Canonical transport/persistence encoding for AuditChain. The wire format
+# restores structure only: it neither decodes nor checks the receipts and
+# never verifies the sealing signature, and it carries no hidden state.
+# ---------------------------------------------------------------------------
+
+AUDIT_CHAIN_WIRE_TAG = b"thresholdsign/audit-chain/v1"
+
+
+def _check_audit_chain_signature(signature: object) -> None:
+    """Type- and structure-check the sealing signature without a group or key.
+
+    ``R`` and ``z`` only need to be non-negative integers (their group/field
+    ranges are unknown without the verifying key) and ``signer_ids`` a
+    non-empty tuple of positive, strictly increasing integers; whether the
+    signature actually seals the chain is left to :func:`verify_audit_chain`.
+    """
+    if not isinstance(signature, AggregateSignature):
+        raise TypeError("chain signature must be an AggregateSignature instance")
+    for name, value in (("R", signature.R), ("z", signature.z)):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"signature.{name} must be an integer")
+        if value < 0:
+            raise ValueError(f"signature.{name} must be non-negative")
+    if not isinstance(signature.signer_ids, tuple):
+        raise TypeError("signature.signer_ids must be a tuple")
+    if not signature.signer_ids:
+        raise ValueError("at least one signer is required")
+    for signer_id in signature.signer_ids:
+        if not isinstance(signer_id, int) or isinstance(signer_id, bool):
+            raise TypeError("signer ids must be integers")
+        if signer_id <= 0:
+            raise ValueError("signer ids must satisfy 1 <= id")
+    if any(
+        signature.signer_ids[index] >= signature.signer_ids[index + 1]
+        for index in range(len(signature.signer_ids) - 1)
+    ):
+        raise ValueError("signer ids must be strictly increasing and unique")
+
+
+def _read_audit_chain_bytes(
+    stream: bytes, offset: int, *, what: str, allow_empty: bool
+) -> tuple[bytes, int]:
+    """Read one 4-byte-length-prefixed byte frame at ``offset``.
+
+    Message frames may be empty; receipt frames may not. Raises ValueError on
+    truncation or a zero-length frame when ``allow_empty`` is false.
+    """
+    if offset + 4 > len(stream):
+        raise ValueError(f"truncated audit chain {what} length")
+    length = int.from_bytes(stream[offset:offset + 4], "big")
+    offset += 4
+    if not allow_empty and length == 0:
+        raise ValueError(f"audit chain {what} must be non-empty")
+    if offset + length > len(stream):
+        raise ValueError(f"truncated audit chain {what}")
+    return bytes(stream[offset:offset + length]), offset + length
+
+
+def encode_audit_chain(chain: AuditChain) -> bytes:
+    """Canonically encode an audit chain for transport or persistence.
+
+    The encoding starts with the tag
+    ``b"thresholdsign/audit-chain/v1"`` followed by the record count as a
+    4-byte unsigned big-endian integer, then one frame pair per record in
+    strict ``records`` order, and finally the signature frame. Each record
+    writes the 4-byte unsigned big-endian message length and the raw
+    ``message`` bytes (empty messages are allowed), then the 4-byte unsigned
+    big-endian receipt length and the raw :attr:`SigningAudit.payload`
+    (receipts must be non-empty). The signature frame writes ``R``, ``z`` and
+    then the 4-byte unsigned big-endian ``signer_ids`` count followed by the
+    ascending ids; every integer is a 4-byte unsigned big-endian length
+    followed by its shortest unsigned big-endian value (zero is the single
+    byte ``00``, positive values carry no leading zero).
+
+    Only the field types and structure are checked — a non-empty tuple of
+    ``(bytes, SigningAudit)`` records and a structurally legal
+    :class:`AggregateSignature` — but neither the receipts nor the signature
+    need to match anything; :func:`verify_audit_chain` remains the way to test
+    the chain afterwards. Wrong types raise TypeError; an empty chain, an
+    empty receipt, a negative signature integer, an empty, non-positive or
+    non-increasing signer set, an over-long frame or a count that does not
+    fit the 4-byte counter raises ValueError. The output for a given chain is
+    unique and carries no network, storage or hidden state.
+    """
+    if not isinstance(chain, AuditChain):
+        raise TypeError("chain must be an AuditChain instance")
+    count = _check_audit_chain_records(chain.records)
+    _check_audit_chain_signature(chain.signature)
+    if count > 0xFFFFFFFF:
+        raise ValueError("too many records")
+
+    buffer = bytearray(AUDIT_CHAIN_WIRE_TAG)
+    buffer += count.to_bytes(4, "big", signed=False)
+    for index, (message, audit) in enumerate(chain.records):
+        if len(message) > 0xFFFFFFFF:
+            raise ValueError(f"record {index + 1} message too long")
+        if not audit.payload:
+            raise ValueError(f"record {index + 1} receipt payload must be non-empty")
+        if len(audit.payload) > 0xFFFFFFFF:
+            raise ValueError(f"record {index + 1} receipt payload too long")
+        buffer += len(message).to_bytes(4, "big", signed=False)
+        buffer += message
+        buffer += len(audit.payload).to_bytes(4, "big", signed=False)
+        buffer += audit.payload
+
+    buffer += _encode_varint(chain.signature.R)
+    buffer += _encode_varint(chain.signature.z)
+    buffer += len(chain.signature.signer_ids).to_bytes(4, "big", signed=False)
+    for signer_id in chain.signature.signer_ids:
+        buffer += _encode_varint(signer_id)
+    return bytes(buffer)
+
+
+def decode_audit_chain(payload: bytes) -> AuditChain:
+    """Decode the canonical encoding produced by :func:`encode_audit_chain`.
+
+    Accepts only the single canonical form: the tag
+    ``b"thresholdsign/audit-chain/v1"``, the 4-byte unsigned big-endian
+    record count (at least one), exactly that many record frame pairs — each
+    a 4-byte length-prefixed (possibly empty) message followed by a 4-byte
+    length-prefixed non-empty receipt — and then the signature frame:
+    length-prefixed ``R`` and ``z``, the 4-byte ``signer_ids`` count and the
+    ascending, length-prefixed ids. A non-bytes argument raises TypeError; a
+    wrong or missing tag, an empty chain, a zero-length receipt, a count
+    mismatch, truncation, trailing bytes or a non-canonical integer (leading
+    zero or over-long length) raises ValueError, as do empty, zero or
+    non-increasing signer ids. A successfully decoded chain re-encodes to
+    exactly the input bytes.
+
+    Decoding restores the structure only: receipts are never decoded or
+    checked and the sealing signature is never verified — a chain whose
+    receipts do not match its messages or whose signature does not seal the
+    records is returned normally and :func:`verify_audit_chain` reports it as
+    ``False``.
+    """
+    if not isinstance(payload, bytes):
+        raise TypeError("payload must be bytes")
+    if not payload.startswith(AUDIT_CHAIN_WIRE_TAG):
+        raise ValueError("bad audit chain tag")
+    offset = len(AUDIT_CHAIN_WIRE_TAG)
+
+    if offset + 4 > len(payload):
+        raise ValueError("truncated audit chain record count")
+    count = int.from_bytes(payload[offset:offset + 4], "big")
+    offset += 4
+    if count == 0:
+        raise ValueError("records must be non-empty")
+
+    records = []
+    for index in range(count):
+        message, offset = _read_audit_chain_bytes(
+            payload,
+            offset,
+            what=f"record {index + 1} message",
+            allow_empty=True,
+        )
+        receipt, offset = _read_audit_chain_bytes(
+            payload,
+            offset,
+            what=f"record {index + 1} receipt",
+            allow_empty=False,
+        )
+        records.append((message, SigningAudit(payload=receipt)))
+
+    R, offset = _read_varint(payload, offset, what="audit chain signature R")
+    z, offset = _read_varint(payload, offset, what="audit chain signature z")
+    signer_ids, offset = _read_id_list(
+        payload, offset, name="signer ids", what="audit chain signature"
+    )
+    if offset != len(payload):
+        raise ValueError("trailing bytes after audit chain")
+
+    chain = AuditChain(
+        records=tuple(records),
+        signature=AggregateSignature(R=R, z=z, signer_ids=signer_ids),
+    )
+    if encode_audit_chain(chain) != payload:
+        raise ValueError("non-canonical audit chain")
+    return chain
