@@ -13,7 +13,8 @@ threshold Schnorr protocol: SigningNonceCommitment /
 SigningRound / SignatureShare / SignatureShareRejection / AggregateSignature /
 create_signing_nonce_commitment / create_signing_round / create_signature_share
 / verify_signature_share / aggregate_signature / verify_signature, signing
-audit receipts: SigningAudit / create_audit / check_audit, and publicly
+audit receipts: SigningAudit / create_audit / check_audit, the stateless
+nonce-reuse audit NonceReuse / find_nonce_reuse, and publicly
 verifiable key-rotation authorization: Rotation / rotation_payload /
 verify_rotation.
 """
@@ -67,6 +68,8 @@ __all__ = [
     "SigningAudit",
     "create_audit",
     "check_audit",
+    "NonceReuse",
+    "find_nonce_reuse",
     "Rotation",
     "rotation_payload",
     "verify_rotation",
@@ -2807,3 +2810,99 @@ def verify_rotation(cert: Rotation) -> bool:
         generator=cert.g,
         prime=cert.q,
     )
+
+
+# ---------------------------------------------------------------------------
+# Stateless nonce-reuse audit: scan a batch of audit receipts for one signer
+# republishing the same round-one commitment R_i under the same key. Every
+# receipt is re-verified with check_audit first; only status-1 receipts take
+# part. The function keeps no state between calls — each batch stands alone.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class NonceReuse:
+    """One signer's reused round-one nonce commitment, with the evidence.
+
+    ``signer_id`` names the DKG participant and ``nonce_commitment`` the
+    round-one value ``R_i`` that appears in the rows of more than one
+    distinct verified receipt; ``receipts`` holds those status-1
+    :class:`SigningAudit` receipts, deduplicated and ordered by their
+    ``payload`` bytes. Reusing ``R_i`` across messages exposes the signer's
+    secret share, so every reported finding is critical.
+    """
+
+    signer_id: int
+    nonce_commitment: int
+    receipts: tuple[SigningAudit, ...]
+
+
+def find_nonce_reuse(
+    records: Iterable[tuple[bytes, SigningAudit]],
+    dkg_result: SigningDKGResult,
+) -> tuple[NonceReuse, ...]:
+    """Report every ``(signer_id, R_i)`` pair reused across distinct receipts.
+
+    ``records`` pairs each audited message with its receipt: every item must
+    be a ``(message, receipt)`` tuple with the ``bytes`` message first and
+    the :class:`SigningAudit` second. Each record is re-verified with
+    :func:`check_audit` against ``dkg_result``: a structurally illegal
+    receipt raises ValueError, a well-formed receipt that does not match its
+    message or the key also raises ValueError, and wrong argument or record
+    element types raise TypeError. Only receipts whose recorded status is 1
+    take part in the scan.
+
+    The surviving receipts are decoded and their rows grouped by
+    ``(signer_id, R_i)``; a group is reported only when its pair appears in
+    at least two *distinct* payloads, so resubmitting the same receipt never
+    manufactures an alert. Each :class:`NonceReuse` carries the group's
+    receipts deduplicated and ordered by payload bytes, and the findings are
+    returned as a tuple sorted by ascending ``signer_id`` then
+    ``nonce_commitment`` — the result does not depend on the input order.
+    The function is stateless: it examines only the batch it is given and
+    keeps no history across calls.
+    """
+    _result, _public_key, field_prime, group_prime, _generator = (
+        _check_signing_setup(dkg_result)
+    )
+    _check_signing_dkg_structure(dkg_result)
+
+    if isinstance(records, (str, bytes)):
+        raise TypeError("records must be an iterable of (message, receipt) tuples")
+    materialised = list(records)
+
+    groups: dict[tuple[int, int], dict[bytes, SigningAudit]] = {}
+    for record in materialised:
+        if not isinstance(record, tuple) or len(record) != 2:
+            raise TypeError("records must contain (message, receipt) tuples")
+        message, receipt = record
+        if not isinstance(message, bytes):
+            raise TypeError("record message must be bytes")
+        if not isinstance(receipt, SigningAudit):
+            raise TypeError("record receipt must be a SigningAudit instance")
+        if not check_audit(message, receipt, dkg_result):
+            raise ValueError("receipt does not match its message or the key")
+        _digest, _Y, _R, _challenge, rows, status, _z = _decode_audit_payload(
+            receipt.payload, field_prime, group_prime
+        )
+        if status != 1:
+            continue
+        for signer_id, nonce_commitment, _z_i in rows:
+            groups.setdefault((signer_id, nonce_commitment), {})[
+                receipt.payload
+            ] = receipt
+
+    findings = []
+    for (signer_id, nonce_commitment), by_payload in groups.items():
+        if len(by_payload) < 2:
+            continue
+        receipts = tuple(by_payload[payload] for payload in sorted(by_payload))
+        findings.append(
+            NonceReuse(
+                signer_id=signer_id,
+                nonce_commitment=nonce_commitment,
+                receipts=receipts,
+            )
+        )
+    findings.sort(key=lambda finding: (finding.signer_id, finding.nonce_commitment))
+    return tuple(findings)

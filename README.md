@@ -424,6 +424,17 @@ python3 -m thresholdsign
   或份额方程失败都计入重算 status=0，与记录的 status 对比而非直接判负，因此
   原样生成的失败回执复核为 `True`；重算结论与回执一致返回 `True`，合法篡改
   或消息/密钥不匹配返回 `False`
+- `NonceReuse(signer_id, nonce_commitment, receipts)` — 冻结数据类，可按位置
+  构造、按值相等；同一签名者重复使用同一轮次一承诺 `R_i` 的证据：`receipts`
+  为含该 `(signer_id, R_i)` 行的 status=1 审计回执，按 `payload` 字节序去重
+  排列
+- `find_nonce_reuse(records, dkg_result) -> tuple[NonceReuse, ...]` — 无状态
+  随机数复用审计：`records` 各项为 `(message, receipt)`（消息在前），逐项先以
+  `check_audit` 复核（结构非法抛 `ValueError`，类型错误抛 `TypeError`，合法
+  回执但消息或密钥不匹配同样抛 `ValueError`），仅 status=1 的回执参与；按
+  解码行的 `(signer_id, R_i)` 分组，同一对不同 payload 至少出现两次才报告
+  复用（重复提交同一回执不制造告警）；结果按 `signer_id`、`nonce_commitment`
+  升序，与输入顺序无关；函数只检查本批输入，不留历史
 - `Rotation(old, new, ids, t, q, p, g, sig)` — 冻结数据类，可按位置构造、按值
   相等；公开可验证的密钥轮换授权证书：`old`/`new` 为新旧联合公钥，`ids` 为严格
   递增的新成员编号元组，`t` 为新 threshold，`q`/`p`/`g` 为域素数、群素数与
