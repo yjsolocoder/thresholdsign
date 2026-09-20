@@ -263,6 +263,28 @@ payload 依次拼接标签 `b"thresholdsign/rotation/v1"`、`q`、`p`、`g`、`o
 合法但不匹配返回 `False`，类型错误抛 `TypeError`，证书结构非法（含签名结构）
 抛 `ValueError`。新密钥的 DKG 执行与份额交接由调用方负责，库不保存任何状态。
 
+要跨实现传输或持久化证书，用 `encode_rotation` / `decode_rotation` 的公开规范
+编码。编码以标签 `b"thresholdsign/rotation-cert/v1"` 开头，随后依次写 `old`、
+`new`、`ids`、`t`、`q`、`p`、`g`，最后写签名的 `R`、`z`、`signer_ids`，无额外
+分隔符。每个整数都是 4 字节无符号大端长度前缀加该整数的最短无符号大端值：零
+编码为单字节 `00`，正数禁止前导零；`ids` 与 `signer_ids` 均先写 4 字节元素数
+再逐项编码：
+
+```python
+from thresholdsign import encode_rotation, decode_rotation, verify_rotation
+
+blob = encode_rotation(cert)          # bytes，可自由传输/落盘，无隐藏状态
+restored = decode_rotation(blob)      # Rotation
+assert encode_rotation(restored) == blob   # 成功解码必可逐字节复现
+assert verify_rotation(restored)            # 授权仍由 verify_rotation 核验
+```
+
+`encode_rotation` 只接受结构合法的 `Rotation`（不要求签名匹配，输出唯一）；
+`decode_rotation` 拒绝非规范整数、截断、尾随字节、标签错误或计数不符，且不
+验签——结构合法但签名不匹配的证书照常返回，由 `verify_rotation` 返回 `False`。
+类型错误（含嵌套字段）抛 `TypeError`，负数、长度溢出、空编号、编号未递增/重复、
+群参数、公钥或签名结构非法抛 `ValueError`。
+
 
 ## 命令行演示
 
@@ -451,6 +473,17 @@ python3 -m thresholdsign
   一致返回 `True`，结构合法但签名/字段不匹配返回 `False`；类型错误抛
   `TypeError`，证书结构非法（群参数、公钥、编号、threshold 或签名结构）抛
   `ValueError`。新密钥的生成与份额交接由调用方负责
+- `encode_rotation(cert) -> bytes` — 证书的规范传输/持久化编码：以标签
+  `b"thresholdsign/rotation-cert/v1"` 开头，依次写 `old`、`new`、`ids`、`t`、
+  `q`、`p`、`g` 及签名的 `R`、`z`、`signer_ids`，无额外分隔符；每个整数为
+  4 字节无符号大端长度前缀 + 最短无符号大端值（零为单字节 `00`，正数禁前导
+  零），`ids`/`signer_ids` 均先写 4 字节元素数再逐项编码。只校验结构、不要求
+  签名匹配且输出唯一；类型错误抛 `TypeError`，负数、长度溢出或结构非法抛
+  `ValueError`
+- `decode_rotation(payload) -> Rotation` — `encode_rotation` 的逆操作：拒绝
+  错误/缺失标签、非规范整数、截断、尾随字节或计数不符，成功后重编码必得到原
+  字节；不验签，结构合法但签名不匹配由 `verify_rotation` 返回 `False`。
+  非 `bytes` 入参抛 `TypeError`，其余非法情形抛 `ValueError`
 
 ### 门限 Schnorr 群参数与边界
 
