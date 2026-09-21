@@ -32,7 +32,10 @@ the full history and the compact multi-seal proofs
 SealHistoryMultiProof / make_history_multi_proof /
 check_history_multi_proof that locate several seals at once with the
 one root signature, plus their canonical transport encoding
-encode_history_multi_proof / decode_history_multi_proof, publicly
+encode_history_multi_proof / decode_history_multi_proof and the
+proof-plus-signature bundle SealHistoryMultiProofBundle /
+encode_history_multi_proof_bundle / decode_history_multi_proof_bundle /
+verify_history_multi_proof_bundle, publicly
 verifiable key-rotation authorization: Rotation / rotation_payload /
 verify_rotation, the persistent, multi-hop authorization chain
 RotationChain / verify_rotation_chain / encode_rotation_chain /
@@ -132,6 +135,10 @@ __all__ = [
     "check_history_multi_proof",
     "encode_history_multi_proof",
     "decode_history_multi_proof",
+    "SealHistoryMultiProofBundle",
+    "encode_history_multi_proof_bundle",
+    "decode_history_multi_proof_bundle",
+    "verify_history_multi_proof_bundle",
     "Rotation",
     "rotation_payload",
     "verify_rotation",
@@ -6939,6 +6946,260 @@ def decode_history_multi_proof(blob: bytes) -> SealHistoryMultiProof:
     if encode_history_multi_proof(proof) != blob:
         raise ValueError("non-canonical seal history multi-proof encoding")
     return proof
+
+
+# ---------------------------------------------------------------------------
+# Canonical seal-history-multi-proof bundle transport: a self-delimiting,
+# byte-for-byte reproducible encoding of a SealHistoryMultiProof together with
+# the AggregateSignature on its b"sh/r" || U64(total) || root statement, for
+# cross-implementation exchange and persistence. Decoding restores structure
+# only — the nested proof goes through decode_history_multi_proof and no seal
+# or signature is checked, so verify_history_multi_proof_bundle remains the
+# sole verifier afterwards.
+# ---------------------------------------------------------------------------
+
+SEAL_HISTORY_MULTI_PROOF_BUNDLE_WIRE_TAG = b"ts/shmpb/v1"
+
+
+@dataclass(frozen=True)
+class SealHistoryMultiProofBundle:
+    """A compact multi-seal history proof together with its root signature.
+
+    The fields, in order, are ``proof`` (a
+    :class:`SealHistoryMultiProof`) and ``signature`` (the
+    :class:`AggregateSignature` on the proof's
+    ``b"sh/r" || U64(total) || root`` statement). The dataclass is frozen,
+    positionally constructible and compared by value, and carries no
+    network, storage or hidden state. Field types and bounds are not
+    checked at construction time — :func:`encode_history_multi_proof_bundle`
+    checks the structure and :func:`verify_history_multi_proof_bundle` is
+    the way to test a bundle afterwards.
+    """
+
+    proof: SealHistoryMultiProof
+    signature: AggregateSignature
+
+
+def _check_history_multi_proof_bundle_signature(signature: object) -> int:
+    """Type- and structure-check a bundle's root signature, returning its id count.
+
+    The integers and signer set are checked only as the unsigned, ordered
+    structures the wire framing needs; nothing here places ``R``/``z`` in a
+    group (that takes group parameters and is :func:`verify_signature`'s
+    job during :func:`check_history_multi_proof`). ``R`` must be strictly
+    positive (a real commitment is never the identity, and the same value
+    is illegal under :func:`verify_signature`), while ``z`` may be zero and
+    then encodes as the single body byte ``00``.
+    """
+    if not isinstance(signature, AggregateSignature):
+        raise TypeError(
+            "bundle.signature must be an AggregateSignature instance"
+        )
+    if not isinstance(signature.R, int) or isinstance(signature.R, bool):
+        raise TypeError("signature.R must be an integer")
+    if not isinstance(signature.z, int) or isinstance(signature.z, bool):
+        raise TypeError("signature.z must be an integer")
+    if not isinstance(signature.signer_ids, tuple):
+        raise TypeError("signature.signer_ids must be a tuple")
+    try:
+        signer_count = len(signature.signer_ids)
+    except OverflowError:
+        raise ValueError("too many signer ids") from None
+    for signer_id in signature.signer_ids:
+        if not isinstance(signer_id, int) or isinstance(signer_id, bool):
+            raise TypeError("signer ids must be integers")
+
+    if signature.R <= 0:
+        raise ValueError("signature R must be positive")
+    if signature.z < 0:
+        raise ValueError("signature z must be non-negative")
+    if signer_count == 0:
+        raise ValueError("at least one signer is required")
+    for signer_id in signature.signer_ids:
+        if signer_id <= 0:
+            raise ValueError("signer ids must be positive")
+    if any(
+        previous >= next_
+        for previous, next_ in zip(
+            signature.signer_ids, signature.signer_ids[1:]
+        )
+    ):
+        raise ValueError("signer ids must be strictly increasing and unique")
+    return signer_count
+
+
+def encode_history_multi_proof_bundle(
+    bundle: SealHistoryMultiProofBundle,
+) -> bytes:
+    """Canonically encode a multi-proof bundle for transport or persistence.
+
+    The encoding is, in order, the tag ``b"ts/shmpb/v1"``, the 4-byte
+    unsigned big-endian length ``len(P)`` followed by
+    ``P = encode_history_multi_proof(bundle.proof)`` (never empty), and
+    then the signature frame: ``VARINT(R)``, ``VARINT(z)``, the 4-byte
+    unsigned big-endian signer count ``k`` and one ``VARINT(id)`` per
+    ascending signer id. A ``VARINT`` is a 4-byte unsigned big-endian
+    body length followed by the shortest unsigned big-endian value (zero
+    is the single byte ``00``, positive values carry no leading zero);
+    ``R`` must be positive and ``z`` may be zero.
+
+    Only a structurally legal :class:`SealHistoryMultiProofBundle` is
+    accepted — a non-bundle or non-:class:`SealHistoryMultiProof` proof
+    argument, or wrong proof/signature field types, raise TypeError and
+    illegal proof or signature structure (the exact bounds of
+    :func:`encode_history_multi_proof`, a non-positive ``R``, a negative
+    ``z``, an empty or non-strictly-increasing signer id tuple) or an
+    over-long frame raises ValueError, exactly as
+    :func:`check_history_multi_proof`'s structural checks do — but the
+    seals are not verified and the signature is not checked against the
+    root: :func:`verify_history_multi_proof_bundle` stays the way to
+    verify a bundle afterwards. The output for a given bundle is unique
+    and the encoding carries no network, storage or hidden state.
+    """
+    if not isinstance(bundle, SealHistoryMultiProofBundle):
+        raise TypeError(
+            "bundle must be a SealHistoryMultiProofBundle instance"
+        )
+    if not isinstance(bundle.proof, SealHistoryMultiProof):
+        raise TypeError(
+            "bundle.proof must be a SealHistoryMultiProof instance"
+        )
+    encoded_proof = encode_history_multi_proof(bundle.proof)
+    signer_count = _check_history_multi_proof_bundle_signature(
+        bundle.signature
+    )
+    if len(encoded_proof) > 0xFFFFFFFF:
+        raise ValueError("history multi-proof encoding too long")
+    if signer_count > 0xFFFFFFFF:
+        raise ValueError("too many signer ids")
+
+    buffer = bytearray(SEAL_HISTORY_MULTI_PROOF_BUNDLE_WIRE_TAG)
+    buffer += len(encoded_proof).to_bytes(4, "big", signed=False)
+    buffer += encoded_proof
+    buffer += _encode_varint(bundle.signature.R)
+    buffer += _encode_varint(bundle.signature.z)
+    buffer += signer_count.to_bytes(4, "big", signed=False)
+    for signer_id in bundle.signature.signer_ids:
+        buffer += _encode_varint(signer_id)
+    return bytes(buffer)
+
+
+def decode_history_multi_proof_bundle(
+    blob: bytes,
+) -> SealHistoryMultiProofBundle:
+    """Decode the canonical encoding produced by :func:`encode_history_multi_proof_bundle`.
+
+    Accepts only the single canonical form: the tag ``b"ts/shmpb/v1"``, a
+    4-byte non-zero frame length followed by bytes that
+    :func:`decode_history_multi_proof` accepts, the length-prefixed
+    integers ``R`` and ``z``, the 4-byte non-zero signer count ``k`` and
+    then exactly ``k`` strictly increasing positive signer ids. A
+    non-bytes argument raises TypeError; a wrong or missing tag, a zero
+    or over-long proof frame length, a non-canonical nested proof, a zero
+    ``R``, a non-canonical integer (leading zero or over-long length), a
+    zero signer count, a non-positive or non-increasing signer id,
+    truncation, or trailing bytes raises ValueError. A successfully
+    decoded bundle re-encodes to exactly the input bytes.
+
+    Decoding only restores the structure: the nested proof is decoded
+    with :func:`decode_history_multi_proof` (which verifies no seal) and
+    the signature is not checked. A structurally legal bundle whose seals
+    do not verify or whose signature does not sign the root is returned
+    normally, and :func:`verify_history_multi_proof_bundle` reports it as
+    ``False``.
+    """
+    if not isinstance(blob, bytes):
+        raise TypeError("blob must be bytes")
+    if not blob.startswith(SEAL_HISTORY_MULTI_PROOF_BUNDLE_WIRE_TAG):
+        raise ValueError("bad seal history multi-proof bundle tag")
+    offset = len(SEAL_HISTORY_MULTI_PROOF_BUNDLE_WIRE_TAG)
+
+    encoded_proof, offset = _read_audit_proof_block(
+        blob, offset, what="seal history multi-proof bundle proof"
+    )
+    proof = decode_history_multi_proof(encoded_proof)
+
+    R, offset = _read_varint(
+        blob, offset, what="seal history multi-proof bundle signature R"
+    )
+    z, offset = _read_varint(
+        blob, offset, what="seal history multi-proof bundle signature z"
+    )
+    if R == 0:
+        raise ValueError(
+            "seal history multi-proof bundle signature R must be positive"
+        )
+
+    if offset + 4 > len(blob):
+        raise ValueError(
+            "truncated seal history multi-proof bundle signer count"
+        )
+    signer_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    if signer_count == 0:
+        raise ValueError(
+            "seal history multi-proof bundle must name at least one signer"
+        )
+
+    signer_ids = []
+    for _ in range(signer_count):
+        signer_id, offset = _read_varint(
+            blob,
+            offset,
+            what="seal history multi-proof bundle signer id",
+        )
+        if signer_id == 0:
+            raise ValueError(
+                "seal history multi-proof bundle signer ids must be positive"
+            )
+        if signer_ids and signer_id <= signer_ids[-1]:
+            raise ValueError(
+                "seal history multi-proof bundle signer ids must be strictly "
+                "increasing and unique"
+            )
+        signer_ids.append(signer_id)
+    if offset != len(blob):
+        raise ValueError(
+            "trailing bytes after seal history multi-proof bundle"
+        )
+
+    bundle = SealHistoryMultiProofBundle(
+        proof=proof,
+        signature=AggregateSignature(
+            R=R, z=z, signer_ids=tuple(signer_ids)
+        ),
+    )
+    if encode_history_multi_proof_bundle(bundle) != blob:
+        raise ValueError(
+            "non-canonical seal history multi-proof bundle encoding"
+        )
+    return bundle
+
+
+def verify_history_multi_proof_bundle(
+    bundle: SealHistoryMultiProofBundle, key: SigningDKGResult
+) -> bool:
+    """Verify a bundle exactly as :func:`check_history_multi_proof` would.
+
+    This is a convenience wrapper over
+    ``check_history_multi_proof(bundle.proof, bundle.signature, key)``:
+    every disclosed seal is re-checked with :func:`verify_seal`, the
+    Merkle root is rebuilt from the proof and the signature verified on
+    ``b"sh/r" || U64(total) || root``. Returns ``True`` only when all of
+    them hold; a well-formed bundle with tampered seals, indices,
+    siblings or signature, or one presented under another key, returns
+    ``False``.
+
+    A non-:class:`SealHistoryMultiProofBundle` argument raises
+    TypeError; illegal nested proof, signature or key structure raises
+    TypeError/ValueError, exactly as
+    :func:`check_history_multi_proof` does.
+    """
+    if not isinstance(bundle, SealHistoryMultiProofBundle):
+        raise TypeError(
+            "bundle must be a SealHistoryMultiProofBundle instance"
+        )
+    return check_history_multi_proof(bundle.proof, bundle.signature, key)
 
 
 # ---------------------------------------------------------------------------
