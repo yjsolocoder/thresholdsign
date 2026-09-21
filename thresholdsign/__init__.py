@@ -18,7 +18,9 @@ nonce-reuse audit NonceReuse / find_nonce_reuse, leaked-share recovery from
 reused nonces via NonceLeak / recover_leaks, the canonical nonce-reuse
 transport encoding encode_nonce_reuse / decode_nonce_reuse, the canonical
 leaked-share transport encoding encode_nonce_leak / decode_nonce_leak and
-its key-only verifier verify_nonce_leak, publicly
+its key-only verifier verify_nonce_leak, the batched nonce-leak report
+NonceLeakReport with encode_nonce_leak_report / decode_nonce_leak_report /
+verify_nonce_leak_report, publicly
 verifiable key-rotation authorization: Rotation / rotation_payload /
 verify_rotation, the persistent, multi-hop authorization chain
 RotationChain / verify_rotation_chain / encode_rotation_chain /
@@ -94,6 +96,10 @@ __all__ = [
     "encode_nonce_leak",
     "decode_nonce_leak",
     "verify_nonce_leak",
+    "NonceLeakReport",
+    "encode_nonce_leak_report",
+    "decode_nonce_leak_report",
+    "verify_nonce_leak_report",
     "Rotation",
     "rotation_payload",
     "verify_rotation",
@@ -3939,6 +3945,201 @@ def verify_nonce_leak(item: NonceLeak, key: SigningDKGResult) -> bool:
     share_index = result.participant_ids.index(item.signer_id)
     if pow(generator, solved, group_prime) != key.verification_shares[share_index]:
         return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Batched leaked-share transport: a non-empty, order-preserving report of
+# NonceLeak findings with a self-delimiting, byte-for-byte reproducible
+# encoding. Decoding restores the structure only — each nested finding is
+# decoded frame by frame with decode_nonce_leak (which keeps its receipts
+# opaque and verifies nothing); verify_nonce_leak_report re-checks every
+# finding against the signing key afterwards.
+# ---------------------------------------------------------------------------
+
+NONCE_LEAK_REPORT_WIRE_TAG = b"thresholdsign/nlr/v1"
+
+
+@dataclass(frozen=True)
+class NonceLeakReport:
+    """A non-empty batch of leaked-share findings, ordered and unique by key.
+
+    ``items`` is the non-empty tuple of :class:`NonceLeak` findings in
+    report order, strictly increasing and unique by the pair
+    ``(signer_id, commitment)``, exactly as :func:`recover_leaks` sorts its
+    output. The dataclass is frozen, positionally constructible and compared
+    by value; it carries no network, storage or hidden state. Neither the
+    container nor the findings are checked at construction time —
+    :func:`verify_nonce_leak_report` is the way to test a report afterwards.
+    """
+
+    items: tuple[NonceLeak, ...]
+
+
+def encode_nonce_leak_report(report: NonceLeakReport) -> bytes:
+    """Canonically encode a non-empty nonce-leak report for transport.
+
+    The encoding is the direct concatenation, in order, of the tag
+    ``b"thresholdsign/nlr/v1"``, the item count ``n`` as a 4-byte unsigned
+    big-endian integer, and one frame per item — a 4-byte unsigned
+    big-endian length followed by the exact
+    :func:`encode_nonce_leak` output of that finding. ``items`` must be a
+    non-empty tuple whose findings are strictly increasing and unique by
+    ``(signer_id, commitment)``; its order is preserved verbatim — nothing
+    is sorted and no leak is verified.
+
+    A non-:class:`NonceLeakReport` argument, an ``items`` value that is not
+    a tuple (a list or other sequence included), or any finding that is not
+    a structurally encodable :class:`NonceLeak` (a boolean or other
+    non-integer field, a non-tuple receipt, and so on) raises TypeError; an
+    empty report, an out-of-order or duplicated ``(signer_id,
+    commitment)`` key, more than 2**32 - 1 findings, an over-long frame, or
+    any nested finding rejected by :func:`encode_nonce_leak` raises
+    ValueError. The output for a given report is unique and the encoding
+    carries no hidden state.
+    """
+    if not isinstance(report, NonceLeakReport):
+        raise TypeError("report must be a NonceLeakReport instance")
+    items = report.items
+    if not isinstance(items, tuple):
+        raise TypeError("report.items must be a tuple")
+    if not items:
+        raise ValueError("nonce-leak report must be non-empty")
+    if len(items) > 0xFFFFFFFF:
+        raise ValueError("too many nonce-leak findings")
+
+    buffer = bytearray(NONCE_LEAK_REPORT_WIRE_TAG)
+    buffer += len(items).to_bytes(4, "big", signed=False)
+    previous_key = None
+    for item in items:
+        # Each nested finding is encoded with the single-item codec, which
+        # performs its own TypeError/ValueError field validation.
+        encoded = encode_nonce_leak(item)
+        key = (item.signer_id, item.commitment)
+        if previous_key is not None and key <= previous_key:
+            raise ValueError(
+                "nonce-leak report items must be strictly increasing and "
+                "unique by (signer_id, commitment)"
+            )
+        previous_key = key
+        if len(encoded) > 0xFFFFFFFF:
+            raise ValueError("nonce-leak item encoding too long")
+        buffer += len(encoded).to_bytes(4, "big", signed=False)
+        buffer += encoded
+    return bytes(buffer)
+
+
+def decode_nonce_leak_report(blob: bytes) -> NonceLeakReport:
+    """Decode the canonical encoding produced by :func:`encode_nonce_leak_report`.
+
+    Accepts only the single canonical form: the tag
+    ``b"thresholdsign/nlr/v1"``, a 4-byte unsigned big-endian item count of
+    at least one, and exactly that many frames, each a 4-byte non-zero
+    length followed by bytes that :func:`decode_nonce_leak` accepts — every
+    nested finding is decoded frame by frame, which rejects bad or missing
+    tags, non-canonical integers, wrong receipt counts, empty, duplicated
+    or unordered nested receipts, truncation and trailing bytes inside a
+    frame. The decoded findings must be strictly increasing and unique by
+    ``(signer_id, commitment)``. A non-bytes argument raises TypeError; a
+    bad or missing report tag, a zero item count, a zero frame length, a
+    count that does not match the frames present, a truncated or trailing
+    frame, an out-of-order or duplicated key, or any nested finding that is
+    not a canonical :class:`NonceLeak` encoding raises ValueError. A
+    successfully decoded report re-encodes to exactly the input bytes.
+
+    Decoding restores the structure only: nested receipts stay opaque and
+    neither the findings nor the report are verified against a key. A
+    structurally legal report whose findings do not actually attest to the
+    claimed leaks is returned normally, and
+    :func:`verify_nonce_leak_report` reports it as ``False``.
+    """
+    if not isinstance(blob, bytes):
+        raise TypeError("blob must be bytes")
+    if not blob.startswith(NONCE_LEAK_REPORT_WIRE_TAG):
+        raise ValueError("bad nonce-leak-report tag")
+    offset = len(NONCE_LEAK_REPORT_WIRE_TAG)
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated nonce-leak-report item count")
+    item_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    if item_count == 0:
+        raise ValueError("nonce-leak report must be non-empty")
+
+    items = []
+    previous_key = None
+    for index in range(item_count):
+        if offset + 4 > len(blob):
+            raise ValueError("truncated nonce-leak-report item length")
+        frame_length = int.from_bytes(blob[offset:offset + 4], "big")
+        offset += 4
+        if frame_length == 0:
+            raise ValueError("nonce-leak-report item frame must be non-empty")
+        if offset + frame_length > len(blob):
+            raise ValueError("truncated nonce-leak-report item")
+        frame = bytes(blob[offset:offset + frame_length])
+        offset += frame_length
+        # decode_nonce_leak enforces the nested tag and the single
+        # canonical finding form, so no non-canonical nesting can pass.
+        item = decode_nonce_leak(frame)
+        key = (item.signer_id, item.commitment)
+        if previous_key is not None and key <= previous_key:
+            raise ValueError(
+                "nonce-leak report items must be strictly increasing and "
+                "unique by (signer_id, commitment)"
+            )
+        previous_key = key
+        items.append(item)
+    if offset != len(blob):
+        raise ValueError("trailing bytes after nonce-leak report")
+
+    report = NonceLeakReport(items=tuple(items))
+    if encode_nonce_leak_report(report) != blob:
+        raise ValueError("non-canonical nonce-leak-report encoding")
+    return report
+
+
+def verify_nonce_leak_report(report: NonceLeakReport, key: SigningDKGResult) -> bool:
+    """Verify every finding of a nonce-leak report against the signing key.
+
+    ``report`` must be a structurally legal :class:`NonceLeakReport`
+    exactly as :func:`encode_nonce_leak_report` requires — a non-report or
+    a non-tuple ``items`` raises TypeError, an empty report or an
+    out-of-order or duplicated key raises ValueError — and each finding is
+    validated exactly as in :func:`verify_nonce_leak`, so a structurally
+    illegal nested finding (wrong field types, other than two receipts, an
+    unparsable receipt, an unknown signer) raises TypeError or ValueError
+    just like the single-item verifier. Every finding is then checked
+    against ``key`` alone, without the messages: only if
+    :func:`verify_nonce_leak` returns ``True`` for every item does this
+    function return ``True``; any single legal mismatch returns ``False``.
+    The function is stateless.
+    """
+    if not isinstance(report, NonceLeakReport):
+        raise TypeError("report must be a NonceLeakReport instance")
+    items = report.items
+    if not isinstance(items, tuple):
+        raise TypeError("report.items must be a tuple")
+    if not items:
+        raise ValueError("nonce-leak report must be non-empty")
+    # Mirror the encoder's key ordering rule so verify matches the codec.
+    previous_key = None
+    for item in items:
+        if not isinstance(item, NonceLeak):
+            raise TypeError("each report item must be a NonceLeak instance")
+        # Validate field types (booleans included) before the integer keys
+        # are compared, so a boolean field raises TypeError, never an
+        # ordering ValueError (True compares equal to 1).
+        _check_nonce_leak_fields(item)
+        key_pair = (item.signer_id, item.commitment)
+        if previous_key is not None and key_pair <= previous_key:
+            raise ValueError(
+                "nonce-leak report items must be strictly increasing and "
+                "unique by (signer_id, commitment)"
+            )
+        previous_key = key_pair
+        if not verify_nonce_leak(item, key):
+            return False
     return True
 
 
