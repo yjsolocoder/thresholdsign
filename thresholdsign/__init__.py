@@ -16,7 +16,9 @@ create_signing_nonce_commitment / create_signing_round / create_signature_share
 audit receipts: SigningAudit / create_audit / check_audit, the stateless
 nonce-reuse audit NonceReuse / find_nonce_reuse, leaked-share recovery from
 reused nonces via NonceLeak / recover_leaks, the canonical nonce-reuse
-transport encoding encode_nonce_reuse / decode_nonce_reuse, publicly
+transport encoding encode_nonce_reuse / decode_nonce_reuse, the canonical
+nonce-leak transport encoding encode_nonce_leak / decode_nonce_leak and the
+standalone leaked-share proof check verify_nonce_leak, publicly
 verifiable key-rotation authorization: Rotation / rotation_payload /
 verify_rotation, the persistent, multi-hop authorization chain
 RotationChain / verify_rotation_chain / encode_rotation_chain /
@@ -89,6 +91,9 @@ __all__ = [
     "decode_nonce_reuse",
     "NonceLeak",
     "recover_leaks",
+    "encode_nonce_leak",
+    "decode_nonce_leak",
+    "verify_nonce_leak",
     "Rotation",
     "rotation_payload",
     "verify_rotation",
@@ -1911,8 +1916,32 @@ def schnorr_challenge(
     ``L = ceil(group_prime.bit_length() / 8)`` bytes. Signer ids are taken in
     the (strictly increasing) order given, so the encoding is canonical.
     """
+    return _schnorr_challenge_digest(
+        hashlib.sha256(message).digest(),
+        public_key,
+        R,
+        signer_ids,
+        field_prime=field_prime,
+        group_prime=group_prime,
+    )
+
+
+def _schnorr_challenge_digest(
+    digest: bytes,
+    public_key: int,
+    R: int,
+    signer_ids: Sequence[int],
+    *,
+    field_prime: int,
+    group_prime: int,
+) -> int:
+    """The Fiat-Shamir challenge over a precomputed 32-byte message digest.
+
+    This is :func:`schnorr_challenge` with ``SHA256(message)`` already
+    evaluated, for callers (audit receipts, leak proofs) that store the
+    digest but not the message.
+    """
     length = (group_prime.bit_length() + 7) // 8
-    digest = hashlib.sha256(message).digest()
     buffer = bytearray(SCHNORR_TAG)
     buffer += digest
     buffer += _encode_integer(public_key, length)
@@ -3639,6 +3668,289 @@ def decode_nonce_reuse(blob: bytes) -> NonceReuse:
     if encode_nonce_reuse(item) != blob:
         raise ValueError("non-canonical nonce-reuse encoding")
     return item
+
+
+# ---------------------------------------------------------------------------
+# Canonical nonce-leak transport: a self-delimiting, byte-for-byte
+# reproducible encoding of a NonceLeak proof for cross-implementation
+# exchange and persistence. Decoding restores the structure only — receipts
+# are stored opaque and are neither parsed nor re-verified, and no share is
+# recovered: verify_nonce_leak remains the sole checker afterwards.
+# ---------------------------------------------------------------------------
+
+NONCE_LEAK_WIRE_TAG = b"thresholdsign/nl/v1"
+
+
+def _check_nonce_leak_fields(item: NonceLeak) -> None:
+    """Type-check every NonceLeak field, raising TypeError (bool is not int)."""
+    if not isinstance(item, NonceLeak):
+        raise TypeError("item must be a NonceLeak instance")
+    for name, value in (
+        ("item.signer_id", item.signer_id),
+        ("item.commitment", item.commitment),
+        ("item.share", item.share),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"{name} must be an integer")
+    if not isinstance(item.receipts, tuple):
+        raise TypeError("item.receipts must be a tuple")
+    for receipt in item.receipts:
+        if not isinstance(receipt, SigningAudit):
+            raise TypeError("each receipt must be a SigningAudit instance")
+        if not isinstance(receipt.payload, bytes):
+            raise TypeError("each receipt payload must be bytes")
+
+
+def encode_nonce_leak(item: NonceLeak) -> bytes:
+    """Canonically encode a leaked-share proof for transport or persistence.
+
+    The encoding is the direct concatenation, in order, of the tag
+    ``b"thresholdsign/nl/v1"``, ``VARINT(signer_id)``,
+    ``VARINT(commitment)`` and ``VARINT(share)`` (positive, positive and
+    non-negative respectively), the receipt count as a 4-byte unsigned
+    big-endian integer — always exactly two — and one frame per receipt: a
+    4-byte unsigned big-endian payload length followed by the raw
+    :class:`SigningAudit` payload bytes. Both payloads must be non-empty and
+    must appear in strictly increasing byte order, exactly as
+    :func:`recover_leaks` produces them. A ``VARINT`` is a 4-byte unsigned
+    big-endian body length followed by the shortest unsigned big-endian
+    value (zero is the single byte ``00`` and positive values carry no
+    leading zero).
+
+    A non-:class:`NonceLeak` argument or a wrong field type (a non-integer
+    ``signer_id``, ``commitment`` or ``share`` including booleans, a
+    non-tuple receipts sequence, a non-:class:`SigningAudit` receipt or a
+    non-bytes payload) raises TypeError; a non-positive ``signer_id`` or
+    ``commitment``, a negative ``share``, a receipt count other than two, an
+    empty, duplicated or out-of-order payload, or an over-long frame raises
+    ValueError. The payloads are not parsed and no share is recovered: the
+    output for a given proof is unique and the encoding carries no network,
+    storage or hidden state.
+    """
+    _check_nonce_leak_fields(item)
+    signer_id = item.signer_id
+    commitment = item.commitment
+    share = item.share
+    receipts = item.receipts
+    if signer_id <= 0:
+        raise ValueError("item.signer_id must be positive")
+    if commitment <= 0:
+        raise ValueError("item.commitment must be positive")
+    if share < 0:
+        raise ValueError("item.share must be non-negative")
+    if len(receipts) != 2:
+        raise ValueError("a nonce-leak proof carries exactly two receipts")
+
+    buffer = bytearray(NONCE_LEAK_WIRE_TAG)
+    buffer += _encode_varint(signer_id)
+    buffer += _encode_varint(commitment)
+    buffer += _encode_varint(share)
+    buffer += len(receipts).to_bytes(4, "big", signed=False)
+    previous = None
+    for receipt in receipts:
+        payload = receipt.payload
+        if not payload:
+            raise ValueError("receipt payloads must be non-empty")
+        if len(payload) > 0xFFFFFFFF:
+            raise ValueError("receipt encoding too long")
+        if previous is not None and payload <= previous:
+            raise ValueError(
+                "receipt payloads must be strictly increasing and unique"
+            )
+        previous = payload
+        buffer += len(payload).to_bytes(4, "big", signed=False)
+        buffer += payload
+    return bytes(buffer)
+
+
+def decode_nonce_leak(blob: bytes) -> NonceLeak:
+    """Decode the canonical encoding produced by :func:`encode_nonce_leak`.
+
+    Accepts only the single canonical form: the tag
+    ``b"thresholdsign/nl/v1"``, the length-prefixed integers ``signer_id``,
+    ``commitment`` and ``share`` (each a 4-byte unsigned big-endian length
+    followed by its shortest unsigned big-endian value, zero encoded as the
+    single byte ``00``; the first two must be positive), the 4-byte receipt
+    count — which must be exactly two — and that many frames of a 4-byte
+    non-zero length followed by raw payload bytes that are strictly
+    increasing and unique. A non-bytes argument raises TypeError; a wrong or
+    missing tag, a zero ``signer_id`` or ``commitment``, a receipt count
+    other than two, an empty, duplicated or unordered payload, a
+    non-canonical integer (leading zero or over-long length), truncation, or
+    trailing bytes raises ValueError. A successfully decoded proof
+    re-encodes to exactly the input bytes.
+
+    Decoding only restores the structure: the receipts are constructed as
+    opaque :class:`SigningAudit` values and are neither parsed nor verified,
+    and no share is recovered or checked. A structurally legal proof whose
+    receipts do not actually expose the claimed share is returned normally,
+    and :func:`verify_nonce_leak` reports it as ``False``.
+    """
+    if not isinstance(blob, bytes):
+        raise TypeError("blob must be bytes")
+    if not blob.startswith(NONCE_LEAK_WIRE_TAG):
+        raise ValueError("bad nonce-leak tag")
+    offset = len(NONCE_LEAK_WIRE_TAG)
+
+    signer_id, offset = _read_varint(blob, offset, what="nonce-leak signer_id")
+    commitment, offset = _read_varint(blob, offset, what="nonce-leak commitment")
+    share, offset = _read_varint(blob, offset, what="nonce-leak share")
+    if signer_id == 0:
+        raise ValueError("nonce-leak signer_id must be positive")
+    if commitment == 0:
+        raise ValueError("nonce-leak commitment must be positive")
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated nonce-leak receipt count")
+    receipt_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    if receipt_count != 2:
+        raise ValueError("a nonce-leak proof carries exactly two receipts")
+
+    receipts = []
+    previous = None
+    for _ in range(receipt_count):
+        if offset + 4 > len(blob):
+            raise ValueError("truncated nonce-leak receipt length")
+        length = int.from_bytes(blob[offset:offset + 4], "big")
+        offset += 4
+        if length == 0:
+            raise ValueError("nonce-leak receipt payloads must be non-empty")
+        if offset + length > len(blob):
+            raise ValueError("truncated nonce-leak receipt")
+        payload = bytes(blob[offset:offset + length])
+        offset += length
+        if previous is not None and payload <= previous:
+            raise ValueError(
+                "receipt payloads must be strictly increasing and unique"
+            )
+        previous = payload
+        receipts.append(SigningAudit(payload=payload))
+    if offset != len(blob):
+        raise ValueError("trailing bytes after nonce-leak proof")
+
+    item = NonceLeak(
+        signer_id=signer_id,
+        commitment=commitment,
+        share=share,
+        receipts=tuple(receipts),
+    )
+    if encode_nonce_leak(item) != blob:
+        raise ValueError("non-canonical nonce-leak encoding")
+    return item
+
+
+def verify_nonce_leak(item: NonceLeak, key: SigningDKGResult) -> bool:
+    """Re-verify a leaked-share proof against the signing key, statelessly.
+
+    Both receipts must be structurally legal status-1 audit receipts under
+    ``key``: each payload is decoded (structural or decoding defects raise
+    ValueError, wrong types raise TypeError; this includes rows fewer than
+    ``threshold``, signer ids that are not DKG participants, or a receipt
+    count other than two) and everything is recomputed from the stored
+    message digest and ``key`` — the Fiat-Shamir challenge from the digest,
+    the public key and the header ``R``, the aggregate ``R`` from the row
+    commitments, the per-row share verification
+    ``g ** z_i == R_i * Y_i ** (c * lambda_i)`` and the aggregated ``z``
+    with the aggregate signature ``g ** z == R * Y ** c``. Any mismatch
+    returns ``False``, as does a receipt whose recorded status is not 1.
+
+    Both receipts must then name ``item.signer_id`` in a row whose
+    ``nonce_commitment`` equals ``item.commitment`` — the reused round-one
+    value. With ``a = c * lambda_i mod q`` over each receipt's own signer
+    set, the two coefficients must differ; the solved share
+    ``s = (z1 - z2) / (a1 - a2) mod q`` must equal ``item.share`` and must
+    satisfy ``g ** s == Y_i mod p`` against the signer's verification
+    share. Every match returns ``True``; any mismatch returns ``False``.
+    """
+    _check_nonce_leak_fields(item)
+    if not isinstance(key, SigningDKGResult):
+        raise TypeError("key must be a SigningDKGResult instance")
+    result, public_key, field_prime, group_prime, generator = _check_signing_setup(key)
+    _check_signing_dkg_structure(key)
+    threshold = len(result.commitment.values)
+
+    if len(item.receipts) != 2:
+        raise ValueError("a nonce-leak proof carries exactly two receipts")
+    if item.signer_id not in result.participant_ids:
+        raise ValueError("item.signer_id must be a DKG participant")
+    verification_share = key.verification_shares[
+        result.participant_ids.index(item.signer_id)
+    ]
+
+    entries = []
+    for receipt in item.receipts:
+        digest, Y, R, challenge, rows, status, z = _decode_audit_payload(
+            receipt.payload, field_prime, group_prime
+        )
+        signer_ids = tuple(row[0] for row in rows)
+        if len(signer_ids) < threshold:
+            raise ValueError("audit rows must cover at least threshold signers")
+        if any(
+            signer_id not in result.participant_ids for signer_id in signer_ids
+        ):
+            raise ValueError("audit signer ids must be DKG participants")
+        if status != 1:
+            return False
+        if Y != public_key:
+            return False
+        recomputed_challenge = _schnorr_challenge_digest(
+            digest,
+            public_key,
+            R,
+            signer_ids,
+            field_prime=field_prime,
+            group_prime=group_prime,
+        )
+        if recomputed_challenge != challenge:
+            return False
+
+        recomputed_R = 1
+        z_total = 0
+        for signer_id, nonce_commitment, z_i in rows:
+            recomputed_R = recomputed_R * nonce_commitment % group_prime
+            weight = _lagrange_weight(signer_id, signer_ids, field_prime)
+            share_index = result.participant_ids.index(signer_id)
+            expected = (
+                nonce_commitment
+                * pow(
+                    key.verification_shares[share_index],
+                    challenge * weight % field_prime,
+                    group_prime,
+                )
+                % group_prime
+            )
+            if pow(generator, z_i, group_prime) != expected:
+                return False
+            z_total = (z_total + z_i) % field_prime
+        if recomputed_R != R:
+            return False
+        if z != z_total:
+            return False
+        if pow(generator, z, group_prime) != (
+            R * pow(public_key, challenge, group_prime) % group_prime
+        ):
+            return False
+
+        row = next((r for r in rows if r[0] == item.signer_id), None)
+        if row is None:
+            return False
+        if row[1] != item.commitment:
+            return False
+        weight = _lagrange_weight(item.signer_id, signer_ids, field_prime)
+        entries.append((challenge * weight % field_prime, row[2]))
+
+    (first_a, first_z), (second_a, second_z) = entries
+    if first_a == second_a:
+        return False
+    recovered = (
+        (first_z - second_z)
+        * pow(first_a - second_a, -1, field_prime)
+        % field_prime
+    )
+    if recovered != item.share:
+        return False
+    return pow(generator, recovered, group_prime) == verification_share
 
 
 # ---------------------------------------------------------------------------
