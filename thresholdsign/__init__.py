@@ -23,7 +23,9 @@ leaked-share transport encoding encode_nonce_leak_report /
 decode_nonce_leak_report and its key-only verifier
 verify_nonce_leak_report, the threshold-Schnorr-authenticated
 whole-report seal ReportSeal / seal_message / encode_seal /
-decode_seal / verify_seal, publicly
+decode_seal / verify_seal, the order-preserving, threshold-Schnorr-sealed
+seal history SealHistory / history_message / check_history with its
+canonical transport encoding encode_history / decode_history, publicly
 verifiable key-rotation authorization: Rotation / rotation_payload /
 verify_rotation, the persistent, multi-hop authorization chain
 RotationChain / verify_rotation_chain / encode_rotation_chain /
@@ -108,6 +110,11 @@ __all__ = [
     "encode_seal",
     "decode_seal",
     "verify_seal",
+    "SealHistory",
+    "history_message",
+    "check_history",
+    "encode_history",
+    "decode_history",
     "Rotation",
     "rotation_payload",
     "verify_rotation",
@@ -4380,6 +4387,220 @@ def verify_seal(seal: ReportSeal, key: SigningDKGResult) -> bool:
         generator=generator,
         prime=field_prime,
     )
+
+
+# ---------------------------------------------------------------------------
+# Seal histories: a non-empty, order-preserving sequence of whole-report
+# ReportSeal values sealed as a batch by one further threshold Schnorr
+# signature. The signed history message commits to the exact canonical
+# encodings of every seal in tuple order and to the verifying public key,
+# so deleting, inserting, reordering or cross-key-substituting a seal all
+# invalidate the signature. The history is a plain frozen value with no
+# network, storage or hidden state; check_history re-verifies every seal
+# with verify_seal and then the sealing signature.
+# ---------------------------------------------------------------------------
+
+SEAL_HISTORY_TAG = b"ts/sh/v1"
+SEAL_HISTORY_WIRE_TAG = b"thresholdsign/seal-history/v1"
+
+
+@dataclass(frozen=True)
+class SealHistory:
+    """A non-empty, order-preserving batch of report seals sealed by one signature.
+
+    ``items`` is the non-empty tuple of :class:`ReportSeal` values in history
+    order; the dataclass is frozen, positionally constructible and compared
+    by value, keeps its order and carries no network, storage or hidden
+    state. The sole field is not checked at construction time —
+    :func:`check_history`, :func:`history_message` and the codec are the
+    ways to test a history afterwards.
+    """
+
+    items: tuple[ReportSeal, ...]
+
+
+def _check_seal_history_items(items: object) -> int:
+    """Type- and structure-check the items container of a seal history.
+
+    ``items`` must be a non-empty tuple of :class:`ReportSeal` instances;
+    the nested seals themselves are not decoded here (that is
+    :func:`verify_seal`'s job during verification). Returns the item count.
+    """
+    if not isinstance(items, tuple):
+        raise TypeError("items must be a tuple")
+    try:
+        count = len(items)
+    except OverflowError:
+        raise ValueError("too many history items") from None
+    if count == 0:
+        raise ValueError("items must be non-empty")
+    for item in items:
+        if not isinstance(item, ReportSeal):
+            raise TypeError("each history item must be a ReportSeal instance")
+    return count
+
+
+def history_message(history: SealHistory, pk: int) -> bytes:
+    """Encode the canonical message the threshold key signs to seal a history.
+
+    The message is, in order, the tag ``b"ts/sh/v1"``, the 32-byte
+    ``SHA256`` digest of :func:`encode_history` output for ``history``, and
+    ``VARINT(pk)`` — the same 4-byte unsigned big-endian length followed by
+    the shortest unsigned big-endian value used throughout the canonical
+    transport encodings (zero is the single byte ``00``, positive values
+    carry no leading zero). It carries no signature and keeps no state.
+
+    ``history`` must be a :class:`SealHistory` whose items are a non-empty
+    tuple of structurally legal :class:`ReportSeal` values exactly as
+    :func:`encode_history` requires and ``pk`` a positive non-boolean
+    integer. Wrong field types raise TypeError; an illegal history, a
+    non-positive or boolean pk, or an over-long key encoding raises
+    ValueError.
+    """
+    if not isinstance(history, SealHistory):
+        raise TypeError("history must be a SealHistory instance")
+    if not isinstance(pk, int) or isinstance(pk, bool):
+        raise TypeError("pk must be an integer")
+    if pk <= 0:
+        raise ValueError("pk must be positive")
+    encoded_history = encode_history(history)
+    return (
+        SEAL_HISTORY_TAG
+        + hashlib.sha256(encoded_history).digest()
+        + _encode_varint(pk)
+    )
+
+
+def check_history(
+    history: SealHistory, signature: AggregateSignature, key: SigningDKGResult
+) -> bool:
+    """Verify a seal history against its items and the threshold key.
+
+    Every item of ``history.items`` is first re-checked in history order
+    with :func:`verify_seal` against ``key``, and the canonical
+    :func:`history_message` of the history and ``key.public_key`` is then
+    checked as ``signature``'s threshold Schnorr message via
+    :func:`verify_signature`. Returns ``True`` only when every seal matches
+    its report and the key and the signature seals the exact item
+    sequence; deleting or inserting an item, reordering items,
+    substituting a seal sealed by another key, tampering with a seal or
+    the signature, or presenting the history under another key all return
+    ``False`` for well-formed inputs.
+
+    A non-:class:`SealHistory` history, a non-:class:`AggregateSignature`
+    signature or any wrong item/key field type raises TypeError; an empty
+    history, a structurally illegal seal or signature, or a malformed
+    ``key`` raises ValueError, exactly as :func:`verify_seal` and
+    :func:`verify_signature` would. The function is stateless.
+    """
+    if not isinstance(history, SealHistory):
+        raise TypeError("history must be a SealHistory instance")
+    if not isinstance(signature, AggregateSignature):
+        raise TypeError("signature must be an AggregateSignature instance")
+    _check_seal_history_items(history.items)
+    _result, public_key, field_prime, group_prime, generator = _check_signing_setup(key)
+    _check_signing_dkg_structure(key)
+
+    for item in history.items:
+        if not verify_seal(item, key):
+            return False
+
+    message = history_message(history, public_key)
+    return verify_signature(
+        message,
+        signature,
+        public_key,
+        group_prime=group_prime,
+        generator=generator,
+        prime=field_prime,
+    )
+
+
+def encode_history(history: SealHistory) -> bytes:
+    """Canonically encode a seal history for transport or persistence.
+
+    The encoding starts with the tag ``b"thresholdsign/seal-history/v1"``
+    and then writes the item count ``n`` as a 4-byte unsigned big-endian
+    integer followed by, strictly in ``items`` tuple order, one frame per
+    seal: a 4-byte unsigned big-endian length followed by the raw
+    :func:`encode_seal` output ``E``. The history must hold at least one
+    item.
+
+    Only a structurally legal history is accepted: ``items`` a non-empty
+    tuple of :class:`ReportSeal` values, each itself encodable by
+    :func:`encode_seal`. Neither the nested seals, their reports nor any
+    signature are checked: the output for a given history is unique and
+    the encoding carries no network, storage or hidden state. Wrong
+    field types raise TypeError; an empty history, an illegal nested seal
+    structure or an over-long frame (including an item count that does
+    not fit the 4-byte counter) raises ValueError.
+    """
+    if not isinstance(history, SealHistory):
+        raise TypeError("history must be a SealHistory instance")
+    count = _check_seal_history_items(history.items)
+    if count > 0xFFFFFFFF:
+        raise ValueError("too many history items")
+
+    buffer = bytearray(SEAL_HISTORY_WIRE_TAG)
+    buffer += count.to_bytes(4, "big", signed=False)
+    for index, item in enumerate(history.items):
+        encoded_item = encode_seal(item)
+        if len(encoded_item) > 0xFFFFFFFF:
+            raise ValueError(f"history item {index + 1} encoding too long")
+        buffer += len(encoded_item).to_bytes(4, "big", signed=False)
+        buffer += encoded_item
+    return bytes(buffer)
+
+
+def decode_history(blob: bytes) -> SealHistory:
+    """Decode the canonical encoding produced by :func:`encode_history`.
+
+    Accepts only the single canonical form: the tag
+    ``b"thresholdsign/seal-history/v1"``, the 4-byte unsigned big-endian
+    item count (never zero), and then exactly that many frames in order,
+    each a 4-byte non-zero length followed by bytes that
+    :func:`decode_seal` accepts. A non-bytes argument raises TypeError; a
+    wrong or missing tag, a zero or over-long item count, an empty frame,
+    a count mismatch, truncation, trailing bytes, or any non-canonical
+    nested seal (bad tag, bad nested report, a zero ``R``, a zero or
+    mismatched signer count, unordered or duplicate signer ids, or a
+    non-canonical integer) raises ValueError. A successfully decoded
+    history re-encodes to exactly the input bytes.
+
+    Decoding only restores the structure: each nested seal is decoded
+    frame by frame with :func:`decode_seal`, which verifies neither the
+    sealed report nor any signature, so neither are checked here. A
+    structurally legal history whose seals do not verify or whose sealing
+    signature does not seal the sequence is returned normally, and
+    :func:`check_history` reports it as ``False``.
+    """
+    if not isinstance(blob, bytes):
+        raise TypeError("blob must be bytes")
+    if not blob.startswith(SEAL_HISTORY_WIRE_TAG):
+        raise ValueError("bad seal history tag")
+    offset = len(SEAL_HISTORY_WIRE_TAG)
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated seal history item count")
+    count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    if count == 0:
+        raise ValueError("seal history must contain at least one item")
+
+    items = []
+    for index in range(count):
+        encoded_item, offset = _read_audit_proof_block(
+            blob, offset, what=f"seal history item {index + 1}"
+        )
+        items.append(decode_seal(encoded_item))
+
+    if offset != len(blob):
+        raise ValueError("trailing bytes after seal history")
+
+    history = SealHistory(items=tuple(items))
+    if encode_history(history) != blob:
+        raise ValueError("non-canonical seal history encoding")
+    return history
 
 
 # ---------------------------------------------------------------------------

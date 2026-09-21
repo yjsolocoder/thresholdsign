@@ -813,6 +813,43 @@ python3 -m thresholdsign
   非 `ReportSeal`/`AggregateSignature`/`SigningDKGResult` 入参或字段
   类型错误抛 `TypeError`，报告、签名或密钥结构非法抛 `ValueError`；
   无状态
+- `SealHistory(items)` — 冻结数据类，唯一字段 `items` 为非空且保序的
+  `ReportSeal` 元组，可按位置构造、按值相等；以又一个门限 Schnorr
+  签名批量认证一批整报告封印，构造时不校验，核验由 `check_history`
+  负责；不含网络、存储或隐藏状态
+- `history_message(history, pk) -> bytes` — 生成由门限密钥签署、
+  认证整条封印历史的规范消息（作为 `SigningRound.message`）：记
+  `H = encode_history(history)`，依次拼接标签 `b"ts/sh/v1"`、
+  `SHA256(H)`（32 字节）及 `VARINT(pk)`（规则同其他规范编码：4
+  字节无符号大端长度 + 最短无符号大端值，零为单字节 `00`），其中
+  `pk` 必须为正；消息不含签名。非 `SealHistory`、元素非
+  `ReportSeal` 或 pk 非整数（含布尔）抛 `TypeError`，空历史、嵌套
+  封印结构非法、pk 非正或编码过长抛 `ValueError`；输出唯一、无状态
+- `check_history(history, signature, key) -> bool` — 先按元组顺序对
+  `history.items` 逐项调用 `verify_seal` 复核（每份封印的报告证据与
+  封印签名均须通过），再以 `key.public_key` 和 `key` 的群参数对
+  `history_message(history, key.public_key)` 调用 `verify_signature`
+  验签；全部为真才返回 `True`，删除、插入、重排任一 item、替换为
+  另一把密钥封印的 item、篡改任一封印或批量签名、或以另一把密钥
+  核验均对结构合法的入参返回 `False`。非
+  `SealHistory`/`AggregateSignature`/`SigningDKGResult` 入参或字段
+  类型错误抛 `TypeError`，空历史、嵌套封印、批量签名或密钥结构
+  非法抛 `ValueError`；无状态
+- `encode_history(history) -> bytes` — 封印历史的规范传输/持久化
+  编码：记 `n` 为 item 数，依次拼接标签
+  `b"thresholdsign/seal-history/v1"`、4 字节无符号大端 `n`（非零），
+  再严格按 `items` 顺序为每个 item 写一帧
+  `U32(len(E)) || E`，其中 `E = encode_seal(item)`；不重排、不验
+  封印、不验任何签名。非 `SealHistory`、`items` 非元组或元素非
+  `ReportSeal` 抛 `TypeError`；空历史、嵌套封印结构非法、超长帧
+  （含 item 数超出 4 字节计数）抛 `ValueError`；输出唯一、无状态
+- `decode_history(blob) -> SealHistory` — `encode_history` 的逆操作，
+  逐帧调用 `decode_seal`（拒绝一切非规范嵌套封印及其嵌套报告），不
+  验封印、不验任何签名：拒绝非 `bytes`、坏/缺标签、零或超长的 item
+  计数、空帧、声明计数与帧数不符、截断、尾随字节及一切嵌套非法
+  （坏标签、嵌套报告非规范、零 `R`、零或不符的签名者计数、
+  非正/乱序/重复 ids、非规范整数）；非 `bytes` 入参抛 `TypeError`，
+  其余非法情形抛 `ValueError`；成功后重编码必逐字节等于输入
 - `Rotation(old, new, ids, t, q, p, g, sig)` — 冻结数据类，可按位置构造、按值
   相等；公开可验证的密钥轮换授权证书：`old`/`new` 为新旧联合公钥，`ids` 为严格
   递增的新成员编号元组，`t` 为新 threshold，`q`/`p`/`g` 为域素数、群素数与
