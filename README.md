@@ -778,6 +778,43 @@ python3 -m thresholdsign
   （类型错误抛 `TypeError`，空报告、非元组、乱序/重复键或嵌套结构非法
   抛 `ValueError`），再对各项调用 `verify_nonce_leak`；全部为 `True`
   才返回 `True`，任一项合法不匹配即为 `False`；无状态
+- `ReportSeal(report, signature)` — 冻结数据类，字段依次为
+  `NonceLeakReport` 与认证整份报告的 `AggregateSignature`，可按位置构造、
+  按值相等；构造时不校验，核验由 `verify_seal` 负责；不含任何网络、存储或
+  隐藏状态
+- `seal_message(report, public_key) -> bytes` — 生成由门限密钥签署的封口
+  消息（作为 `SigningRound.message`）：记
+  `E = encode_nonce_leak_report(report)`，依次拼接标签
+  `b"ts/nlrs/v1"`、`SHA256(E)` 与 `VARINT(public_key)`；`VARINT` 同其他
+  签名整数，为 4 字节无符号大端长度加最短无符号大端值（正数禁前导零）；
+  不含签名、无状态。非 `NonceLeakReport`、报告字段类型错误或非整数（含
+  布尔）公钥抛 `TypeError`；空报告、乱序/重复键、嵌套结构非法、超长帧、
+  非正公钥或整数编码过长抛 `ValueError`
+- `encode_seal(seal) -> bytes` — 封口报告的规范传输/持久化编码：以标签
+  `b"ts/nlrs/w1"` 开头，其后为 4 字节无符号大端报告编码长度及原始
+  `E = encode_nonce_leak_report(seal.report)`，再写签名帧
+  `VARINT(R) || VARINT(z) || U32(k) || Σ VARINT(id)`；`R`、`z` 与签名者
+  编号取自 `seal.signature`，`k` 为严格升序编号的数量，`VARINT` 为
+  4 字节无符号大端长度加最短无符号大端值（`R` 必须为正；`z` 可为零，零为
+  单字节 `00`，正数禁前导零）；该标签与封口消息标签 `b"ts/nlrs/v1"` 互不
+  相同。输出唯一，只校验字段类型与结构、不要求泄露或签名匹配；类型错误抛
+  `TypeError`，空报告、乱序/重复键、嵌套结构非法、非正 `R`、负 `z`、编号
+  非升序、超长帧或报告/签名者计数超过 2^32-1 抛 `ValueError`
+- `decode_seal(blob) -> ReportSeal` — `encode_seal` 的逆操作，只恢复
+  结构：嵌套报告经 `decode_nonce_leak_report` 还原（回执保持不透明）、
+  不验泄露、不验签、不留状态。拒绝非 `bytes`、坏/缺标签、零或超长报告帧、
+  截断、尾随字节、非规范嵌套报告、`R` 为零、空/零/重复/非升序签名者编号及
+  非规范整数（前导零或零长整数帧）；非 `bytes` 入参抛 `TypeError`，其余
+  非法情形抛 `ValueError`；成功解码后重编码必得到原字节；结构合法但泄露或
+  签名不匹配由 `verify_seal` 返回 `False`
+- `verify_seal(seal, key) -> bool` — 先对 `seal.report` 调用
+  `verify_nonce_leak_report` 逐项复核全部泄露，再以 `key.public_key` 与
+  `key` 的群参数对 `seal_message(seal.report, key.public_key)` 的封口消息
+  调用 `verify_signature`；两者皆验返回 `True`。篡改任一条目或报告编码、
+  跨密钥出示封口或签名不匹配均返回 `False`；非
+  `ReportSeal`/`NonceLeakReport`/`AggregateSignature` 入参或字段类型错误抛
+  `TypeError`，空报告、乱序/重复键、嵌套结构非法、签名或密钥结构非法抛
+  `ValueError`；无状态
 - `Rotation(old, new, ids, t, q, p, g, sig)` — 冻结数据类，可按位置构造、按值
   相等；公开可验证的密钥轮换授权证书：`old`/`new` 为新旧联合公钥，`ids` 为严格
   递增的新成员编号元组，`t` 为新 threshold，`q`/`p`/`g` 为域素数、群素数与
