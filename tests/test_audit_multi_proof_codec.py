@@ -135,11 +135,12 @@ class RoundTripTest(unittest.TestCase):
 class StructureOnlyTest(unittest.TestCase):
     def test_decode_does_not_parse_receipts_or_verify(self):
         receipt = b"not-an-audit-receipt"
+        # n=3 with indices (0, 2) determines exactly one sibling digest.
         proof = AuditMultiProof(
             indices=(0, 2),
             n=3,
             records=((b"m", SigningAudit(receipt)), (b"m2", SigningAudit(b"x"))),
-            siblings=(b"s" * 32, b"t" * 32),
+            siblings=(b"s" * 32,),
         )
         decoded = decode_audit_multi_proof(encode_audit_multi_proof(proof))
         self.assertEqual(decoded.records[0][1].payload, receipt)
@@ -206,9 +207,42 @@ class EncodeValidationTest(unittest.TestCase):
             ),
             dataclasses.replace(proof, siblings=(thirty_two[:-1],)),
             dataclasses.replace(proof, siblings=(thirty_two + b"x",)),
+            # n and the indices determine a unique sibling count: both a
+            # missing and an extra 32-byte digest are rejected.
+            dataclasses.replace(proof, siblings=proof.siblings[:-1]),
+            dataclasses.replace(proof, siblings=proof.siblings + (thirty_two,)),
+            dataclasses.replace(proof, siblings=()),
         ):
             with self.assertRaises(ValueError, msg=repr(bad)):
                 encode_audit_multi_proof(bad)
+
+    def test_sibling_count_matches_make_multi_proof_for_every_subset(self):
+        thirty_two = b"s" * 32
+        for n in range(1, 10):
+            records = tuple(
+                make_record(self.key, f"sized-{i}".encode(), seed=300 + i)
+                for i in range(n)
+            )
+            for mask in range(1, 1 << n):
+                indices = tuple(i for i in range(n) if mask & (1 << i))
+                _msg, proof = make_multi_proof(records, indices)
+                # The encoder accepts exactly the count make_multi_proof emits.
+                encode_audit_multi_proof(proof)
+                if proof.siblings:
+                    with self.assertRaises(
+                        ValueError, msg=f"n={n} indices={indices}"
+                    ):
+                        encode_audit_multi_proof(
+                            dataclasses.replace(
+                                proof, siblings=proof.siblings[:-1]
+                            )
+                        )
+                with self.assertRaises(ValueError, msg=f"n={n} indices={indices}"):
+                    encode_audit_multi_proof(
+                        dataclasses.replace(
+                            proof, siblings=proof.siblings + (thirty_two,)
+                        )
+                    )
 
 
 class DecodeValidationTest(unittest.TestCase):
@@ -351,6 +385,23 @@ class DecodeValidationTest(unittest.TestCase):
         out += b"s" * 31
         with self.assertRaises(ValueError):
             decode_audit_multi_proof(bytes(out))
+
+    def test_sibling_count_mismatch(self):
+        # n=5 with indices (1, 2) determines exactly three sibling digests;
+        # both fewer and more well-formed 32-byte entries are rejected.
+        for count in (0, 2, 4):
+            out = bytearray(WIRE_TAG)
+            out += varint(self.proof.n)
+            out += u32(len(self.proof.indices))
+            for index in self.proof.indices:
+                out += varint(index)
+            out += u32(len(self.proof.records))
+            for message, audit in self.proof.records:
+                out += frame(message) + frame(audit.payload)
+            out += u32(count)
+            out += b"s" * 32 * count
+            with self.assertRaises(ValueError, msg=f"count={count}"):
+                decode_audit_multi_proof(bytes(out))
 
 
 if __name__ == "__main__":

@@ -489,10 +489,14 @@ assert encode_audit_multi_proof(restored) == blob  # 成功解码必可逐字节
 长度 + `SigningAudit.payload` 原字节，回执非空）；最后写 4 字节无符号大端兄弟数及
 按原序排列的逐字 32 字节兄弟摘要。所有 U32 计数与长度均为 4 字节无符号大端；
 `VARINT` 为 4 字节无符号大端长度 + 最短无符号大端值（零是单字节 `00`，正数禁前导
-零）。`encode_audit_multi_proof` 只接受结构合法的证明（非证明或字段类型错误抛
-`TypeError`，空索引、空回执、`n` 越界、计数不符、兄弟宽度错误等抛 `ValueError`），
+零）。兄弟摘要数由 `n` 与 `indices` 唯一确定（逐层重放配对规则所得），两个入口
+均按此校验，缺失或多余都拒绝。`encode_audit_multi_proof` 只接受结构合法的证明
+（非证明或字段类型错误抛
+`TypeError`，空索引、空回执、`n` 越界、计数不符、兄弟宽度错误或兄弟数不符等抛
+`ValueError`），
 不解析回执、不验签；`decode_audit_multi_proof` 拒绝非 `bytes` 入参（`TypeError`）与
-坏标签、空索引或空回执、`n` 越界、计数不符、摘要宽度错误、截断、尾随字节及非规范
+坏标签、空索引或空回执、`n` 越界、计数不符、摘要宽度错误、兄弟数缺失/多余、截断、
+尾随字节及非规范
 整数（`ValueError`）；成功后重编码必逐字节等于输入，结构合法但记录或签名不匹配由
 `check_multi_proof` 返回 `False`。
 
@@ -714,6 +718,19 @@ python3 -m thresholdsign
   解码行的 `(signer_id, R_i)` 分组，同一对不同 payload 至少出现两次才报告
   复用（重复提交同一回执不制造告警）；结果按 `signer_id`、`nonce_commitment`
   升序，与输入顺序无关；函数只检查本批输入，不留历史
+- `encode_nonce_reuse(item) -> bytes` — `NonceReuse` 的规范传输/持久化编码：
+  依次直拼标签 `b"thresholdsign/nr/v1"`、`VARINT(signer_id)`、
+  `VARINT(nonce_commitment)`、U32 回执数及每份回执的帧（U32 长度 +
+  `SigningAudit.payload` 原字节）；U32 为 4 字节无符号大端，`VARINT` 为 4 字节
+  无符号大端长度 + 最短无符号大端值（零是单字节 `00`，正数禁前导零）。
+  `signer_id` 与 `nonce_commitment` 必须为正，回执须两份以上且 `payload` 非空、
+  按字节严格递增；类型错误抛 `TypeError`，非法取值抛 `ValueError`。不解析回执、
+  不验复用，输出唯一、无状态
+- `decode_nonce_reuse(blob) -> NonceReuse` — `encode_nonce_reuse` 的逆操作，
+  仅还原结构：每份回执封装为不透明的 `SigningAudit`，不解析、不验复用
+  （`find_nonce_reuse` 仍是唯一审计入口）。拒绝非 `bytes` 入参（`TypeError`）与
+  坏标签、非正整数、回执不足两份、空/重复/乱序 payload、计数不符、截断、尾随
+  字节及非规范整数（`ValueError`）；成功后重编码必逐字节等于输入
 - `Rotation(old, new, ids, t, q, p, g, sig)` — 冻结数据类，可按位置构造、按值
   相等；公开可验证的密钥轮换授权证书：`old`/`new` 为新旧联合公钥，`ids` 为严格
   递增的新成员编号元组，`t` 为新 threshold，`q`/`p`/`g` 为域素数、群素数与
@@ -852,12 +869,14 @@ python3 -m thresholdsign
   原字节，消息可空）与回执帧（U32 长度 + `SigningAudit.payload`，回执非空）、U32
   兄弟数及按原序的逐字 32 字节兄弟摘要；U32 均为 4 字节无符号大端，`VARINT` 规则同
   单叶证明。只接受结构合法的 `AuditMultiProof`，不解析回执、不验签；输出唯一、无
-  状态。非证明或字段类型错误抛 `TypeError`，空索引/空回执、越界/溢出、计数不符或
-  兄弟宽度错误抛 `ValueError`
+  状态。非证明或字段类型错误抛 `TypeError`，空索引/空回执、越界/溢出、计数不符、
+  兄弟宽度错误或兄弟数与 `n`、`indices` 推导的唯一数量不符（缺失/多余）抛
+  `ValueError`
 - `decode_audit_multi_proof(payload) -> AuditMultiProof` —
   `encode_audit_multi_proof` 的逆操作，仅还原结构、不解析回执、不验签、不留状态：
   拒绝非 `bytes`、坏/缺标签、空索引或空回执、越界的 `n`、记录数与索引数不符、下标
-  非严格递增或越界、非规范整数（前导零或超长）、摘要宽度错误、截断/尾随字节；成功后
+  非严格递增或越界、非规范整数（前导零或超长）、摘要宽度错误、兄弟数缺失/多余、
+  截断/尾随字节；成功后
   重编码必逐字节等于输入。非 `bytes` 入参抛 `TypeError`，其余非法情形抛
   `ValueError`；结构合法但记录或签名不匹配由 `check_multi_proof` 返回 `False`
 - `AuditExtensionProof(old_n, leaves)` — 冻结数据类；追加一致性证明：`old_n` 为

@@ -14,7 +14,8 @@ SigningRound / SignatureShare / SignatureShareRejection / AggregateSignature /
 create_signing_nonce_commitment / create_signing_round / create_signature_share
 / verify_signature_share / aggregate_signature / verify_signature, signing
 audit receipts: SigningAudit / create_audit / check_audit, the stateless
-nonce-reuse audit NonceReuse / find_nonce_reuse, leaked-share recovery from
+nonce-reuse audit NonceReuse / find_nonce_reuse plus its canonical transport
+encoding encode_nonce_reuse / decode_nonce_reuse, leaked-share recovery from
 reused nonces via NonceLeak / recover_leaks, publicly
 verifiable key-rotation authorization: Rotation / rotation_payload /
 verify_rotation, the persistent, multi-hop authorization chain
@@ -84,6 +85,8 @@ __all__ = [
     "check_audit",
     "NonceReuse",
     "find_nonce_reuse",
+    "encode_nonce_reuse",
+    "decode_nonce_reuse",
     "NonceLeak",
     "recover_leaks",
     "Rotation",
@@ -3378,6 +3381,164 @@ def find_nonce_reuse(
 
 
 # ---------------------------------------------------------------------------
+# Canonical nonce-reuse transport: a self-delimiting, byte-for-byte
+# reproducible encoding of a NonceReuse finding for cross-implementation
+# exchange and persistence. Decoding restores structure only — each receipt
+# is wrapped in a SigningAudit left unparsed and the reuse itself is not
+# re-examined, so find_nonce_reuse remains the sole auditor. No state is
+# kept.
+# ---------------------------------------------------------------------------
+
+NONCE_REUSE_WIRE_TAG = b"thresholdsign/nr/v1"
+
+
+def encode_nonce_reuse(item: NonceReuse) -> bytes:
+    """Canonically encode a nonce-reuse finding for transport or persistence.
+
+    The encoding is the direct concatenation, in order, of the tag
+    ``b"thresholdsign/nr/v1"``, ``VARINT(signer_id)``,
+    ``VARINT(nonce_commitment)``, the receipt count as a 4-byte unsigned
+    big-endian integer and then one frame per receipt: a 4-byte unsigned
+    big-endian payload length followed by the raw ``SigningAudit.payload``
+    bytes. A ``VARINT`` is a 4-byte unsigned big-endian body length followed
+    by the shortest unsigned big-endian value (zero is the single byte
+    ``00`` and positive values carry no leading zero).
+
+    Only a structurally legal :class:`NonceReuse` is accepted: ``signer_id``
+    and ``nonce_commitment`` must be positive integers and ``receipts`` a
+    tuple of at least two :class:`SigningAudit` receipts whose payloads are
+    non-empty and strictly increasing by bytes (the order
+    :func:`find_nonce_reuse` reports them in). Wrong field types raise
+    TypeError; non-positive integers, fewer than two receipts, an empty,
+    duplicated or out-of-order payload, or an over-long frame raise
+    ValueError. The receipts are not parsed and the reuse is not verified:
+    :func:`find_nonce_reuse` stays the way to audit a batch afterwards. The
+    output for a given finding is unique and the encoding carries no
+    network, storage or hidden state.
+    """
+    if not isinstance(item, NonceReuse):
+        raise TypeError("item must be a NonceReuse instance")
+    signer_id = item.signer_id
+    nonce_commitment = item.nonce_commitment
+    receipts = item.receipts
+    for name, value in (
+        ("signer_id", signer_id),
+        ("nonce_commitment", nonce_commitment),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"{name} must be an integer")
+    if not isinstance(receipts, tuple):
+        raise TypeError("receipts must be a tuple")
+    for receipt in receipts:
+        if not isinstance(receipt, SigningAudit):
+            raise TypeError("receipts must contain SigningAudit instances")
+        if not isinstance(receipt.payload, bytes):
+            raise TypeError("receipt payloads must be bytes")
+
+    if signer_id <= 0:
+        raise ValueError("signer_id must be positive")
+    if nonce_commitment <= 0:
+        raise ValueError("nonce_commitment must be positive")
+    if len(receipts) < 2:
+        raise ValueError("a nonce reuse carries at least two receipts")
+    if len(receipts) > 0xFFFFFFFF:
+        raise ValueError("too many receipts")
+    previous = None
+    for receipt in receipts:
+        if not receipt.payload:
+            raise ValueError("receipt payloads must be non-empty")
+        if len(receipt.payload) > 0xFFFFFFFF:
+            raise ValueError("receipt encoding too long")
+        if previous is not None and receipt.payload <= previous:
+            raise ValueError("receipt payloads must be strictly increasing")
+        previous = receipt.payload
+
+    buffer = bytearray(NONCE_REUSE_WIRE_TAG)
+    buffer += _encode_varint(signer_id)
+    buffer += _encode_varint(nonce_commitment)
+    buffer += len(receipts).to_bytes(4, "big", signed=False)
+    for receipt in receipts:
+        buffer += len(receipt.payload).to_bytes(4, "big", signed=False)
+        buffer += receipt.payload
+    return bytes(buffer)
+
+
+def decode_nonce_reuse(blob: bytes) -> NonceReuse:
+    """Decode the canonical encoding produced by :func:`encode_nonce_reuse`.
+
+    Accepts only the single canonical form: the tag
+    ``b"thresholdsign/nr/v1"``, the length-prefixed integers ``signer_id``
+    and ``nonce_commitment`` (each a 4-byte unsigned big-endian length
+    followed by its shortest unsigned big-endian value, zero encoded as the
+    single byte ``00``; both must be positive), the 4-byte receipt count
+    (at least two) and then exactly that many receipt frames, each a 4-byte
+    unsigned big-endian non-zero length followed by the raw receipt bytes,
+    the payloads strictly increasing by bytes. A non-bytes argument raises
+    TypeError; a wrong or missing tag, a non-positive integer, fewer than
+    two receipts, an empty, duplicated or out-of-order payload, a count
+    that does not match the frames present, truncation, trailing bytes, or
+    a non-canonical integer (leading zero or over-long length) raises
+    ValueError. A successfully decoded finding re-encodes to exactly the
+    input bytes.
+
+    Decoding only restores the structure: every receipt is stored as an
+    opaque :class:`SigningAudit` and is neither parsed nor verified, and
+    whether the receipts actually evidence a reuse is not examined —
+    :func:`find_nonce_reuse` remains the sole auditor. No state is kept.
+    """
+    if not isinstance(blob, bytes):
+        raise TypeError("blob must be bytes")
+    if not blob.startswith(NONCE_REUSE_WIRE_TAG):
+        raise ValueError("bad nonce reuse tag")
+    offset = len(NONCE_REUSE_WIRE_TAG)
+
+    signer_id, offset = _read_varint(blob, offset, what="nonce reuse signer_id")
+    nonce_commitment, offset = _read_varint(
+        blob, offset, what="nonce reuse nonce_commitment"
+    )
+    if signer_id == 0:
+        raise ValueError("signer_id must be positive")
+    if nonce_commitment == 0:
+        raise ValueError("nonce_commitment must be positive")
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated nonce reuse receipt count")
+    receipt_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    if receipt_count < 2:
+        raise ValueError("a nonce reuse carries at least two receipts")
+
+    receipts = []
+    previous = None
+    for _ in range(receipt_count):
+        if offset + 4 > len(blob):
+            raise ValueError("truncated nonce reuse receipt length")
+        length = int.from_bytes(blob[offset:offset + 4], "big")
+        offset += 4
+        if length == 0:
+            raise ValueError("nonce reuse receipt must be non-empty")
+        if offset + length > len(blob):
+            raise ValueError("truncated nonce reuse receipt")
+        payload = bytes(blob[offset:offset + length])
+        offset += length
+        if previous is not None and payload <= previous:
+            raise ValueError("receipt payloads must be strictly increasing")
+        previous = payload
+        receipts.append(SigningAudit(payload=payload))
+    if offset != len(blob):
+        raise ValueError("trailing bytes after nonce reuse")
+
+    item = NonceReuse(
+        signer_id=signer_id,
+        nonce_commitment=nonce_commitment,
+        receipts=tuple(receipts),
+    )
+    if encode_nonce_reuse(item) != blob:
+        raise ValueError("non-canonical nonce reuse")
+    return item
+
+
+# ---------------------------------------------------------------------------
 # Leaked-share recovery: from two verified status-1 receipts in which one
 # signer republished the same round-one commitment R_i, solve the two
 # Schnorr responses z_i = r_i + c * lambda_i * s_i for the signer's secret
@@ -4224,6 +4385,36 @@ def make_multi_proof(
     return AUDIT_PROOF_ROOT_TAG + _audit_proof_u64(count) + root, proof
 
 
+def _audit_multi_proof_sibling_count(count: int, indices: tuple[int, ...]) -> int:
+    """The exact number of sibling digests a proof of ``indices`` out of ``n`` needs.
+
+    Replays :func:`make_multi_proof`'s level-by-level companion rule on the
+    positions alone: at every level a proven position paired with another
+    proven position, or the last member of an odd-width level (which the tree
+    pairs with itself), consumes no sibling; every other proven position
+    consumes exactly one. The total is uniquely determined by ``n`` and
+    ``indices``, so a proof carrying fewer or more digests is malformed.
+    """
+    needed = 0
+    positions = set(indices)
+    width = count
+    while width > 1:
+        next_positions = set()
+        for position in positions:
+            if width % 2 == 1 and position == width - 1:
+                # Odd tail with no companion: the tree pairs it with itself.
+                pass
+            elif (position ^ 1) in positions:
+                # The companion is itself a disclosed node; nothing to send.
+                pass
+            else:
+                needed += 1
+            next_positions.add(position // 2)
+        positions = next_positions
+        width = (width + 1) // 2
+    return needed
+
+
 def _validate_audit_multi_proof_structure(
     proof: object,
 ) -> tuple[tuple[int, ...], int, tuple[tuple[bytes, SigningAudit], ...], tuple[bytes, ...]]:
@@ -4235,10 +4426,10 @@ def _validate_audit_multi_proof_structure(
     ``indices``/``records`` pair of equal length with strictly increasing
     indices in ``0 <= i < n`` and well-formed ``(bytes, SigningAudit)``
     records with non-empty payloads, and a siblings tuple of 32-byte
-    entries. Wrong field types raise TypeError; illegal bounds, shapes or
-    sibling widths raise ValueError. The number of siblings is *not* checked
-    here — :func:`check_multi_proof` consumes them while rebuilding the root
-    and rejects a short or trailing sequence.
+    entries whose length equals the unique count
+    :func:`_audit_multi_proof_sibling_count` derives from ``n`` and
+    ``indices``. Wrong field types raise TypeError; illegal bounds, shapes,
+    sibling widths or a missing/extra sibling raise ValueError.
     """
     if not isinstance(proof, AuditMultiProof):
         raise TypeError("proof must be an AuditMultiProof instance")
@@ -4293,6 +4484,12 @@ def _validate_audit_multi_proof_structure(
     for sibling in siblings:
         if len(sibling) != AUDIT_PROOF_DIGEST_SIZE:
             raise ValueError("proof.siblings entries must be exactly 32 bytes")
+    expected = _audit_multi_proof_sibling_count(count, indices)
+    if len(siblings) != expected:
+        raise ValueError(
+            "proof.siblings must hold exactly the sibling digests "
+            "proof.n and proof.indices determine"
+        )
     return indices, count, proof_records, siblings
 
 
@@ -4556,9 +4753,10 @@ def encode_audit_multi_proof(proof: AuditMultiProof) -> bytes:
     Only a structurally legal :class:`AuditMultiProof` is accepted — a
     non-proof or wrong field types raise TypeError and illegal bounds, an
     empty index tuple, a record tuple that does not pair one-to-one with the
-    indices, an empty receipt, or a sibling that is not exactly 32 bytes
-    raise ValueError, exactly as :func:`check_multi_proof`'s structural
-    checks do — but the receipts are not parsed and no signature is
+    indices, an empty receipt, a sibling that is not exactly 32 bytes, or a
+    sibling count that differs from the unique count ``n`` and ``indices``
+    determine raise ValueError, exactly as :func:`check_multi_proof`'s
+    structural checks do — but the receipts are not parsed and no signature is
     checked: :func:`check_multi_proof` stays the way to verify a proof
     afterwards. The output for a given proof is unique and the encoding
     carries no network, storage or hidden state.
@@ -4610,7 +4808,9 @@ def decode_audit_multi_proof(payload: bytes) -> AuditMultiProof:
     an empty index list or receipt, an out-of-range ``n``, a record count
     that does not match the index count, indices that are not strictly
     increasing or lie outside ``0 <= i < n``, a sibling that is not exactly
-    32 bytes, truncation, trailing bytes, or a non-canonical integer
+    32 bytes, a sibling count that differs from the unique count ``n`` and
+    the indices determine (missing or extra digests alike), truncation,
+    trailing bytes, or a non-canonical integer
     (leading zero or over-long length) raises ValueError. A successfully
     decoded proof re-encodes to exactly the input bytes.
 
