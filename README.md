@@ -731,6 +731,31 @@ python3 -m thresholdsign
   `bytes`、坏/缺标签、零或非规范（前导零、超长）整数、回执少于两份、空/重复/
   乱序 payload、声明计数与帧数不符、截断与尾随字节；非 `bytes` 入参抛
   `TypeError`，其余非法情形抛 `ValueError`；成功后重编码必逐字节等于输入
+- `encode_nonce_leak(item) -> bytes` — 泄露份额证据的规范传输/持久化编码：
+  以标签 `b"thresholdsign/nl/v1"` 开头，依次写 `signer_id`、`commitment`、
+  `share` 三个 `VARINT`（前两者须为正、`share` 非负）、常量 U32 回执数 2
+  及两回执的 `U32(len(payload)) || payload` 帧；payload 非空且按字节严格
+  递增、无重复，恰如 `recover_leaks` 的输出；`VARINT` 与 U32 规则同其他
+  规范编码。非 `NonceLeak` 或字段类型错误（含布尔冒充整数、非元组回执、
+  非 `SigningAudit`、payload 非 `bytes`）抛 `TypeError`；整数越界、回执
+  非两份、空/重复/乱序 payload 或超长帧抛 `ValueError`；不解析回执、不验
+  泄露；输出唯一、无状态
+- `decode_nonce_leak(blob) -> NonceLeak` — `encode_nonce_leak` 的逆操作，
+  仅构造不透明 `SigningAudit`、不解析回执、不验泄露、不留状态：拒绝非
+  `bytes`、坏/缺标签、零 `signer_id`/`commitment` 或非规范（前导零、超长）
+  整数、回执数非 2、空/重复/乱序 payload、截断与尾随字节；非 `bytes` 入参
+  抛 `TypeError`，其余非法情形抛 `ValueError`；成功后重编码必逐字节等于
+  输入
+- `verify_nonce_leak(item, key) -> bool` — 仅凭签名密钥复核泄露声明，无需
+  原消息：先按 `encode_nonce_leak` 的结构要求校验 `item`（类型错误抛
+  `TypeError`，结构非法抛 `ValueError`），再逐份解码两张回执（结构非法
+  抛 `ValueError`），由回执内消息摘要重算 Fiat-Shamir 挑战并复核公钥、
+  聚合 `R`、逐行份额方程 `g^z_i = R_i·Y_i^(c·λ_i)` 与聚合式
+  `g^z = R·Y^c`，两回执均须为 status=1；随后按各自签名者集合算
+  `a = c·λ_i mod q`，两 `a` 须不同、两行承诺须相同且等于
+  `item.commitment`，解得 `s = (z1 - z2)/(a1 - a2) mod q` 须等于
+  `item.share` 且满足 `g^s = Y_i mod p`；任何不匹配返回 `False`，全部
+  一致才返回 `True`；无状态
 - `Rotation(old, new, ids, t, q, p, g, sig)` — 冻结数据类，可按位置构造、按值
   相等；公开可验证的密钥轮换授权证书：`old`/`new` 为新旧联合公钥，`ids` 为严格
   递增的新成员编号元组，`t` 为新 threshold，`q`/`p`/`g` 为域素数、群素数与
