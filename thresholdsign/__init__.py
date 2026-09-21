@@ -22,7 +22,10 @@ RotationChain / verify_rotation_chain / encode_rotation_chain /
 decode_rotation_chain, and the stateless, threshold-Schnorr-authenticated
 audit chain: AuditChain / audit_chain_payload / verify_audit_chain.
 Merkle inclusion proofs over a chain's records: AuditProof / make_proof /
-check_proof, plus their canonical transport encoding encode_audit_proof /
+check_proof, the compact multi-record proofs AuditMultiProof /
+make_multi_proof / check_multi_proof that certify several ordered records
+with the one root signature, plus their canonical transport encoding
+encode_audit_proof /
 decode_audit_proof. Append-only consistency proofs over the same tree:
 AuditExtensionProof / make_extension / check_extension, letting an observer
 verify — from two threshold signatures alone — that an old record sequence
@@ -100,6 +103,9 @@ __all__ = [
     "AuditProof",
     "make_proof",
     "check_proof",
+    "AuditMultiProof",
+    "make_multi_proof",
+    "check_multi_proof",
     "encode_audit_proof",
     "decode_audit_proof",
     "AuditExtensionProof",
@@ -4097,6 +4103,283 @@ def check_proof(
     signed_message = AUDIT_PROOF_ROOT_TAG + _audit_proof_u64(count) + node
     if not check_audit(message, audit, key):
         return False
+    return verify_signature(
+        signed_message,
+        signature,
+        public_key,
+        group_prime=group_prime,
+        generator=generator,
+        prime=field_prime,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Compact multi-record inclusion proofs: one root signature certifies that
+# several disclosed records belong to the same ordered, indexed set. The tree
+# is exactly make_proof's tree; a single AuditMultiProof carries only the
+# siblings that are not themselves disclosed records (or odd-tail self-pairs),
+# so the whole set can be audited from one signature without hidden state.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AuditMultiProof:
+    """A compact Merkle inclusion proof for several records at once.
+
+    The fields, in order, are ``indices`` (the proven leaf positions as a
+    non-empty tuple of strictly increasing, unique non-negative integers),
+    ``n`` (the total, non-empty record count), ``records`` (the proven
+    records, one ``(message, SigningAudit)`` pair per entry of
+    ``indices``, in the same order) and ``siblings`` (the 32-byte sibling
+    digests consumed from the leaf level up to the root, in ascending level
+    order; the tuple is empty when no companion digests are needed). The
+    dataclass is frozen, positionally constructible and compared by value,
+    and carries no network, storage or hidden state. Field types and bounds
+    are not checked at construction time — :func:`check_multi_proof` is the
+    way to test a proof afterwards.
+    """
+
+    indices: tuple[int, ...]
+    n: int
+    records: tuple[tuple[bytes, SigningAudit], ...]
+    siblings: tuple[bytes, ...]
+
+
+def make_multi_proof(
+    records: tuple[tuple[bytes, SigningAudit], ...],
+    indices: tuple[int, ...],
+) -> tuple[bytes, AuditMultiProof]:
+    """Build the root statement and a compact inclusion proof for several records.
+
+    ``records`` must be the same non-empty, order-preserving tuple of
+    ``(message, SigningAudit)`` pairs an :class:`AuditChain` seals, with
+    ``n == len(records)``, and ``indices`` a non-empty tuple of leaf
+    positions to prove. The tree is exactly :func:`make_proof`'s tree.
+    Returns ``(message, proof)`` where ``message`` is
+    ``b"am/r" || U64(n) || root`` — the bytes to be threshold-signed — and
+    ``proof`` is the :class:`AuditMultiProof` whose ``records`` pair up one
+    to one with ``indices``. Its ``siblings`` are collected level by level,
+    in ascending level order (leaves upward), one entry per needed
+    companion: at a level a position is paired left to right; when the
+    companion position is itself a proven node carried in the proof, or the
+    node is the last member of an odd-width level (which the tree pairs with
+    itself), no sibling is appended; otherwise the companion digest is.
+    Proven nodes from lower levels feed the level above exactly as in the
+    tree, so no digest is sent twice.
+
+    Wrong argument types raise TypeError: a non-tuple record sequence or
+    index sequence, a non-integer (including boolean) index, or a malformed
+    record (exactly the rules of :func:`audit_chain_payload`). An empty
+    record sequence or index tuple, a record count that does not fit the
+    8-byte counter, indices that are not strictly increasing and unique, or
+    an index outside ``0 <= i < n`` raises ValueError.
+    """
+    if not isinstance(indices, tuple):
+        raise TypeError("indices must be a tuple")
+    count = _check_audit_chain_records(records)
+    if count > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("too many records")
+    if len(indices) == 0:
+        raise ValueError("indices must be non-empty")
+    previous = -1
+    for index in indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("each index must be an integer")
+        if index <= previous:
+            raise ValueError("indices must be strictly increasing and unique")
+        if index < 0 or index >= count:
+            raise ValueError("index out of range")
+        previous = index
+
+    levels = _audit_proof_levels(records)
+
+    siblings: list[bytes] = []
+    positions = set(indices)
+    for level in levels[:-1]:
+        width = len(level)
+        padded = level if width % 2 == 0 else level + level[-1:]
+        next_positions = set()
+        for position in sorted(positions):
+            if width % 2 == 1 and position == width - 1:
+                # Odd tail with no companion: the tree pairs it with itself.
+                pass
+            elif (position ^ 1) in positions:
+                # The companion is itself a disclosed node; nothing to send.
+                pass
+            else:
+                siblings.append(padded[position ^ 1])
+            next_positions.add(position // 2)
+        positions = next_positions
+
+    root = levels[-1][0]
+    proof_records = tuple(records[index] for index in indices)
+    proof = AuditMultiProof(
+        indices=tuple(indices),
+        n=count,
+        records=proof_records,
+        siblings=tuple(siblings),
+    )
+    return AUDIT_PROOF_ROOT_TAG + _audit_proof_u64(count) + root, proof
+
+
+def _validate_audit_multi_proof_structure(
+    proof: object,
+) -> tuple[tuple[int, ...], int, tuple[tuple[bytes, SigningAudit], ...], tuple[bytes, ...]]:
+    """Type- and structure-check an :class:`AuditMultiProof`, returning its fields.
+
+    Only the container structure is checked: the receipt payloads are kept
+    opaque and neither they nor the siblings are cryptographically verified
+    here. The bounds are ``0 < n < 2**64``, a non-empty
+    ``indices``/``records`` pair of equal length with strictly increasing
+    indices in ``0 <= i < n`` and well-formed ``(bytes, SigningAudit)``
+    records with non-empty payloads, and a siblings tuple of 32-byte
+    entries. Wrong field types raise TypeError; illegal bounds, shapes or
+    sibling widths raise ValueError. The number of siblings is *not* checked
+    here — :func:`check_multi_proof` consumes them while rebuilding the root
+    and rejects a short or trailing sequence.
+    """
+    if not isinstance(proof, AuditMultiProof):
+        raise TypeError("proof must be an AuditMultiProof instance")
+    indices = proof.indices
+    count = proof.n
+    proof_records = proof.records
+    siblings = proof.siblings
+    if not isinstance(indices, tuple):
+        raise TypeError("proof.indices must be a tuple")
+    if not isinstance(count, int) or isinstance(count, bool):
+        raise TypeError("proof.n must be an integer")
+    if not isinstance(proof_records, tuple):
+        raise TypeError("proof.records must be a tuple")
+    if not isinstance(siblings, tuple):
+        raise TypeError("proof.siblings must be a tuple")
+
+    if count <= 0:
+        raise ValueError("proof.n must be positive")
+    if count > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("too many records")
+    if len(indices) == 0:
+        raise ValueError("proof.indices must be non-empty")
+    if len(indices) != len(proof_records):
+        raise ValueError("proof.records must pair one-to-one with proof.indices")
+
+    previous = -1
+    for index in indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("proof.indices entries must be integers")
+        if index <= previous:
+            raise ValueError("proof.indices must be strictly increasing and unique")
+        if index < 0 or index >= count:
+            raise ValueError("proof.indices entry out of range")
+        previous = index
+
+    for record in proof_records:
+        if not isinstance(record, tuple) or len(record) != 2:
+            raise TypeError("each proof record must be a (message, audit) tuple")
+        message, audit = record
+        if not isinstance(message, bytes):
+            raise TypeError("proof record message must be bytes")
+        if not isinstance(audit, SigningAudit):
+            raise TypeError("proof record audit must be a SigningAudit instance")
+        if not isinstance(audit.payload, bytes):
+            raise TypeError("proof record audit payload must be bytes")
+        if not audit.payload:
+            raise ValueError("proof record audit payload must be non-empty")
+
+    for sibling in siblings:
+        if not isinstance(sibling, bytes):
+            raise TypeError("proof.siblings entries must be bytes")
+    for sibling in siblings:
+        if len(sibling) != AUDIT_PROOF_DIGEST_SIZE:
+            raise ValueError("proof.siblings entries must be exactly 32 bytes")
+    return indices, count, proof_records, siblings
+
+
+def check_multi_proof(
+    proof: AuditMultiProof,
+    signature: AggregateSignature,
+    key: SigningDKGResult,
+) -> bool:
+    """Rebuild a multi-proof's Merkle root and verify its records and signature.
+
+    Every disclosed record's leaf digest is recomputed from its position and
+    ``(message, audit)`` exactly as in :func:`make_proof`. The root is then
+    rebuilt level by level while consuming ``proof.siblings`` in ascending
+    level order: the current level holds the digests of the proven nodes at
+    their current positions, paired left to right; when a companion is
+    itself a current-level node its digest is used directly, when the node
+    is the last member of an odd-width level it is paired with itself, and
+    otherwise the next 32-byte entry of ``siblings`` is consumed. The
+    current width contracts as ``(width + 1) // 2``. Every embedded record
+    is re-checked with :func:`check_audit` against ``key`` (in index order),
+    and the statement ``b"am/r" || U64(n) || root`` is checked as
+    ``signature``'s threshold Schnorr message via :func:`verify_signature`.
+    Returns ``True`` only when the rebuild consumes every sibling exactly
+    and reaches the single signed root, every receipt matches its message
+    and the key, and the signature verifies; a well-formed proof whose
+    records, indices, siblings, root or signature was tampered with —
+    records swapped or altered, a missing, extra or misplaced sibling — or
+    which is presented under another key, returns ``False``.
+
+    A non-:class:`AuditMultiProof` or non-:class:`AggregateSignature`
+    argument or any wrong field type (non-tuple indices/records/siblings, a
+    non-integer ``n`` or index including booleans, a non-bytes record
+    message or sibling, a non-:class:`SigningAudit` receipt) raises
+    TypeError; a non-positive or over-64-bit ``n``, empty indices, an index
+    out of range or not strictly increasing, a records tuple that does not
+    pair one-to-one with the indices, an empty receipt, a sibling that is
+    not exactly 32 bytes, too few or too many siblings for the indicated
+    positions, or a structurally illegal receipt, signature or ``key``
+    raises ValueError, exactly as :func:`check_audit` and
+    :func:`verify_signature` would.
+    """
+    indices, count, proof_records, siblings = _validate_audit_multi_proof_structure(proof)
+    if not isinstance(signature, AggregateSignature):
+        raise TypeError("signature must be an AggregateSignature instance")
+
+    _result, public_key, field_prime, group_prime, generator = _check_signing_setup(key)
+    _check_signing_dkg_structure(key)
+
+    nodes = {
+        index: _audit_proof_leaf(index, message, audit)
+        for index, (message, audit) in zip(indices, proof_records)
+    }
+    pending = iter(siblings)
+    width = count
+    while width > 1:
+        next_nodes = {}
+        for position in sorted(nodes):
+            parent = position // 2
+            if parent in next_nodes:
+                continue
+            if width % 2 == 1 and position == width - 1:
+                # Odd tail with no companion: pair the node with itself.
+                next_nodes[parent] = _audit_proof_node(nodes[position], nodes[position])
+            elif (position ^ 1) in nodes:
+                left = position if position % 2 == 0 else position ^ 1
+                next_nodes[parent] = _audit_proof_node(nodes[left], nodes[left ^ 1])
+            else:
+                try:
+                    sibling = next(pending)
+                except StopIteration:
+                    raise ValueError("proof.siblings is missing entries") from None
+                if position % 2 == 0:
+                    next_nodes[parent] = _audit_proof_node(nodes[position], sibling)
+                else:
+                    next_nodes[parent] = _audit_proof_node(sibling, nodes[position])
+        nodes = next_nodes
+        width = (width + 1) // 2
+
+    try:
+        next(pending)
+    except StopIteration:
+        pass
+    else:
+        raise ValueError("proof.siblings has extra entries")
+
+    signed_message = AUDIT_PROOF_ROOT_TAG + _audit_proof_u64(count) + nodes[0]
+    for (message, audit) in proof_records:
+        if not check_audit(message, audit, key):
+            return False
     return verify_signature(
         signed_message,
         signature,

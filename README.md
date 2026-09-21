@@ -437,6 +437,40 @@ assert encode_audit_proof(restored) == blob  # 成功解码必可逐字节复现
 无符号大端长度 + 原字节，消息可空、回执非空。约束 `0 < n < 2^64`、`0 <= i < n`、
 路径数恰为 `(n-1).bit_length()`。
 
+### 紧凑多记录包含证明
+
+要一次向第三方证明若干公开记录同属一个有序集合（同一棵树）而只出示一个根签名时，
+可用紧凑多记录证明，它与单叶证明共用完全相同的树与根消息，旧接口与单叶证明均不变。
+冻结数据类 `AuditMultiProof(indices, n, records, siblings)` 字段依次为待证叶下标
+元组 `tuple[int, ...]`（非空、严格递增且互不相同）、记录总数 `int`、与下标逐项对应
+的记录元组 `tuple[tuple[bytes, SigningAudit], ...]` 与按层升序（自叶向根）排列的
+兄弟摘要元组 `tuple[bytes, ...]`（每项恰为 32 字节），可按位置构造、按值相等且
+不可变，不带任何隐藏状态。
+
+`make_multi_proof(records, indices) -> tuple[bytes, AuditMultiProof]` 中 `n` 为
+`records` 总数，记录沿用审计链的非空保序 `(message, SigningAudit)` 结构；树规则与
+`make_proof` 完全一致，返回同样的待签消息 `b"am/r" || U64(n) || root` 与多记录证明。
+每层从左到右配对：兄弟本身也是被选记录（其摘要已由证明携带）或当前节点是奇数宽度
+层的最后一个（以自身配对）时省略兄弟，否则追加一个 32 字节摘要；摘要只发送一次：
+
+```python
+from thresholdsign import make_multi_proof, check_multi_proof
+
+message, proof = make_multi_proof(records, (0, 2, 4))
+signature = sign_threshold(key, message)        # 同一个根签名覆盖多条记录
+assert check_multi_proof(proof, signature, key)
+```
+
+`check_multi_proof(proof, signature, key) -> bool` 先由各下标与记录重算叶摘要，再
+逐层按层升序消费 `siblings` 重建根：同伴本身在当前层则直接取其摘要，奇数尾无同伴则
+以自身配对，否则消费下一个兄弟；宽度按 `(width+1)//2` 上收。重建恰好用尽全部兄弟
+并唯一到达根后，逐条对记录调用 `check_audit`，再对
+`b"am/r"||U64(n)||root` 调用 `verify_signature`；全部一致返回 `True`，结构合法但
+不匹配（记录互换或改动、下标改动、兄弟缺失/多余/错位、摘要或签名不符、换密钥核验
+等）返回 `False`。类型错误抛 `TypeError`；空索引、`n` 非正或超过 2^64-1、下标
+越界或非严格递增、`records` 与 `indices` 数量不同、空回执、兄弟非 32 字节或数量
+缺失/多余、回执或签名结构非法抛 `ValueError`。
+
 ### 追加一致性证明
 
 要向第三方证明一条旧记录序列是某条更长新序列的前缀，而不必公开任何消息或回执时，
@@ -753,6 +787,28 @@ python3 -m thresholdsign
   合法但不匹配返回 `False`。非 `AuditProof`/`AggregateSignature` 入参或字段类型
   错误抛 `TypeError`，`n` 非正或超 2^64-1、`i` 越界、空回执、路径长度不符
   （恰为 `(n-1).bit_length()`）或兄弟非 32 字节、回执/签名结构非法抛 `ValueError`
+- `AuditMultiProof(indices, n, records, siblings)` — 冻结数据类；紧凑多记录包含
+  证明：字段依次为非空、严格递增唯一的叶下标元组 `tuple[int, ...]`、记录总数 `int`、
+  与下标逐项对应的 `(message, SigningAudit)` 记录元组、按层升序（自叶向根）消费的
+  32 字节兄弟摘要元组；可按位置构造、按值相等、不可变，构造时不校验，核验由
+  `check_multi_proof` 负责
+- `make_multi_proof(records, indices) -> tuple[bytes, AuditMultiProof]` — `n` 为
+  `records` 总数，沿用 `make_proof` 的非空保序记录结构与同一棵 SHA256 Merkle 树，
+  返回待签消息 `b"am/r"||U64(n)||root` 与多记录证明。每层从左到右配对：兄弟已被
+  选中（摘要已在证明中）或当前节点是奇数宽度层最后一个（自身配对）则省略，否则追加
+  一个 32 字节摘要。`indices` 必须非空、严格递增唯一且在 `0..n-1`，且
+  `proof.records` 与之等长逐项对应。索引序列非元组、索引非整数（含布尔）或记录类型
+  错误抛 `TypeError`；空记录/空索引、计数超 2^64-1、索引重复/非递增/越界抛
+  `ValueError`
+- `check_multi_proof(proof, signature, key) -> bool` — 由各下标与记录重算叶摘要，
+  逐层按层升序消费 `proof.siblings` 重建根（同伴已在当前层则直接取其摘要，奇数尾以
+  自身配对，否则取下一个兄弟；宽度按 `(width+1)//2` 上收），恰好用尽兄弟并唯一
+  到达根后逐条调用 `check_audit`，再对 `b"am/r"||U64(n)||root` 调用
+  `verify_signature`；全部一致返回 `True`，结构合法但不匹配（记录互换/改动、下标、
+  兄弟缺失/多余/错位、摘要或签名不符、换密钥等）返回 `False`。非
+  `AuditMultiProof`/`AggregateSignature` 入参或字段类型错误抛 `TypeError`，空
+  索引、`n` 非正或超 2^64-1、下标越界/非严格递增、`records` 与 `indices` 数量
+  不同、空回执、兄弟非 32 字节或数量缺失/多余、回执/签名结构非法抛 `ValueError`
 - `encode_audit_proof(proof) -> bytes` — 证明的规范传输/持久化编码：依次直拼
   标签 `b"thresholdsign/audit-proof/v1"`、`VARINT(i)`、`VARINT(n)`、消息帧、
   回执帧、4 字节路径数及逐字 32 字节路径项；`VARINT` 为 4 字节长度 + 最短无符号
