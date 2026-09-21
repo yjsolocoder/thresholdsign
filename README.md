@@ -923,6 +923,29 @@ python3 -m thresholdsign
   `TypeError`，`total` 非正或达到 2^64、`indices` 空/越界/非严格递增
   、`seals` 与 `indices` 不一一对应、兄弟项非 32 字节、兄弟数量不符
   或封印、签名、密钥结构非法抛 `ValueError`；无状态
+- `encode_history_multi_proof(proof) -> bytes` — 多封印历史包含证明的规范
+  传输/持久化编码：记 `E = encode_seal(proof.seals[k])`，按字段原序依次
+  拼接标签 `b"thresholdsign/seal-history-multi-proof/v1"`、
+  `VARINT(total)`、`U32` 索引数及按严格递增顺序的各 `VARINT(index)`、
+  `U32` 封印数（与索引数相等）及各封印帧 `U32(len(E)) || E`（帧非空）、
+  `U32` 兄弟数及自叶向根、层内左到右原序直拼的兄弟摘要（各 32 字节）。
+  兄弟数由 `total` 与 `indices` 唯一推导（紧致多证明中既非奇数尾自配、
+  配对位又不是已披露节点的已证节点各配一个兄弟），缺失或多余一律拒绝。
+  `VARINT` 为 4 字节无符号大端长度加最短无符号大端整数（零为单字节
+  `00`，正数禁前导零），`U32` 为 4 字节无符号大端；要求
+  `0 < total < 2^64`、索引非空、升序唯一且界内、封印与索引等数。非
+  `SealHistoryMultiProof` 入参或字段、兄弟项、嵌套封印类型错抛
+  `TypeError`；越界、计数/宽度不符、空索引、嵌套封印结构非法或超长帧
+  抛 `ValueError`；不验封印、不验签，输出唯一、无状态
+- `decode_history_multi_proof(blob) -> SealHistoryMultiProof` —
+  `encode_history_multi_proof` 的逆操作，嵌套封印经 `decode_seal`
+  还原，不验封印、不验签：拒绝非 `bytes`、坏/缺标签、非正或达到 2^64
+  的 `total`、空索引、`VARINT` 非规范、索引越界或非严格递增、封印数
+  与索引数不符、空/截断封印帧、兄弟计数与 `total`/`indices` 推导结果
+  不符、兄弟项非 32 字节、截断及尾随字节；非 `bytes` 入参抛
+  `TypeError`，其余非法情形抛 `ValueError`；成功后重编码必逐字节等于
+  输入，结构合法但封印或签名不匹配由 `check_history_multi_proof`
+  返回 `False`
 - `Rotation(old, new, ids, t, q, p, g, sig)` — 冻结数据类，可按位置构造、按值
   相等；公开可验证的密钥轮换授权证书：`old`/`new` 为新旧联合公钥，`ids` 为严格
   递增的新成员编号元组，`t` 为新 threshold，`q`/`p`/`g` 为域素数、群素数与

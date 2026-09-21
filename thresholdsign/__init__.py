@@ -31,7 +31,8 @@ check_history_proof that locate one seal in a sealed history without
 the full history and the compact multi-seal proofs
 SealHistoryMultiProof / make_history_multi_proof /
 check_history_multi_proof that locate several seals at once with the
-one root signature, publicly
+one root signature, plus their canonical transport encoding
+encode_history_multi_proof / decode_history_multi_proof, publicly
 verifiable key-rotation authorization: Rotation / rotation_payload /
 verify_rotation, the persistent, multi-hop authorization chain
 RotationChain / verify_rotation_chain / encode_rotation_chain /
@@ -129,6 +130,8 @@ __all__ = [
     "SealHistoryMultiProof",
     "make_history_multi_proof",
     "check_history_multi_proof",
+    "encode_history_multi_proof",
+    "decode_history_multi_proof",
     "Rotation",
     "rotation_payload",
     "verify_rotation",
@@ -6748,7 +6751,199 @@ def check_history_multi_proof(
 
 
 # ---------------------------------------------------------------------------
-# Canonical seal-history-proof transport: a self-delimiting, byte-for-byte
+# Canonical seal-history-multi-proof transport: a self-delimiting,
+# byte-for-byte reproducible encoding of a SealHistoryMultiProof for
+# cross-implementation exchange and persistence. Decoding restores structure
+# only — the nested seals go through decode_seal, no seal or signature is
+# checked and no state is kept, so check_history_multi_proof remains the sole
+# verifier afterwards.
+# ---------------------------------------------------------------------------
+
+SEAL_HISTORY_MULTI_PROOF_WIRE_TAG = (
+    b"thresholdsign/seal-history-multi-proof/v1"
+)
+
+
+def encode_history_multi_proof(proof: SealHistoryMultiProof) -> bytes:
+    """Canonically encode a multi-seal history proof for transport/storage.
+
+    The encoding is the direct concatenation, in order, of the tag
+    ``b"thresholdsign/seal-history-multi-proof/v1"``, ``VARINT(total)``,
+    the index count as a 4-byte unsigned big-endian integer, one
+    ``VARINT(index)`` per proven leaf in the proof's strictly increasing
+    order, the seal count as a 4-byte unsigned big-endian integer, one
+    frame per seal — the 4-byte unsigned big-endian length ``len(E)``
+    followed by the raw seal bytes ``E = encode_seal(seal)`` (never
+    empty) — and finally the sibling count as a 4-byte unsigned
+    big-endian integer followed by the raw 32-byte sibling digests in
+    their original leaf-to-root, left-to-right order. A ``VARINT`` is a
+    4-byte unsigned big-endian body length followed by the shortest
+    unsigned big-endian value (zero is the single byte ``00`` and
+    positive values carry no leading zero). The indices must be
+    non-empty, strictly increasing, unique and within
+    ``0 <= i < total``, the seal count must equal the index count, and
+    the sibling count must be the unique one derived from ``total`` and
+    the indices by the compact multi-proof walk.
+
+    Only a structurally legal :class:`SealHistoryMultiProof` is accepted
+    — a non-proof or wrong field/entry types raise TypeError and illegal
+    bounds, an empty index tuple, a seal tuple that does not pair
+    one-to-one with the indices, a sibling that is not exactly 32 bytes,
+    a sibling count other than the one ``total`` and the indices
+    determine, a structurally illegal nested seal or an over-long frame
+    raise ValueError, exactly as :func:`check_history_multi_proof`'s
+    structural checks do — but the seals are not verified and no
+    signature is checked: :func:`check_history_multi_proof` stays the
+    way to verify a proof afterwards. The output for a given proof is
+    unique and the encoding carries no network, storage or hidden
+    state.
+    """
+    if not isinstance(proof, SealHistoryMultiProof):
+        raise TypeError(
+            "proof must be a SealHistoryMultiProof instance"
+        )
+    indices, total, seals, siblings = _validate_history_multi_proof_structure(
+        proof
+    )
+    if len(indices) > 0xFFFFFFFF:
+        raise ValueError("too many indices")
+    if len(siblings) > 0xFFFFFFFF:
+        raise ValueError("too many siblings")
+
+    encoded_seals = []
+    for position, seal in enumerate(seals):
+        encoded_seal = encode_seal(seal)
+        if len(encoded_seal) > 0xFFFFFFFF:
+            raise ValueError(
+                f"history multi-proof seal {position + 1} encoding too long"
+            )
+        encoded_seals.append(encoded_seal)
+
+    buffer = bytearray(SEAL_HISTORY_MULTI_PROOF_WIRE_TAG)
+    buffer += _encode_varint(total)
+    buffer += len(indices).to_bytes(4, "big", signed=False)
+    for index in indices:
+        buffer += _encode_varint(index)
+    buffer += len(encoded_seals).to_bytes(4, "big", signed=False)
+    for encoded_seal in encoded_seals:
+        buffer += len(encoded_seal).to_bytes(4, "big", signed=False)
+        buffer += encoded_seal
+    buffer += len(siblings).to_bytes(4, "big", signed=False)
+    for sibling in siblings:
+        buffer += sibling
+    return bytes(buffer)
+
+
+def decode_history_multi_proof(blob: bytes) -> SealHistoryMultiProof:
+    """Decode the canonical encoding produced by :func:`encode_history_multi_proof`.
+
+    Accepts only the single canonical form: the tag
+    ``b"thresholdsign/seal-history-multi-proof/v1"``, the length-prefixed
+    integer ``total`` (a 4-byte unsigned big-endian length followed by
+    its shortest unsigned big-endian value, zero encoded as the single
+    byte ``00``), the 4-byte non-zero index count followed by one
+    canonical ``VARINT`` per strictly increasing index, the 4-byte seal
+    count (which must equal the index count) followed by that many
+    non-empty seal frames (a 4-byte non-zero length followed by bytes
+    that :func:`decode_seal` accepts), and finally the 4-byte sibling
+    count followed by exactly that many raw 32-byte sibling digests,
+    where the count must be the unique one derived from ``total`` and
+    the disclosed indices. A non-bytes argument raises TypeError; a
+    wrong or missing tag, an empty index list, a non-positive or
+    over-64-bit ``total``, an index outside ``0 <= i < total``, indices
+    that are not strictly increasing and unique, a seal count that does
+    not match the index count, an empty, truncated or non-canonical
+    seal frame, a missing or extra sibling relative to the count
+    ``total`` and the indices require, a sibling that is not exactly 32
+    bytes, truncation, trailing bytes, or a non-canonical integer
+    (leading zero or over-long length) raises ValueError. A
+    successfully decoded proof re-encodes to exactly the input bytes.
+
+    Decoding only restores the structure: each nested seal is decoded
+    with :func:`decode_seal` (which verifies no finding and checks no
+    signature) and nothing else is verified. A structurally legal proof
+    whose seals do not verify or whose root signature is invalid is
+    returned normally, and :func:`check_history_multi_proof` reports it
+    as ``False``.
+    """
+    if not isinstance(blob, bytes):
+        raise TypeError("blob must be bytes")
+    if not blob.startswith(SEAL_HISTORY_MULTI_PROOF_WIRE_TAG):
+        raise ValueError("bad seal history multi-proof tag")
+    offset = len(SEAL_HISTORY_MULTI_PROOF_WIRE_TAG)
+
+    total, offset = _read_varint(
+        blob, offset, what="seal history multi-proof total"
+    )
+    if total <= 0:
+        raise ValueError("seal history multi-proof total must be positive")
+    if total > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("seal history multi-proof total too large")
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated seal history multi-proof index count")
+    index_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    if index_count == 0:
+        raise ValueError("seal history multi-proof indices must be non-empty")
+    indices = []
+    for _ in range(index_count):
+        index, offset = _read_varint(
+            blob, offset, what="seal history multi-proof index"
+        )
+        indices.append(index)
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated seal history multi-proof seal count")
+    seal_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    if seal_count != index_count:
+        raise ValueError(
+            "seal history multi-proof seal count must match the index count"
+        )
+    seals = []
+    for position in range(seal_count):
+        encoded_seal, offset = _read_audit_proof_block(
+            blob,
+            offset,
+            what=f"seal history multi-proof seal {position + 1}",
+        )
+        seals.append(decode_seal(encoded_seal))
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated seal history multi-proof sibling count")
+    sibling_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    siblings = []
+    for _ in range(sibling_count):
+        if offset + SEAL_HISTORY_PROOF_DIGEST_SIZE > len(blob):
+            raise ValueError("truncated seal history multi-proof sibling")
+        siblings.append(
+            bytes(
+                blob[
+                    offset:offset + SEAL_HISTORY_PROOF_DIGEST_SIZE
+                ]
+            )
+        )
+        offset += SEAL_HISTORY_PROOF_DIGEST_SIZE
+    if offset != len(blob):
+        raise ValueError("trailing bytes after seal history multi-proof")
+
+    proof = SealHistoryMultiProof(
+        indices=tuple(indices),
+        total=total,
+        seals=tuple(seals),
+        siblings=tuple(siblings),
+    )
+    _validate_history_multi_proof_structure(proof)
+    if encode_history_multi_proof(proof) != blob:
+        raise ValueError("non-canonical seal history multi-proof encoding")
+    return proof
+
+
+# ---------------------------------------------------------------------------
+# Canonical seal-history-proof transport: a self-delimiting,
+# byte-for-byte
 # reproducible encoding of a SealHistoryProof for cross-implementation
 # exchange and persistence. Decoding restores structure only — the nested
 # seal goes through decode_seal, no seal or signature is checked and no state
