@@ -873,6 +873,25 @@ python3 -m thresholdsign
   `SealHistoryProof`/`AggregateSignature` 入参或字段类型错误抛
   `TypeError`，`total` 非正或达到 2^64、索引越界、路径长度不符、路
   径项非 32 字节或封印、签名、密钥结构非法抛 `ValueError`；无状态
+- `encode_history_proof(proof) -> bytes` — 单项历史包含证明的规范传
+  输/持久化编码：记 `E = encode_seal(proof.seal)`，按字段原序依次拼
+  接标签 `b"thresholdsign/seal-history-proof/v1"`、`VARINT(index)`、
+  `VARINT(total)`、封印帧 `U32(len(E)) || E`、`U32` 路径数及自叶向根
+  原序直拼的兄弟摘要（各 32 字节）。`VARINT` 为 4 字节无符号大端长
+  度加最短无符号大端整数（零为单字节 `00`，正数禁前导零），`U32`
+  为 4 字节无符号大端；要求 `0 < total < 2^64`、`0 <= index < total`
+  且路径数恰为 `(total-1).bit_length()`。非 `SealHistoryProof` 入参
+  或字段、路径项类型错抛 `TypeError`；越界、计数/宽度不符、嵌套封
+  印结构非法或超长帧抛 `ValueError`；不验封印、不验签，输出唯一、
+  无状态
+- `decode_history_proof(blob) -> SealHistoryProof` —
+  `encode_history_proof` 的逆操作，嵌套封印经 `decode_seal` 还原，
+  不验封印、不验签：拒绝非 `bytes`、坏/缺标签、空或超长封印帧、非
+  法嵌套封印、`VARINT` 非规范、越界、路径计数不等于
+  `(total-1).bit_length()`、路径项非 32 字节、截断及尾随字节；非
+  `bytes` 入参抛 `TypeError`，其余非法情形抛 `ValueError`；成功后
+  重编码必逐字节等于输入，结构合法但封印或签名不匹配由
+  `check_history_proof` 返回 `False`
 - `Rotation(old, new, ids, t, q, p, g, sig)` — 冻结数据类，可按位置构造、按值
   相等；公开可验证的密钥轮换授权证书：`old`/`new` 为新旧联合公钥，`ids` 为严格
   递增的新成员编号元组，`t` 为新 threshold，`q`/`p`/`g` 为域素数、群素数与
