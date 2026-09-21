@@ -23,7 +23,8 @@ decode_rotation_chain, and the stateless, threshold-Schnorr-authenticated
 audit chain: AuditChain / audit_chain_payload / verify_audit_chain.
 Merkle inclusion proofs over a chain's records: AuditProof / make_proof /
 check_proof, plus their canonical transport encoding encode_audit_proof /
-decode_audit_proof.
+decode_audit_proof. Append-only consistency between two record sequences:
+AuditExtensionProof / make_extension / check_extension.
 """
 
 from __future__ import annotations
@@ -98,6 +99,9 @@ __all__ = [
     "check_proof",
     "encode_audit_proof",
     "decode_audit_proof",
+    "AuditExtensionProof",
+    "make_extension",
+    "check_extension",
 ]
 
 # Mersenne prime 2**127 - 1: large enough for integer secrets, small enough that
@@ -3873,21 +3877,16 @@ def _audit_proof_node(left: bytes, right: bytes) -> bytes:
     return hashlib.sha256(AUDIT_PROOF_NODE_TAG + left + right).digest()
 
 
-def _audit_proof_levels(
-    records: tuple[tuple[bytes, SigningAudit], ...],
+def _audit_proof_tree_levels(
+    leaves: tuple[bytes, ...],
 ) -> list[tuple[bytes, ...]]:
-    """Build the leaf level and every internal level up to the single root.
+    """Build every tree level above a non-empty leaf level up to the root.
 
     A level with an odd tail width is paired with its own last node
     duplicated, so every level above the leaves has an even width.
     """
-    levels: list[tuple[bytes, ...]] = [
-        tuple(
-            _audit_proof_leaf(index, message, audit)
-            for index, (message, audit) in enumerate(records)
-        )
-    ]
-    current = levels[0]
+    levels: list[tuple[bytes, ...]] = [leaves]
+    current = leaves
     while len(current) > 1:
         if len(current) % 2 == 1:
             current = current + current[-1:]
@@ -3897,6 +3896,23 @@ def _audit_proof_levels(
         )
         levels.append(current)
     return levels
+
+
+def _audit_proof_levels(
+    records: tuple[tuple[bytes, SigningAudit], ...],
+) -> list[tuple[bytes, ...]]:
+    """Build the leaf level and every internal level up to the single root."""
+    return _audit_proof_tree_levels(
+        tuple(
+            _audit_proof_leaf(index, message, audit)
+            for index, (message, audit) in enumerate(records)
+        )
+    )
+
+
+def _audit_proof_root(leaves: tuple[bytes, ...]) -> bytes:
+    """Reduce a non-empty tuple of 32-byte leaf digests to the tree root."""
+    return _audit_proof_tree_levels(leaves)[-1][0]
 
 
 @dataclass(frozen=True)
@@ -4229,3 +4245,174 @@ def decode_audit_proof(payload: bytes) -> AuditProof:
     if encode_audit_proof(proof) != payload:
         raise ValueError("non-canonical audit proof")
     return proof
+
+
+# ---------------------------------------------------------------------------
+# Append-only consistency proofs over an audit chain's records: a compact
+# proof that the record sequence sealed by one threshold signature is a strict
+# prefix of the longer sequence sealed by another. The proof carries only the
+# 32-byte leaf digests of the new sequence — never a message or a receipt —
+# and reuses the AuditProof tree rules, so an observer rebuilds the old root
+# from the first ``old_n`` leaves and the new root from all of them and checks
+# the two root statements ``b"am/r" || U64(n) || root`` against the two
+# signatures. No state is kept and no receipt is re-checked: consistency is a
+# pure statement about the two signed roots.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AuditExtensionProof:
+    """An append-only consistency proof between two audit-chain record sequences.
+
+    The fields, in order, are ``old_n`` (the non-empty length of the old
+    sequence, strictly smaller than the new one) and ``leaves`` (the non-empty
+    tuple of the new sequence's 32-byte leaf digests in chain order, each
+    ``H(b"am/l" || U64(i) || H(message) || H(audit.payload))`` exactly as
+    :func:`make_proof` computes them). The dataclass is frozen, positionally
+    constructible and compared by value, and carries no network, storage or
+    hidden state. Field types and bounds are not checked at construction time
+    — :func:`check_extension` is the way to test a proof afterwards.
+    """
+
+    old_n: int
+    leaves: tuple[bytes, ...]
+
+
+def _validate_audit_extension_proof_structure(
+    proof: object,
+) -> tuple[int, tuple[bytes, ...]]:
+    """Type- and structure-check an :class:`AuditExtensionProof`.
+
+    Only the container structure is checked: the leaves are opaque 32-byte
+    digests and no signature is verified here. The bounds are
+    ``0 < old_n < len(leaves) < 2**64`` and every leaf must be exactly 32
+    bytes. Wrong field types raise TypeError; illegal bounds, an empty leaf
+    tuple or a leaf of another width raise ValueError.
+    """
+    if not isinstance(proof, AuditExtensionProof):
+        raise TypeError("proof must be an AuditExtensionProof instance")
+    old_n = proof.old_n
+    leaves = proof.leaves
+    if not isinstance(old_n, int) or isinstance(old_n, bool):
+        raise TypeError("proof.old_n must be an integer")
+    if not isinstance(leaves, tuple):
+        raise TypeError("proof.leaves must be a tuple")
+    for leaf in leaves:
+        if not isinstance(leaf, bytes):
+            raise TypeError("proof.leaves entries must be bytes")
+
+    if not leaves:
+        raise ValueError("proof.leaves must be non-empty")
+    count = len(leaves)
+    if count > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("too many leaves")
+    for leaf in leaves:
+        if len(leaf) != AUDIT_PROOF_DIGEST_SIZE:
+            raise ValueError("proof.leaves entries must be exactly 32 bytes")
+    if old_n <= 0 or old_n >= count:
+        raise ValueError("proof.old_n out of range")
+    return old_n, leaves
+
+
+def make_extension(
+    records: tuple[tuple[bytes, SigningAudit], ...], old_n: int
+) -> tuple[bytes, bytes, AuditExtensionProof]:
+    """Build the old and new root statements and a consistency proof.
+
+    ``records`` must be the same non-empty, order-preserving tuple of
+    ``(message, SigningAudit)`` pairs an :class:`AuditChain` seals and
+    ``old_n`` the non-empty length of the old prefix, strictly smaller than
+    the total record count. The tree rules are exactly :func:`make_proof`'s:
+    leaves ``H(b"am/l" || U64(i) || H(message) || H(audit.payload))``,
+    internal nodes ``H(b"am/n" || left || right)`` and last-node duplication
+    on odd-width levels. Returns ``(old_message, new_message, proof)`` where
+    ``old_message`` is ``b"am/r" || U64(old_n) || old_root`` over the first
+    ``old_n`` leaves, ``new_message`` is ``b"am/r" || U64(n) || new_root``
+    over all ``n`` leaves — the two bytes to be threshold-signed — and
+    ``proof`` is the :class:`AuditExtensionProof` carrying every leaf digest.
+
+    Wrong argument types raise TypeError: a non-integer (including boolean)
+    ``old_n``, a non-tuple record sequence or a malformed record (exactly the
+    rules of :func:`audit_chain_payload`). An empty record sequence, an
+    ``old_n`` outside ``0 < old_n < n``, or a record count that does not fit
+    the 8-byte counter raises ValueError.
+    """
+    if not isinstance(old_n, int) or isinstance(old_n, bool):
+        raise TypeError("old_n must be an integer")
+    count = _check_audit_chain_records(records)
+    if count > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("too many records")
+    if old_n <= 0 or old_n >= count:
+        raise ValueError("old_n out of range")
+
+    leaves = tuple(
+        _audit_proof_leaf(index, message, audit)
+        for index, (message, audit) in enumerate(records)
+    )
+    old_root = _audit_proof_root(leaves[:old_n])
+    new_root = _audit_proof_root(leaves)
+    old_message = AUDIT_PROOF_ROOT_TAG + _audit_proof_u64(old_n) + old_root
+    new_message = AUDIT_PROOF_ROOT_TAG + _audit_proof_u64(count) + new_root
+    return old_message, new_message, AuditExtensionProof(old_n=old_n, leaves=leaves)
+
+
+def check_extension(
+    proof: AuditExtensionProof,
+    old_sig: AggregateSignature,
+    new_sig: AggregateSignature,
+    key: SigningDKGResult,
+) -> bool:
+    """Verify an append-only consistency proof against two threshold signatures.
+
+    The old root is rebuilt from the first ``proof.old_n`` leaves of
+    ``proof.leaves`` and the new root from all of them, exactly as
+    :func:`make_extension` computes them; the statements
+    ``b"am/r" || U64(old_n) || old_root`` and ``b"am/r" || U64(n) || new_root``
+    are then checked as ``old_sig``'s and ``new_sig``'s threshold Schnorr
+    messages via :func:`verify_signature` against ``key``. Returns ``True``
+    only when both signatures verify: an observer holding nothing but the two
+    signatures and the proof is then convinced the old record sequence is a
+    strict prefix of the new one, without seeing any message or receipt. A
+    well-formed proof whose leaves were tampered with, whose ``old_n`` does
+    not match the signed old statement, or which is presented under another
+    key or with a swapped, foreign or tampered signature returns ``False``.
+
+    A non-:class:`AuditExtensionProof` argument, a
+    non-:class:`AggregateSignature` signature or any wrong field type
+    (non-integer ``old_n`` including booleans, a non-tuple ``leaves`` or a
+    non-bytes leaf) raises TypeError; an empty leaf tuple, a leaf that is not
+    exactly 32 bytes, an ``old_n`` outside ``0 < old_n < n``, a leaf count
+    over 64 bits, or a structurally illegal signature or ``key`` raises
+    ValueError, exactly as :func:`verify_signature` would.
+    """
+    old_n, leaves = _validate_audit_extension_proof_structure(proof)
+    if not isinstance(old_sig, AggregateSignature):
+        raise TypeError("old_sig must be an AggregateSignature instance")
+    if not isinstance(new_sig, AggregateSignature):
+        raise TypeError("new_sig must be an AggregateSignature instance")
+
+    _result, public_key, field_prime, group_prime, generator = _check_signing_setup(key)
+    _check_signing_dkg_structure(key)
+
+    count = len(leaves)
+    old_root = _audit_proof_root(leaves[:old_n])
+    new_root = _audit_proof_root(leaves)
+    old_message = AUDIT_PROOF_ROOT_TAG + _audit_proof_u64(old_n) + old_root
+    new_message = AUDIT_PROOF_ROOT_TAG + _audit_proof_u64(count) + new_root
+    if not verify_signature(
+        old_message,
+        old_sig,
+        public_key,
+        group_prime=group_prime,
+        generator=generator,
+        prime=field_prime,
+    ):
+        return False
+    return verify_signature(
+        new_message,
+        new_sig,
+        public_key,
+        group_prime=group_prime,
+        generator=generator,
+        prime=field_prime,
+    )
