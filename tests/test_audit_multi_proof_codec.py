@@ -135,11 +135,14 @@ class RoundTripTest(unittest.TestCase):
 class StructureOnlyTest(unittest.TestCase):
     def test_decode_does_not_parse_receipts_or_verify(self):
         receipt = b"not-an-audit-receipt"
+        # n=3 with disclosed leaves 0 and 2 derives exactly one sibling:
+        # leaf 0 pairs with the undisclosed leaf 1, the odd tail leaf 2 is
+        # paired with itself, and the two parents are both disclosed nodes.
         proof = AuditMultiProof(
             indices=(0, 2),
             n=3,
             records=((b"m", SigningAudit(receipt)), (b"m2", SigningAudit(b"x"))),
-            siblings=(b"s" * 32, b"t" * 32),
+            siblings=(b"s" * 32,),
         )
         decoded = decode_audit_multi_proof(encode_audit_multi_proof(proof))
         self.assertEqual(decoded.records[0][1].payload, receipt)
@@ -206,6 +209,10 @@ class EncodeValidationTest(unittest.TestCase):
             ),
             dataclasses.replace(proof, siblings=(thirty_two[:-1],)),
             dataclasses.replace(proof, siblings=(thirty_two + b"x",)),
+            # Every entry is exactly 32 bytes, but the count is not the one
+            # n=5 with indices (1, 2) derives (three companions).
+            dataclasses.replace(proof, siblings=proof.siblings[:-1]),
+            dataclasses.replace(proof, siblings=proof.siblings + (thirty_two,)),
         ):
             with self.assertRaises(ValueError, msg=repr(bad)):
                 encode_audit_multi_proof(bad)
@@ -351,6 +358,81 @@ class DecodeValidationTest(unittest.TestCase):
         out += b"s" * 31
         with self.assertRaises(ValueError):
             decode_audit_multi_proof(bytes(out))
+
+    def _wire_with_sibling_count(self, sibling_digests):
+        out = bytearray(WIRE_TAG)
+        out += varint(self.proof.n)
+        out += u32(len(self.proof.indices))
+        for index in self.proof.indices:
+            out += varint(index)
+        out += u32(len(self.proof.records))
+        for message, audit in self.proof.records:
+            out += frame(message) + frame(audit.payload)
+        out += u32(len(sibling_digests))
+        for digest in sibling_digests:
+            out += digest
+        return bytes(out)
+
+    def test_missing_sibling_rejected(self):
+        # n=5 with indices (1, 2) derives three companions; two is short.
+        wire = self._wire_with_sibling_count(self.proof.siblings[:-1])
+        with self.assertRaises(ValueError):
+            decode_audit_multi_proof(wire)
+
+    def test_extra_sibling_rejected(self):
+        wire = self._wire_with_sibling_count(
+            self.proof.siblings + (b"u" * 32,)
+        )
+        with self.assertRaises(ValueError):
+            decode_audit_multi_proof(wire)
+
+    def test_zero_siblings_when_tree_is_fully_disclosed(self):
+        # Disclosing every leaf of a 4-record tree derives no siblings.
+        _message, proof = make_multi_proof(self.records[:4], (0, 1, 2, 3))
+        self.assertEqual(proof.siblings, ())
+        decoded = decode_audit_multi_proof(encode_audit_multi_proof(proof))
+        self.assertEqual(decoded, proof)
+        out = bytearray(encode_audit_multi_proof(proof))
+        # Flip the trailing zero sibling count into a one and append a
+        # well-formed digest: the derived count is still zero.
+        bad = bytes(out[:-4]) + u32(1) + b"u" * 32
+        with self.assertRaises(ValueError):
+            decode_audit_multi_proof(bad)
+
+    def test_derived_sibling_count_matches_maker_for_every_shape(self):
+        for n in range(1, 6):
+            records = self.records[:n]
+            for mask in range(1, 1 << n):
+                indices = tuple(i for i in range(n) if mask & (1 << i))
+                _message, proof = make_multi_proof(records, indices)
+                required = len(proof.siblings)
+                # An extra companion is always rejected.
+                with self.assertRaises(
+                    ValueError, msg=f"n={n} indices={indices} long"
+                ):
+                    encode_audit_multi_proof(
+                        dataclasses.replace(
+                            proof, siblings=proof.siblings + (b"u" * 32,)
+                        )
+                    )
+                # A missing companion is rejected unless the derived count
+                # is already zero.
+                if required:
+                    with self.assertRaises(
+                        ValueError, msg=f"n={n} indices={indices} short"
+                    ):
+                        encode_audit_multi_proof(
+                            dataclasses.replace(
+                                proof, siblings=proof.siblings[:-1]
+                            )
+                        )
+                # The correct count is the only accepted one.
+                self.assertEqual(
+                    decode_audit_multi_proof(
+                        encode_audit_multi_proof(proof)
+                    ),
+                    proof,
+                )
 
 
 if __name__ == "__main__":
