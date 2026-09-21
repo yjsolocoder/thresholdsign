@@ -778,6 +778,41 @@ python3 -m thresholdsign
   （类型错误抛 `TypeError`，空报告、非元组、乱序/重复键或嵌套结构非法
   抛 `ValueError`），再对各项调用 `verify_nonce_leak`；全部为 `True`
   才返回 `True`，任一项合法不匹配即为 `False`；无状态
+- `ReportSeal(report, signature)` — 冻结数据类，字段依次为
+  `NonceLeakReport`、`AggregateSignature`，可按位置构造、按值相等；
+  以一个门限 Schnorr 签名认证整份报告，构造时不校验，核验由
+  `verify_seal` 负责；不含网络、存储或隐藏状态
+- `seal_message(report, public_key) -> bytes` — 生成由门限密钥签署、
+  认证整份报告的规范消息（作为 `SigningRound.message`）：记
+  `E = encode_nonce_leak_report(report)`，依次拼接标签
+  `b"ts/nlrs/v1"`、`SHA256(E)`（32 字节）及 `VARINT(public_key)`
+  （规则同其他规范编码：4 字节无符号大端长度 + 最短无符号大端值，零为
+  单字节 `00`）；消息不含签名。非 `NonceLeakReport` 或公钥非整数
+  （含布尔）抛 `TypeError`，报告结构非法、公钥为负或编码过长抛
+  `ValueError`；输出唯一、无状态
+- `encode_seal(seal) -> bytes` — 报告封印的规范传输/持久化编码：记
+  `E = encode_nonce_leak_report(seal.report)`、签名为 `(R, z, ids)`、
+  `k` 为升序 ids 数，依次拼接标签 `b"ts/nlrs/w1"`、
+  `U32(len(E)) || E`、`VARINT(R)`、`VARINT(z)`、`U32(k)` 及逐项
+  `VARINT(id)`；`R` 须为正、`z` 非负，ids 非空、为正且严格递增无
+  重复。非 `ReportSeal`/`AggregateSignature` 入参或字段类型错误（含
+  布尔冒充整数）抛 `TypeError`；嵌套报告非法、`R` 非正、`z` 为负、
+  ids 空/非正/乱序/重复或超长帧抛 `ValueError`；不验报告、不验签，
+  输出唯一、无状态
+- `decode_seal(blob) -> ReportSeal` — `encode_seal` 的逆操作，嵌套
+  报告调用 `decode_nonce_leak_report`（拒绝一切非规范报告）、不验泄露、
+  不验签：拒绝非 `bytes`、坏/缺标签、零或超长的报告长度、零 `R`、非
+  规范整数（前导零、超长）、零或不符的签名者计数、非正/乱序/重复
+  ids、截断与尾随字节；非 `bytes` 入参抛 `TypeError`，其余非法情形
+  抛 `ValueError`；成功后重编码必逐字节等于输入
+- `verify_seal(seal, key) -> bool` — 先对 `seal.report` 调用
+  `verify_nonce_leak_report` 复核全部泄露证据，再以 `key.public_key`
+  和 `key` 的群参数对 `seal_message(seal.report, key.public_key)` 调用
+  `verify_signature` 验签；两者全真才返回 `True`，报告含伪证、签名被
+  篡改、签名对应另一份报告或另一把密钥均对结构合法的入参返回 `False`。
+  非 `ReportSeal`/`AggregateSignature`/`SigningDKGResult` 入参或字段
+  类型错误抛 `TypeError`，报告、签名或密钥结构非法抛 `ValueError`；
+  无状态
 - `Rotation(old, new, ids, t, q, p, g, sig)` — 冻结数据类，可按位置构造、按值
   相等；公开可验证的密钥轮换授权证书：`old`/`new` 为新旧联合公钥，`ids` 为严格
   递增的新成员编号元组，`t` 为新 threshold，`q`/`p`/`g` 为域素数、群素数与

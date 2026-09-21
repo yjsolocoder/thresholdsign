@@ -21,7 +21,9 @@ leaked-share transport encoding encode_nonce_leak / decode_nonce_leak and
 its key-only verifier verify_nonce_leak, the canonical batched
 leaked-share transport encoding encode_nonce_leak_report /
 decode_nonce_leak_report and its key-only verifier
-verify_nonce_leak_report, publicly
+verify_nonce_leak_report, the threshold-Schnorr-authenticated
+whole-report seal ReportSeal / seal_message / encode_seal /
+decode_seal / verify_seal, publicly
 verifiable key-rotation authorization: Rotation / rotation_payload /
 verify_rotation, the persistent, multi-hop authorization chain
 RotationChain / verify_rotation_chain / encode_rotation_chain /
@@ -101,6 +103,11 @@ __all__ = [
     "encode_nonce_leak_report",
     "decode_nonce_leak_report",
     "verify_nonce_leak_report",
+    "ReportSeal",
+    "seal_message",
+    "encode_seal",
+    "decode_seal",
+    "verify_seal",
     "Rotation",
     "rotation_payload",
     "verify_rotation",
@@ -4133,6 +4140,246 @@ def verify_nonce_leak_report(
     for item in report.items:
         result = verify_nonce_leak(item, key) and result
     return result
+
+
+# ---------------------------------------------------------------------------
+# Whole-report seals: a threshold Schnorr AggregateSignature over a canonical
+# message that binds the exact NonceLeakReport encoding and the verifying
+# public key. The seal is a plain value with no network, storage or hidden
+# state; seal_message builds the signed message, encode_seal/decode_seal move
+# it over the wire, and verify_seal first checks the report itself and then
+# the signature.
+# ---------------------------------------------------------------------------
+
+REPORT_SEAL_TAG = b"ts/nlrs/v1"
+REPORT_SEAL_WIRE_TAG = b"ts/nlrs/w1"
+
+
+@dataclass(frozen=True)
+class ReportSeal:
+    """A whole nonce-leak report sealed by one threshold Schnorr signature.
+
+    ``report`` is the sealed :class:`NonceLeakReport`; ``signature`` is the
+    threshold Schnorr :class:`AggregateSignature` on
+    :func:`seal_message` of the report and the verifying public key. The
+    dataclass is frozen, positionally constructible and compared by value;
+    it carries no network, storage or hidden state. Neither field is
+    checked at construction time — :func:`verify_seal` is the way to test a
+    seal afterwards.
+    """
+
+    report: NonceLeakReport
+    signature: AggregateSignature
+
+
+def seal_message(report: NonceLeakReport, public_key: int) -> bytes:
+    """Encode the canonical message the threshold key signs to seal a report.
+
+    The message is, in order, the tag ``b"ts/nlrs/v1"``, the 32-byte
+    ``SHA256`` digest of :func:`encode_nonce_leak_report` output ``E`` for
+    ``report``, and ``VARINT(public_key)`` — the same 4-byte unsigned
+    big-endian length followed by the shortest unsigned big-endian value
+    used throughout the canonical transport encodings (zero is the single
+    byte ``00``, positive values carry no leading zero). It carries no
+    signature and keeps no state.
+
+    ``report`` must be a structurally legal :class:`NonceLeakReport`
+    exactly as :func:`encode_nonce_leak_report` requires and
+    ``public_key`` a non-boolean non-negative integer. Wrong field types
+    raise TypeError; an illegal report, a negative or boolean public key,
+    or an over-long key encoding raises ValueError.
+    """
+    if not isinstance(report, NonceLeakReport):
+        raise TypeError("report must be a NonceLeakReport instance")
+    if not isinstance(public_key, int) or isinstance(public_key, bool):
+        raise TypeError("public_key must be an integer")
+    # Raises TypeError/ValueError for an illegal report, exactly like the
+    # encoder itself.
+    encoded_report = encode_nonce_leak_report(report)
+    encoded_key = _encode_varint(public_key)
+    return REPORT_SEAL_TAG + hashlib.sha256(encoded_report).digest() + encoded_key
+
+
+def _check_report_seal_fields(seal: object) -> None:
+    """Type- and structure-check a ReportSeal value (without its report)."""
+    if not isinstance(seal, ReportSeal):
+        raise TypeError("seal must be a ReportSeal instance")
+    if not isinstance(seal.report, NonceLeakReport):
+        raise TypeError("seal.report must be a NonceLeakReport instance")
+    if not isinstance(seal.signature, AggregateSignature):
+        raise TypeError("seal.signature must be an AggregateSignature instance")
+    if not isinstance(seal.signature.R, int) or isinstance(seal.signature.R, bool):
+        raise TypeError("signature.R must be an integer")
+    if not isinstance(seal.signature.z, int) or isinstance(seal.signature.z, bool):
+        raise TypeError("signature.z must be an integer")
+    if not isinstance(seal.signature.signer_ids, tuple):
+        raise TypeError("signature.signer_ids must be a tuple")
+    for signer_id in seal.signature.signer_ids:
+        if not isinstance(signer_id, int) or isinstance(signer_id, bool):
+            raise TypeError("signer ids must be integers")
+
+    if seal.signature.R <= 0:
+        raise ValueError("signature R must be positive")
+    if seal.signature.z < 0:
+        raise ValueError("signature z must be non-negative")
+    if not seal.signature.signer_ids:
+        raise ValueError("at least one signer is required")
+    if any(signer_id <= 0 for signer_id in seal.signature.signer_ids):
+        raise ValueError("signer ids must be positive")
+    if any(
+        seal.signature.signer_ids[index] >= seal.signature.signer_ids[index + 1]
+        for index in range(len(seal.signature.signer_ids) - 1)
+    ):
+        raise ValueError("signer ids must be strictly increasing and unique")
+
+
+def encode_seal(seal: ReportSeal) -> bytes:
+    """Canonically encode a report seal for transport or persistence.
+
+    The encoding is, in order, the tag ``b"ts/nlrs/w1"``, the 4-byte
+    unsigned big-endian length ``len(E)`` followed by the raw report
+    encoding ``E = encode_nonce_leak_report(seal.report)``,
+    ``VARINT(R)``, ``VARINT(z)``, the 4-byte unsigned big-endian signer
+    count ``k``, and one ``VARINT(id)`` per ascending signer id. A
+    ``VARINT`` is a 4-byte unsigned big-endian body length followed by
+    the shortest unsigned big-endian value (zero is the single byte
+    ``00``, positive values carry no leading zero); ``R`` must be
+    positive and ``z`` may be zero.
+
+    Only a structurally legal :class:`ReportSeal` is accepted: the report
+    must be encodable by :func:`encode_nonce_leak_report` and the
+    signature an :class:`AggregateSignature` with a positive ``R``, a
+    non-negative ``z`` and a non-empty tuple of strictly increasing
+    positive ids. The signature is not checked against the report and
+    the report's findings are not verified: the output for a given seal
+    is unique and the encoding carries no network, storage or hidden
+    state. Wrong field types raise TypeError; an illegal report or
+    signature structure or an over-long frame raises ValueError.
+    """
+    _check_report_seal_fields(seal)
+    encoded_report = encode_nonce_leak_report(seal.report)
+    signature = seal.signature
+    signer_count = len(signature.signer_ids)
+    if len(encoded_report) > 0xFFFFFFFF:
+        raise ValueError("nonce-leak report encoding too long")
+    if signer_count > 0xFFFFFFFF:
+        raise ValueError("too many signer ids")
+
+    buffer = bytearray(REPORT_SEAL_WIRE_TAG)
+    buffer += len(encoded_report).to_bytes(4, "big", signed=False)
+    buffer += encoded_report
+    buffer += _encode_varint(signature.R)
+    buffer += _encode_varint(signature.z)
+    buffer += signer_count.to_bytes(4, "big", signed=False)
+    for signer_id in signature.signer_ids:
+        buffer += _encode_varint(signer_id)
+    return bytes(buffer)
+
+
+def decode_seal(blob: bytes) -> ReportSeal:
+    """Decode the canonical encoding produced by :func:`encode_seal`.
+
+    Accepts only the single canonical form: the tag ``b"ts/nlrs/w1"``, a
+    4-byte non-zero report length followed by bytes that
+    :func:`decode_nonce_leak_report` accepts, the length-prefixed
+    integers ``R`` and ``z``, the 4-byte non-zero signer count ``k`` and
+    then exactly ``k`` strictly increasing positive signer ids. A
+    non-bytes argument raises TypeError; a wrong or missing tag, a zero
+    or over-long report length, a non-canonical nested report, a zero
+    ``R``, a negative value, a zero or mismatched signer count, a
+    non-canonical integer (leading zero or over-long length),
+    truncation, or trailing bytes raises ValueError. A successfully
+    decoded seal re-encodes to exactly the input bytes.
+
+    Decoding only restores the structure: the nested report is decoded
+    with :func:`decode_nonce_leak_report` (which verifies no finding) and
+    the signature is not checked. A structurally legal seal whose report
+    does not verify or whose signature does not seal it is returned
+    normally, and :func:`verify_seal` reports it as ``False``.
+    """
+    if not isinstance(blob, bytes):
+        raise TypeError("blob must be bytes")
+    if not blob.startswith(REPORT_SEAL_WIRE_TAG):
+        raise ValueError("bad report seal tag")
+    offset = len(REPORT_SEAL_WIRE_TAG)
+
+    encoded_report, offset = _read_audit_proof_block(
+        blob, offset, what="sealed nonce-leak report"
+    )
+    report = decode_nonce_leak_report(encoded_report)
+
+    R, offset = _read_varint(blob, offset, what="report seal signature R")
+    z, offset = _read_varint(blob, offset, what="report seal signature z")
+    if R == 0:
+        raise ValueError("report seal signature R must be positive")
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated report seal signer count")
+    signer_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    if signer_count == 0:
+        raise ValueError("report seal must name at least one signer")
+
+    signer_ids = []
+    for _ in range(signer_count):
+        signer_id, offset = _read_varint(blob, offset, what="report seal signer id")
+        if signer_id == 0:
+            raise ValueError("report seal signer ids must be positive")
+        if signer_ids and signer_id <= signer_ids[-1]:
+            raise ValueError(
+                "report seal signer ids must be strictly increasing and unique"
+            )
+        signer_ids.append(signer_id)
+    if offset != len(blob):
+        raise ValueError("trailing bytes after report seal")
+
+    seal = ReportSeal(
+        report=report,
+        signature=AggregateSignature(
+            R=R, z=z, signer_ids=tuple(signer_ids)
+        ),
+    )
+    if encode_seal(seal) != blob:
+        raise ValueError("non-canonical report seal encoding")
+    return seal
+
+
+def verify_seal(seal: ReportSeal, key: SigningDKGResult) -> bool:
+    """Verify a report seal against its report and the threshold key.
+
+    ``seal`` must be a structurally legal :class:`ReportSeal` — its
+    report encodable by :func:`encode_nonce_leak_report` and its
+    signature an :class:`AggregateSignature` with a positive ``R``, a
+    non-negative ``z`` and a non-empty tuple of strictly increasing
+    positive signer ids — and ``key`` a legal :class:`SigningDKGResult`.
+    Wrong field types raise TypeError; an illegal report, signature or
+    key structure raises ValueError.
+
+    Every finding of the sealed report is first checked with
+    :func:`verify_nonce_leak_report` against ``key``; the canonical
+    :func:`seal_message` of the report and ``key.public_key`` is then
+    checked as the signature's threshold Schnorr message via
+    :func:`verify_signature` with the key's group parameters. Returns
+    ``True`` only when both checks pass; a well-formed seal whose report
+    contains a bad finding, whose signature was tampered with, or which
+    seals another report or key returns ``False``. The function is
+    stateless.
+    """
+    _check_report_seal_fields(seal)
+    _result, public_key, field_prime, group_prime, generator = _check_signing_setup(key)
+    _check_signing_dkg_structure(key)
+
+    if not verify_nonce_leak_report(seal.report, key):
+        return False
+    message = seal_message(seal.report, public_key)
+    return verify_signature(
+        message,
+        seal.signature,
+        public_key,
+        group_prime=group_prime,
+        generator=generator,
+        prime=field_prime,
+    )
 
 
 # ---------------------------------------------------------------------------
