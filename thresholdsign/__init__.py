@@ -25,7 +25,10 @@ verify_nonce_leak_report, the threshold-Schnorr-authenticated
 whole-report seal ReportSeal / seal_message / encode_seal /
 decode_seal / verify_seal, the order-preserving batch of seals
 SealHistory / history_message / check_history and its canonical
-transport encoding encode_history / decode_history, publicly
+transport encoding encode_history / decode_history, plus single-seal
+Merkle inclusion proofs SealHistoryProof / make_history_proof /
+check_history_proof that locate one seal in a sealed history without
+the full history, publicly
 verifiable key-rotation authorization: Rotation / rotation_payload /
 verify_rotation, the persistent, multi-hop authorization chain
 RotationChain / verify_rotation_chain / encode_rotation_chain /
@@ -115,6 +118,9 @@ __all__ = [
     "check_history",
     "encode_history",
     "decode_history",
+    "SealHistoryProof",
+    "make_history_proof",
+    "check_history_proof",
     "Rotation",
     "rotation_payload",
     "verify_rotation",
@@ -6128,3 +6134,271 @@ def decode_history(blob: bytes) -> SealHistory:
     if encode_history(history) != blob:
         raise ValueError("non-canonical seal history encoding")
     return history
+
+
+# ---------------------------------------------------------------------------
+# Single-item inclusion proofs for seal histories: one threshold signature on
+# a Merkle root lets a third party confirm that one ReportSeal sits at a fixed
+# position in the exact sealed history without fetching the history itself.
+# The tree is SHA256 over the canonical seal encodings with domain-separated
+# leaf/node prefixes; the root statement to sign is
+# ``b"sh/r" || U64(total) || root``. No state is kept and
+# check_history_proof re-runs verify_seal on the proven seal and
+# verify_signature on the root signature, so a proof certifies both membership
+# and the seal itself.
+# ---------------------------------------------------------------------------
+
+SEAL_HISTORY_PROOF_LEAF_TAG = b"sh/l"
+SEAL_HISTORY_PROOF_NODE_TAG = b"sh/n"
+SEAL_HISTORY_PROOF_ROOT_TAG = b"sh/r"
+
+SEAL_HISTORY_PROOF_DIGEST_SIZE = 32  # SHA256 output width; every tree node is this wide
+
+
+def _history_proof_u64(value: int) -> bytes:
+    """8-byte unsigned big-endian encoding of a non-negative integer < 2**64."""
+    return value.to_bytes(8, "big", signed=False)
+
+
+def _history_proof_leaf(index: int, seal: ReportSeal) -> bytes:
+    """The index-bound leaf digest ``H(b"sh/l" || U64(i) || H(encode_seal(seal)))``."""
+    return hashlib.sha256(
+        SEAL_HISTORY_PROOF_LEAF_TAG
+        + _history_proof_u64(index)
+        + hashlib.sha256(encode_seal(seal)).digest()
+    ).digest()
+
+
+def _history_proof_node(left: bytes, right: bytes) -> bytes:
+    """The ordered internal digest ``H(b"sh/n" || left || right)``."""
+    return hashlib.sha256(
+        SEAL_HISTORY_PROOF_NODE_TAG + left + right
+    ).digest()
+
+
+def _history_proof_levels(
+    items: tuple[ReportSeal, ...],
+) -> list[tuple[bytes, ...]]:
+    """Build the leaf level and every internal level up to the single root.
+
+    A level with an odd tail width is paired with its own last node
+    duplicated, so every level above the leaves has an even width.
+    """
+    levels: list[tuple[bytes, ...]] = [
+        tuple(
+            _history_proof_leaf(index, seal)
+            for index, seal in enumerate(items)
+        )
+    ]
+    current = levels[0]
+    while len(current) > 1:
+        if len(current) % 2 == 1:
+            current = current + current[-1:]
+        current = tuple(
+            _history_proof_node(current[index], current[index + 1])
+            for index in range(0, len(current), 2)
+        )
+        levels.append(current)
+    return levels
+
+
+@dataclass(frozen=True)
+class SealHistoryProof:
+    """A Merkle inclusion proof for one seal of a seal history.
+
+    The fields, in order, are ``index`` (the non-negative leaf position),
+    ``total`` (the total, non-empty history item count), ``seal`` (the
+    proven :class:`ReportSeal`) and ``siblings`` (the sibling digests on
+    the path from the leaf level up to — but not including — the root,
+    each exactly 32 bytes, ordered from the leaf level upward; the tuple
+    is empty for a one-item history). At a level whose width is odd, the
+    last node pairs with itself, and the corresponding path entry is the
+    node's own digest. The dataclass is frozen, positionally constructible
+    and compared by value, and carries no network, storage or hidden
+    state. Field types and bounds are not checked at construction time —
+    :func:`check_history_proof` is the way to test a proof afterwards.
+    """
+
+    index: int
+    total: int
+    seal: ReportSeal
+    siblings: tuple[bytes, ...]
+
+
+def make_history_proof(
+    history: SealHistory, index: int
+) -> tuple[bytes, SealHistoryProof]:
+    """Build the root statement and a seal inclusion proof for one item.
+
+    ``history`` must be a structurally legal :class:`SealHistory` — a
+    non-empty tuple of :class:`ReportSeal` values each encodable by
+    :func:`encode_seal` — and ``index`` the leaf position to prove. The
+    tree is built in history item order with SHA256: leaves are
+    ``H(b"sh/l" || U64(i) || H(encode_seal(item)))`` and internal nodes
+    ``H(b"sh/n" || left || right)``; a level with an odd tail width
+    duplicates its last node for pairing, and the sibling carried for
+    that level is the node's own digest. Returns ``(message, proof)``
+    where ``message`` is ``b"sh/r" || U64(total) || root`` (the 8-byte
+    unsigned big-endian item count followed by the 32-byte root) — the
+    bytes to be threshold-signed — and ``proof`` is the
+    :class:`SealHistoryProof` for ``index`` whose ``siblings`` list the
+    32-byte digests from the leaf level up to the root.
+
+    Wrong argument types raise TypeError: a non-:class:`SealHistory`
+    history or a non-integer (including boolean) index. An empty
+    history, a structurally illegal item seal, a count that does not
+    fit ``0 < total < 2**64``, or an index outside ``0 <= i < total``
+    raises ValueError.
+    """
+    if not isinstance(history, SealHistory):
+        raise TypeError("history must be a SealHistory instance")
+    if not isinstance(index, int) or isinstance(index, bool):
+        raise TypeError("index must be an integer")
+    total = _check_seal_history_items(history.items)
+    if total > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("too many history items")
+    if index < 0 or index >= total:
+        raise ValueError("index out of range")
+
+    levels = _history_proof_levels(history.items)
+
+    path = []
+    position = index
+    for level in levels[:-1]:
+        width = len(level)
+        padded = level if width % 2 == 0 else level + level[-1:]
+        # At an odd tail the companion position is the duplicated last
+        # node, so the carried sibling equals the current node itself.
+        path.append(padded[position ^ 1])
+        position //= 2
+
+    root = levels[-1][0]
+    proof = SealHistoryProof(
+        index=index,
+        total=total,
+        seal=history.items[index],
+        siblings=tuple(path),
+    )
+    return SEAL_HISTORY_PROOF_ROOT_TAG + _history_proof_u64(total) + root, proof
+
+
+def _validate_history_proof_structure(
+    proof: object,
+) -> tuple[int, int, ReportSeal, tuple[bytes, ...]]:
+    """Type- and structure-check a SealHistoryProof, returning its fields.
+
+    Only the container structure is checked: the seal itself is neither
+    encoded nor verified here (that is :func:`verify_seal`'s job during
+    verification). The bounds are ``0 < total < 2**64`` and
+    ``0 <= index < total``; the sibling tuple must hold exactly
+    ``(total - 1).bit_length()`` entries, each 32 bytes. Wrong field
+    types raise TypeError; illegal bounds or a bad path shape raise
+    ValueError.
+    """
+    if not isinstance(proof, SealHistoryProof):
+        raise TypeError("proof must be a SealHistoryProof instance")
+    index = proof.index
+    total = proof.total
+    seal = proof.seal
+    siblings = proof.siblings
+    if not isinstance(index, int) or isinstance(index, bool):
+        raise TypeError("proof.index must be an integer")
+    if not isinstance(total, int) or isinstance(total, bool):
+        raise TypeError("proof.total must be an integer")
+    if not isinstance(seal, ReportSeal):
+        raise TypeError("proof.seal must be a ReportSeal instance")
+    if not isinstance(siblings, tuple):
+        raise TypeError("proof.siblings must be a tuple")
+    for sibling in siblings:
+        if not isinstance(sibling, bytes):
+            raise TypeError("proof.siblings entries must be bytes")
+
+    if total <= 0:
+        raise ValueError("proof.total must be positive")
+    if total > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("too many history items")
+    if index < 0 or index >= total:
+        raise ValueError("proof.index out of range")
+    expected_depth = (total - 1).bit_length()
+    if len(siblings) != expected_depth:
+        raise ValueError("proof.siblings has the wrong length for proof.total")
+    for sibling in siblings:
+        if len(sibling) != SEAL_HISTORY_PROOF_DIGEST_SIZE:
+            raise ValueError("proof.siblings entries must be exactly 32 bytes")
+    return index, total, seal, siblings
+
+
+def check_history_proof(
+    proof: SealHistoryProof,
+    signature: AggregateSignature,
+    key: SigningDKGResult,
+) -> bool:
+    """Rebuild a proof's Merkle root and verify its seal and root signature.
+
+    The proven seal is first re-checked with :func:`verify_seal` against
+    ``key``. The leaf digest is then recomputed from ``proof.index`` and
+    ``proof.seal`` exactly as in :func:`make_history_proof`, and the
+    root is rebuilt level by level while tracking the current level's
+    width. At each level the current position is paired by its parity —
+    an even position is hashed on the left, an odd position on the
+    right — except for an odd tail: when the level has odd width and the
+    current node is its last member it has no companion, so it is paired
+    with itself (``H(node, node)``), exactly the last-node duplication
+    the tree builder uses; the supplied sibling at that level must equal
+    the current node. The width for the next level is
+    ``(width + 1) // 2``. The statement ``b"sh/r" || U64(total) || root``
+    is finally checked as ``signature``'s threshold Schnorr message via
+    :func:`verify_signature` with the key's group parameters. Returns
+    ``True`` only when the seal verifies, the rebuilt root matches the
+    signed statement and the signature verifies; a well-formed proof
+    whose seal, sibling digests or signature were tampered with, or
+    which is presented under another key, returns ``False``.
+
+    A non-:class:`SealHistoryProof` or non-:class:`AggregateSignature`
+    argument or any wrong field type (non-integer ``index``/``total``
+    including booleans, a non-:class:`ReportSeal` seal, a non-tuple
+    sibling path or non-bytes path entry) raises TypeError; a
+    non-positive or not-less-than-``2**64`` total, an out-of-range
+    index, a sibling entry that is not exactly 32 bytes, a path whose
+    length does not fit total, or a structurally illegal seal,
+    signature or key raises ValueError, exactly as :func:`verify_seal`
+    and :func:`verify_signature` would.
+    """
+    index, total, seal, siblings = _validate_history_proof_structure(proof)
+    if not isinstance(signature, AggregateSignature):
+        raise TypeError("signature must be an AggregateSignature instance")
+
+    _result, public_key, field_prime, group_prime, generator = _check_signing_setup(key)
+    _check_signing_dkg_structure(key)
+
+    if not verify_seal(seal, key):
+        return False
+
+    node = _history_proof_leaf(index, seal)
+    position = index
+    width = total
+    for sibling in siblings:
+        if width % 2 == 1 and position == width - 1:
+            # Odd tail with no companion: the tree builder duplicated
+            # the last node, so the carried sibling must be this node.
+            if sibling != node:
+                return False
+            node = _history_proof_node(node, node)
+        elif position % 2 == 0:
+            node = _history_proof_node(node, sibling)
+        else:
+            node = _history_proof_node(sibling, node)
+        position //= 2
+        width = (width + 1) // 2
+
+    signed_message = (
+        SEAL_HISTORY_PROOF_ROOT_TAG + _history_proof_u64(total) + node
+    )
+    return verify_signature(
+        signed_message,
+        signature,
+        public_key,
+        group_prime=group_prime,
+        generator=generator,
+        prime=field_prime,
+    )

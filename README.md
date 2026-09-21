@@ -847,6 +847,32 @@ python3 -m thresholdsign
   不符、截断、尾随字节及嵌套非法；非 `bytes` 入参抛 `TypeError`，
   其余非法情形抛 `ValueError`；成功后重编码必逐字节等于输入，结构
   合法但封印或签名不匹配由 `check_history` 返回 `False`
+- `SealHistoryProof(index, total, seal, siblings)` — 冻结数据类，字段
+  依次为非负叶位置 `index`、非空总项数 `total`、被证明的
+  `ReportSeal` 及自叶层向根排列的 32 字节兄弟摘要元组 `siblings`
+  （单项历史时为空元组）；奇数宽层的末节点自配，对应路径项即当前
+  节点自身；可按位置构造、按值相等，构造时不校验，核验由
+  `check_history_proof` 负责；不含网络、存储或隐藏状态
+- `make_history_proof(history, index) -> tuple[bytes, SealHistoryProof]`
+  — 按 `history.items` 顺序构造 SHA256 Merkle 树并为指定项生成单项
+  包含证明：叶摘要为 `H(b"sh/l" || U64(i) || H(encode_seal(item)))`，
+  内部节点为 `H(b"sh/n" || left || right)`，奇数宽层复制末节点配对，
+  该层路径项等于当前节点；`U64` 为 8 字节无符号大端。返回
+  `(b"sh/r" || U64(total) || root, proof)`，前者为待门限签署的根消
+  息，路径项数恰为 `(total-1).bit_length()`，各项 32 字节。非
+  `SealHistory` 入参或 `index` 非整数（含布尔）抛 `TypeError`；空历
+  史、嵌套封印结构非法、不满足 `0 < total < 2^64` 或索引越界抛
+  `ValueError`；输出唯一、无状态
+- `check_history_proof(proof, signature, key) -> bool` — 先对
+  `proof.seal` 调用 `verify_seal` 复核，再由 `proof.index` 重算叶摘
+  要并逐层重建根：偶数位置在左、奇数位置在右，奇数宽层末节点自配
+  （此时路径项必须等于当前节点，否则返回 `False`），随后以 `key`
+  的群参数对 `b"sh/r" || U64(total) || root` 调用
+  `verify_signature`；三者全真才返回 `True`，封印、路径摘要或签名
+  被篡改以及换一把密钥核验均对结构合法的入参返回 `False`。非
+  `SealHistoryProof`/`AggregateSignature` 入参或字段类型错误抛
+  `TypeError`，`total` 非正或达到 2^64、索引越界、路径长度不符、路
+  径项非 32 字节或封印、签名、密钥结构非法抛 `ValueError`；无状态
 - `Rotation(old, new, ids, t, q, p, g, sig)` — 冻结数据类，可按位置构造、按值
   相等；公开可验证的密钥轮换授权证书：`old`/`new` 为新旧联合公钥，`ids` 为严格
   递增的新成员编号元组，`t` 为新 threshold，`q`/`p`/`g` 为域素数、群素数与
