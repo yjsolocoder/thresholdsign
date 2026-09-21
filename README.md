@@ -892,6 +892,37 @@ python3 -m thresholdsign
   `bytes` 入参抛 `TypeError`，其余非法情形抛 `ValueError`；成功后
   重编码必逐字节等于输入，结构合法但封印或签名不匹配由
   `check_history_proof` 返回 `False`
+- `SealHistoryMultiProof(indices, total, seals, siblings)` — 冻结数据
+  类，字段依次为非空、严格递增且唯一的非负叶位置元组 `indices`、非空
+  总项数 `total`、与 `indices` 一一对应的被证明 `ReportSeal` 元组
+  `seals` 及自叶层向根、层内左到右消费的 32 字节兄弟摘要元组
+  `siblings`（无需同伴摘要时为空元组）；奇数宽层的末节点自配、同伴
+  本身也是已披露节点时均省略兄弟，故每个摘要至多写一次；可按位置构
+  造、按值相等，构造时不校验，核验由 `check_history_multi_proof` 负
+  责；不含网络、存储或隐藏状态
+- `make_history_multi_proof(history, indices) -> tuple[bytes, SealHistoryMultiProof]`
+  — 沿用 `make_history_proof` 的同一棵 SHA256 Merkle 树与同一根消息
+  ，为多个位置生成紧凑包含证明：逐层（叶层起向上）、层内左到右收集同
+  伴，同伴位置本身在证明中（已选同伴）或节点为奇数宽层末节点（奇数
+  尾）时不追加兄弟，否则写入同伴摘要一次；下层已证节点直接进入上层。
+  返回 `(b"sh/r" || U64(total) || root, proof)`，根消息与单项证明完全
+  相同，一个根签名可同时证明多个位置且无需完整历史。非 `SealHistory`
+  入参、`indices` 非元组或某项非整数（含布尔）抛 `TypeError`；空历史
+  或空 `indices`、嵌套封印结构非法、不满足 `0 < total < 2^64`、索引非
+  严格递增/不唯一或越界抛 `ValueError`；输出唯一、无状态
+- `check_history_multi_proof(proof, signature, key) -> bool` — 先按
+  `indices`/`seals` 重算各叶摘要，再逐层重建根：层内左到右配对，同
+  伴本身为当前层节点时直接用其摘要，奇数宽层末节点自配，否则依序消费
+  下一个 32 字节 `siblings` 项（偶数位置在左、奇数位置在右），宽度按
+  `(width + 1) // 2` 收缩；兄弟缺失或多余抛 `ValueError`。随后逐项对
+  `proof.seals` 调用 `verify_seal`，并以 `key` 的群参数对
+  `b"sh/r" || U64(total) || root` 调用 `verify_signature`；全部全真
+  才返回 `True`，封印被换/被改、索引或兄弟缺失/多余/错位、签名被篡改
+  以及换一把密钥核验均对结构合法的入参返回 `False`。非
+  `SealHistoryMultiProof`/`AggregateSignature` 入参或字段类型错误抛
+  `TypeError`，`total` 非正或达到 2^64、`indices` 空/越界/非严格递增
+  、`seals` 与 `indices` 不一一对应、兄弟项非 32 字节、兄弟数量不符
+  或封印、签名、密钥结构非法抛 `ValueError`；无状态
 - `Rotation(old, new, ids, t, q, p, g, sig)` — 冻结数据类，可按位置构造、按值
   相等；公开可验证的密钥轮换授权证书：`old`/`new` 为新旧联合公钥，`ids` 为严格
   递增的新成员编号元组，`t` 为新 threshold，`q`/`p`/`g` 为域素数、群素数与

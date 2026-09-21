@@ -28,7 +28,10 @@ SealHistory / history_message / check_history and its canonical
 transport encoding encode_history / decode_history, plus single-seal
 Merkle inclusion proofs SealHistoryProof / make_history_proof /
 check_history_proof that locate one seal in a sealed history without
-the full history, publicly
+the full history and the compact multi-seal proofs
+SealHistoryMultiProof / make_history_multi_proof /
+check_history_multi_proof that locate several seals at once with the
+one root signature, publicly
 verifiable key-rotation authorization: Rotation / rotation_payload /
 verify_rotation, the persistent, multi-hop authorization chain
 RotationChain / verify_rotation_chain / encode_rotation_chain /
@@ -123,6 +126,9 @@ __all__ = [
     "check_history_proof",
     "encode_history_proof",
     "decode_history_proof",
+    "SealHistoryMultiProof",
+    "make_history_multi_proof",
+    "check_history_multi_proof",
     "Rotation",
     "rotation_payload",
     "verify_rotation",
@@ -6395,6 +6401,341 @@ def check_history_proof(
 
     signed_message = (
         SEAL_HISTORY_PROOF_ROOT_TAG + _history_proof_u64(total) + node
+    )
+    return verify_signature(
+        signed_message,
+        signature,
+        public_key,
+        group_prime=group_prime,
+        generator=generator,
+        prime=field_prime,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Compact multi-seal inclusion proofs for seal histories: one threshold
+# signature on the same Merkle root statement lets a third party confirm that
+# several ReportSeal values each sit at a fixed position in the exact sealed
+# history without fetching the history itself. The tree, leaf/node tags and
+# root statement are identical to the single-seal SealHistoryProof; the compact
+# walk sends each companion digest at most once, level by level left to right,
+# omitting companions that are themselves disclosed and odd tails. No state is
+# kept and check_history_multi_proof re-runs verify_seal on every proven seal
+# and verify_signature on the root signature, so a proof certifies both the
+# memberships and the seals themselves.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SealHistoryMultiProof:
+    """A compact Merkle inclusion proof for several seals of a seal history.
+
+    The fields, in order, are ``indices`` (the proven leaf positions as a
+    non-empty tuple of strictly increasing, unique non-negative integers),
+    ``total`` (the total, non-empty history item count), ``seals`` (the
+    proven :class:`ReportSeal` values, one per entry of ``indices``, in the
+    same order) and ``siblings`` (the 32-byte sibling digests consumed from
+    the leaf level up to the root, in ascending level order; the tuple is
+    empty when no companion digests are needed). At a level whose width is
+    odd, the last node pairs with itself and no sibling is carried for it.
+    The dataclass is frozen, positionally constructible and compared by
+    value, and carries no network, storage or hidden state. Field types and
+    bounds are not checked at construction time —
+    :func:`check_history_multi_proof` is the way to test a proof afterwards.
+    """
+
+    indices: tuple[int, ...]
+    total: int
+    seals: tuple[ReportSeal, ...]
+    siblings: tuple[bytes, ...]
+
+
+def make_history_multi_proof(
+    history: SealHistory, indices: tuple[int, ...]
+) -> tuple[bytes, SealHistoryMultiProof]:
+    """Build the root statement and a compact multi-seal inclusion proof.
+
+    ``history`` must be a structurally legal :class:`SealHistory` — a
+    non-empty tuple of :class:`ReportSeal` values each encodable by
+    :func:`encode_seal` — and ``indices`` a non-empty tuple of leaf
+    positions to prove. The tree is exactly :func:`make_history_proof`'s
+    tree: leaves are ``H(b"sh/l" || U64(i) || H(encode_seal(item)))`` and
+    internal nodes ``H(b"sh/n" || left || right)``; a level with an odd
+    tail width duplicates its last node for pairing. Returns
+    ``(message, proof)`` where ``message`` is
+    ``b"sh/r" || U64(total) || root`` — the same bytes
+    :func:`make_history_proof` signs — and ``proof`` is the
+    :class:`SealHistoryMultiProof` whose ``seals`` pair one to one with
+    ``indices``. Its ``siblings`` are collected level by level, in
+    ascending level order (leaves upward) and left to right within a
+    level, one entry per needed companion: when the companion position is
+    itself a proven node carried in the proof, or the node is the last
+    member of an odd-width level (paired with itself), no sibling is
+    appended; otherwise the companion digest is. Proven nodes from lower
+    levels feed the level above exactly as in the tree, so no digest is
+    sent twice.
+
+    Wrong argument types raise TypeError: a non-:class:`SealHistory`
+    history, a non-tuple index sequence or a non-integer (including
+    boolean) index. An empty history or index tuple, a structurally
+    illegal item seal, a count that does not fit ``0 < total < 2**64``,
+    indices that are not strictly increasing and unique, or an index
+    outside ``0 <= i < total`` raises ValueError.
+    """
+    if not isinstance(history, SealHistory):
+        raise TypeError("history must be a SealHistory instance")
+    if not isinstance(indices, tuple):
+        raise TypeError("indices must be a tuple")
+    total = _check_seal_history_items(history.items)
+    if total > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("too many history items")
+    if len(indices) == 0:
+        raise ValueError("indices must be non-empty")
+    previous = -1
+    for index in indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("each index must be an integer")
+        if index <= previous:
+            raise ValueError("indices must be strictly increasing and unique")
+        if index < 0 or index >= total:
+            raise ValueError("index out of range")
+        previous = index
+
+    levels = _history_proof_levels(history.items)
+
+    siblings: list[bytes] = []
+    positions = set(indices)
+    for level in levels[:-1]:
+        width = len(level)
+        padded = level if width % 2 == 0 else level + level[-1:]
+        next_positions = set()
+        for position in sorted(positions):
+            if width % 2 == 1 and position == width - 1:
+                # Odd tail with no companion: the tree pairs it with itself.
+                pass
+            elif (position ^ 1) in positions:
+                # The companion is itself a disclosed node; nothing to send.
+                pass
+            else:
+                siblings.append(padded[position ^ 1])
+            next_positions.add(position // 2)
+        positions = next_positions
+
+    root = levels[-1][0]
+    proof_seals = tuple(history.items[index] for index in indices)
+    proof = SealHistoryMultiProof(
+        indices=tuple(indices),
+        total=total,
+        seals=proof_seals,
+        siblings=tuple(siblings),
+    )
+    return SEAL_HISTORY_PROOF_ROOT_TAG + _history_proof_u64(total) + root, proof
+
+
+def _required_history_multi_proof_siblings(
+    total: int, indices: tuple[int, ...]
+) -> int:
+    """Number of 32-byte companion digests a multi-proof must carry.
+
+    Replays :func:`make_history_multi_proof`'s level walk structurally: at
+    each level a proven node needs a sibling unless it is the odd-width
+    tail (paired with itself) or its companion is itself a proven node at
+    that level. The answer depends only on ``total`` and the disclosed
+    positions — never on the seals or the digests — so it is the unique
+    sibling count both makers and checkers can demand.
+    """
+    required = 0
+    positions = set(indices)
+    width = total
+    while width > 1:
+        next_positions = set()
+        for position in sorted(positions):
+            if width % 2 == 1 and position == width - 1:
+                # Odd tail with no companion: the tree pairs it with itself.
+                pass
+            elif (position ^ 1) in positions:
+                # The companion is itself a disclosed node; nothing to send.
+                pass
+            else:
+                required += 1
+            next_positions.add(position // 2)
+        positions = next_positions
+        width = (width + 1) // 2
+    return required
+
+
+def _validate_history_multi_proof_structure(
+    proof: object,
+) -> tuple[tuple[int, ...], int, tuple[ReportSeal, ...], tuple[bytes, ...]]:
+    """Type- and structure-check a SealHistoryMultiProof, returning its fields.
+
+    Only the container structure is checked: the seals themselves are
+    neither encoded nor verified here (that is :func:`verify_seal`'s job
+    during verification). The bounds are ``0 < total < 2**64``, a
+    non-empty ``indices``/``seals`` pair of equal length with strictly
+    increasing indices in ``0 <= i < total`` and a siblings tuple whose
+    entries are exactly 32 bytes. Wrong field types raise TypeError;
+    illegal bounds or shapes raise ValueError. The number of siblings is
+    derived uniquely from ``total`` and ``indices`` (the compact walk
+    sends one companion per proven node that is neither an odd tail nor
+    paired with another proven node), so a missing or extra sibling
+    raises ValueError here — before any root is rebuilt.
+    """
+    if not isinstance(proof, SealHistoryMultiProof):
+        raise TypeError(
+            "proof must be a SealHistoryMultiProof instance"
+        )
+    indices = proof.indices
+    total = proof.total
+    seals = proof.seals
+    siblings = proof.siblings
+    if not isinstance(indices, tuple):
+        raise TypeError("proof.indices must be a tuple")
+    if not isinstance(total, int) or isinstance(total, bool):
+        raise TypeError("proof.total must be an integer")
+    if not isinstance(seals, tuple):
+        raise TypeError("proof.seals must be a tuple")
+    if not isinstance(siblings, tuple):
+        raise TypeError("proof.siblings must be a tuple")
+
+    if total <= 0:
+        raise ValueError("proof.total must be positive")
+    if total > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("too many history items")
+    if len(indices) == 0:
+        raise ValueError("proof.indices must be non-empty")
+    if len(indices) != len(seals):
+        raise ValueError("proof.seals must pair one-to-one with proof.indices")
+
+    previous = -1
+    for index in indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("proof.indices entries must be integers")
+        if index <= previous:
+            raise ValueError(
+                "proof.indices must be strictly increasing and unique"
+            )
+        if index < 0 or index >= total:
+            raise ValueError("proof.indices entry out of range")
+        previous = index
+
+    for seal in seals:
+        if not isinstance(seal, ReportSeal):
+            raise TypeError("proof.seals entries must be ReportSeal instances")
+
+    for sibling in siblings:
+        if not isinstance(sibling, bytes):
+            raise TypeError("proof.siblings entries must be bytes")
+    for sibling in siblings:
+        if len(sibling) != SEAL_HISTORY_PROOF_DIGEST_SIZE:
+            raise ValueError("proof.siblings entries must be exactly 32 bytes")
+    required_siblings = _required_history_multi_proof_siblings(total, indices)
+    if len(siblings) != required_siblings:
+        raise ValueError(
+            "proof.siblings count is not the one determined by total and indices"
+        )
+    return indices, total, seals, siblings
+
+
+def check_history_multi_proof(
+    proof: SealHistoryMultiProof,
+    signature: AggregateSignature,
+    key: SigningDKGResult,
+) -> bool:
+    """Rebuild a multi-proof's Merkle root and verify its seals and signature.
+
+    Every disclosed seal is first re-checked with :func:`verify_seal`
+    against ``key`` in index order. Each seal's leaf digest is then
+    recomputed from its position and the seal exactly as in
+    :func:`make_history_proof`, and the root is rebuilt level by level
+    while consuming ``proof.siblings`` in ascending level order and left
+    to right within a level: the current level holds the digests of the
+    proven nodes at their current positions, paired left to right; when a
+    companion is itself a current-level node its digest is used directly,
+    when the node is the last member of an odd-width level it is paired
+    with itself, and otherwise the next 32-byte entry of ``siblings`` is
+    consumed. The current width contracts as ``(width + 1) // 2``. The
+    statement ``b"sh/r" || U64(total) || root`` is finally checked as
+    ``signature``'s threshold Schnorr message via :func:`verify_signature`
+    with the key's group parameters. Returns ``True`` only when every seal
+    verifies against the key, the rebuild consumes every sibling exactly
+    and reaches the single signed root, and the signature verifies; a
+    well-formed proof whose seals, indices, siblings, root or signature
+    was tampered with — seals swapped or altered, a missing, extra or
+    misplaced sibling — or which is presented under another key, returns
+    ``False``.
+
+    A non-:class:`SealHistoryMultiProof` or non-:class:`AggregateSignature`
+    argument or any wrong field type (non-tuple indices/seals/siblings, a
+    non-integer ``total`` or index including booleans, a
+    non-:class:`ReportSeal` seal or non-bytes sibling) raises TypeError; a
+    non-positive or over-64-bit total, empty indices, an index out of
+    range or not strictly increasing, a seals tuple that does not pair
+    one-to-one with the indices, a sibling that is not exactly 32 bytes,
+    too few or too many siblings for the indicated positions, or a
+    structurally illegal seal, signature or ``key`` raises ValueError,
+    exactly as :func:`verify_seal` and :func:`verify_signature` would.
+    """
+    indices, total, seals, siblings = _validate_history_multi_proof_structure(proof)
+    if not isinstance(signature, AggregateSignature):
+        raise TypeError("signature must be an AggregateSignature instance")
+
+    _result, public_key, field_prime, group_prime, generator = _check_signing_setup(key)
+    _check_signing_dkg_structure(key)
+
+    for seal in seals:
+        if not verify_seal(seal, key):
+            return False
+
+    nodes = {
+        index: _history_proof_leaf(index, seal)
+        for index, seal in zip(indices, seals)
+    }
+    pending = iter(siblings)
+    width = total
+    while width > 1:
+        next_nodes = {}
+        for position in sorted(nodes):
+            parent = position // 2
+            if parent in next_nodes:
+                continue
+            if width % 2 == 1 and position == width - 1:
+                # Odd tail with no companion: pair the node with itself.
+                next_nodes[parent] = _history_proof_node(
+                    nodes[position], nodes[position]
+                )
+            elif (position ^ 1) in nodes:
+                left = position if position % 2 == 0 else position ^ 1
+                next_nodes[parent] = _history_proof_node(
+                    nodes[left], nodes[left ^ 1]
+                )
+            else:
+                try:
+                    sibling = next(pending)
+                except StopIteration:
+                    raise ValueError(
+                        "proof.siblings is missing entries"
+                    ) from None
+                if position % 2 == 0:
+                    next_nodes[parent] = _history_proof_node(
+                        nodes[position], sibling
+                    )
+                else:
+                    next_nodes[parent] = _history_proof_node(
+                        sibling, nodes[position]
+                    )
+        nodes = next_nodes
+        width = (width + 1) // 2
+
+    try:
+        next(pending)
+    except StopIteration:
+        pass
+    else:
+        raise ValueError("proof.siblings has extra entries")
+
+    signed_message = (
+        SEAL_HISTORY_PROOF_ROOT_TAG + _history_proof_u64(total) + nodes[0]
     )
     return verify_signature(
         signed_message,
