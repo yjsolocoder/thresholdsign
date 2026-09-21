@@ -23,7 +23,10 @@ decode_rotation_chain, and the stateless, threshold-Schnorr-authenticated
 audit chain: AuditChain / audit_chain_payload / verify_audit_chain.
 Merkle inclusion proofs over a chain's records: AuditProof / make_proof /
 check_proof, plus their canonical transport encoding encode_audit_proof /
-decode_audit_proof.
+decode_audit_proof. Append-only consistency proofs over the same tree:
+AuditExtensionProof / make_extension / check_extension, letting an observer
+verify — from two threshold signatures alone — that an old record sequence
+is a prefix of a new one, without seeing any message or receipt.
 """
 
 from __future__ import annotations
@@ -98,6 +101,9 @@ __all__ = [
     "check_proof",
     "encode_audit_proof",
     "decode_audit_proof",
+    "AuditExtensionProof",
+    "make_extension",
+    "check_extension",
 ]
 
 # Mersenne prime 2**127 - 1: large enough for integer secrets, small enough that
@@ -4229,3 +4235,194 @@ def decode_audit_proof(payload: bytes) -> AuditProof:
     if encode_audit_proof(proof) != payload:
         raise ValueError("non-canonical audit proof")
     return proof
+
+
+# ---------------------------------------------------------------------------
+# Append-only consistency (extension) proofs over the same audit Merkle tree:
+# a compact statement that the first ``old_n`` records of a chain are exactly
+# the records of an older, shorter chain. The proof carries only the leaf
+# digests — never a message or a receipt — and both the old and the new
+# statement are the ordinary record-root messages ``b"am/r" || U64(n) ||
+# root`` of the shared tree rules, so an observer needs nothing but the two
+# threshold signatures to check the prefix relation. No state is kept.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AuditExtensionProof:
+    """An append-only consistency proof between two audit-chain record roots.
+
+    The fields, in order, are ``old_n`` (the non-empty old record count,
+    strictly smaller than the new total) and ``leaves`` (the 32-byte leaf
+    digests of the full new record sequence, in order, each exactly
+    ``H(b"am/l" || U64(i) || H(message) || H(audit.payload))`` as in
+    :func:`make_proof`; the tuple is non-empty). The first ``old_n`` leaves
+    rebuild the old root and all of them rebuild the new root, so the proof
+    discloses no message or receipt — only their digests. The dataclass is
+    frozen, positionally constructible and compared by value, and carries no
+    network, storage or hidden state. Field types and bounds are not checked
+    at construction time — :func:`check_extension` is the way to test a
+    proof afterwards.
+    """
+
+    old_n: int
+    leaves: tuple[bytes, ...]
+
+
+def _audit_extension_root(leaves: tuple[bytes, ...]) -> bytes:
+    """Root digest of the AuditProof tree rebuilt directly from leaf digests.
+
+    The pairing rules are exactly those of :func:`_audit_proof_levels`: a
+    level with an odd tail width duplicates its last node, and internal
+    nodes are ``H(b"am/n" || left || right)``.
+    """
+    current = leaves
+    while len(current) > 1:
+        if len(current) % 2 == 1:
+            current = current + current[-1:]
+        current = tuple(
+            _audit_proof_node(current[index], current[index + 1])
+            for index in range(0, len(current), 2)
+        )
+    return current[0]
+
+
+def make_extension(
+    records: tuple[tuple[bytes, SigningAudit], ...], old_n: int
+) -> tuple[bytes, bytes, AuditExtensionProof]:
+    """Build the old and new root statements and a consistency proof.
+
+    ``records`` must be the same non-empty, order-preserving tuple of
+    ``(message, SigningAudit)`` pairs an :class:`AuditChain` seals and
+    ``old_n`` the old record count, which must be non-zero and strictly
+    smaller than the total record count. The tree rules are exactly those of
+    :func:`make_proof`; the first ``old_n`` leaves give the old root and all
+    leaves give the new root. Returns ``(old_message, new_message, proof)``
+    where both messages are ``b"am/r" || U64(n) || root`` with ``n`` the old
+    count and the total count respectively — the bytes to be
+    threshold-signed — and ``proof`` is the :class:`AuditExtensionProof`
+    carrying every leaf digest.
+
+    Wrong argument types raise TypeError: a non-tuple record sequence, a
+    malformed record (exactly the rules of :func:`audit_chain_payload`), or
+    a non-integer (including boolean) ``old_n``. An empty record sequence, a
+    record count that does not fit the 8-byte counter, or an ``old_n``
+    outside ``0 < old_n < n`` raises ValueError.
+    """
+    if not isinstance(old_n, int) or isinstance(old_n, bool):
+        raise TypeError("old_n must be an integer")
+    count = _check_audit_chain_records(records)
+    if count > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("too many records")
+    if old_n <= 0 or old_n >= count:
+        raise ValueError("old_n out of range")
+
+    leaves = tuple(
+        _audit_proof_leaf(index, message, audit)
+        for index, (message, audit) in enumerate(records)
+    )
+    old_root = _audit_extension_root(leaves[:old_n])
+    new_root = _audit_extension_root(leaves)
+    old_message = AUDIT_PROOF_ROOT_TAG + _audit_proof_u64(old_n) + old_root
+    new_message = AUDIT_PROOF_ROOT_TAG + _audit_proof_u64(count) + new_root
+    proof = AuditExtensionProof(old_n=old_n, leaves=leaves)
+    return old_message, new_message, proof
+
+
+def _validate_audit_extension_structure(
+    proof: object,
+) -> tuple[int, tuple[bytes, ...]]:
+    """Type- and structure-check an :class:`AuditExtensionProof`.
+
+    Shared by :func:`check_extension`. The bounds are
+    ``0 < old_n < len(leaves)`` and ``len(leaves) <= 2**64 - 1``; the leaf
+    tuple must be non-empty and every entry exactly 32 bytes. Wrong field
+    types raise TypeError; illegal bounds, an empty leaf tuple or a leaf of
+    the wrong width raise ValueError.
+    """
+    if not isinstance(proof, AuditExtensionProof):
+        raise TypeError("proof must be an AuditExtensionProof instance")
+    old_n = proof.old_n
+    leaves = proof.leaves
+    if not isinstance(old_n, int) or isinstance(old_n, bool):
+        raise TypeError("proof.old_n must be an integer")
+    if not isinstance(leaves, tuple):
+        raise TypeError("proof.leaves must be a tuple")
+    for leaf in leaves:
+        if not isinstance(leaf, bytes):
+            raise TypeError("proof.leaves entries must be bytes")
+
+    try:
+        count = len(leaves)
+    except OverflowError:
+        raise ValueError("too many leaves") from None
+    if count == 0:
+        raise ValueError("proof.leaves must be non-empty")
+    if count > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("too many leaves")
+    if old_n <= 0 or old_n >= count:
+        raise ValueError("proof.old_n out of range")
+    for leaf in leaves:
+        if len(leaf) != AUDIT_PROOF_DIGEST_SIZE:
+            raise ValueError("proof.leaves entries must be exactly 32 bytes")
+    return old_n, leaves
+
+
+def check_extension(
+    proof: AuditExtensionProof,
+    old_sig: AggregateSignature,
+    new_sig: AggregateSignature,
+    key: SigningDKGResult,
+) -> bool:
+    """Verify a consistency proof against its two threshold signatures.
+
+    The old root is rebuilt from the first ``proof.old_n`` leaves of
+    ``proof.leaves`` and the new root from all of them, exactly as in
+    :func:`make_extension`; the statements ``b"am/r" || U64(old_n) ||
+    old_root`` and ``b"am/r" || U64(n) || new_root`` are then checked as
+    ``old_sig``'s and ``new_sig``'s threshold Schnorr messages via
+    :func:`verify_signature` under ``key``. Returns ``True`` only when both
+    signatures verify: an observer learns nothing but the two signatures and
+    the leaf digests, yet is convinced the old record sequence is a prefix
+    of the new one. A well-formed proof whose leaves or ``old_n`` were
+    tampered with, a swapped or mismatched signature pair, or a proof
+    presented under another key returns ``False``.
+
+    A non-:class:`AuditExtensionProof` proof, a
+    non-:class:`AggregateSignature` signature or any wrong field type
+    (non-integer ``old_n`` including booleans, a non-tuple leaf sequence or
+    non-bytes leaf) raises TypeError; an empty leaf tuple, a leaf that is
+    not exactly 32 bytes, a total over ``2**64 - 1``, an ``old_n`` outside
+    ``0 < old_n < n``, or a structurally illegal signature or ``key`` raises
+    ValueError, exactly as :func:`verify_signature` would.
+    """
+    old_n, leaves = _validate_audit_extension_structure(proof)
+    if not isinstance(old_sig, AggregateSignature):
+        raise TypeError("old_sig must be an AggregateSignature instance")
+    if not isinstance(new_sig, AggregateSignature):
+        raise TypeError("new_sig must be an AggregateSignature instance")
+
+    _result, public_key, field_prime, group_prime, generator = _check_signing_setup(key)
+    _check_signing_dkg_structure(key)
+
+    old_root = _audit_extension_root(leaves[:old_n])
+    new_root = _audit_extension_root(leaves)
+    old_message = AUDIT_PROOF_ROOT_TAG + _audit_proof_u64(old_n) + old_root
+    new_message = AUDIT_PROOF_ROOT_TAG + _audit_proof_u64(len(leaves)) + new_root
+    if not verify_signature(
+        old_message,
+        old_sig,
+        public_key,
+        group_prime=group_prime,
+        generator=generator,
+        prime=field_prime,
+    ):
+        return False
+    return verify_signature(
+        new_message,
+        new_sig,
+        public_key,
+        group_prime=group_prime,
+        generator=generator,
+        prime=field_prime,
+    )
