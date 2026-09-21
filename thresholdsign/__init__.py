@@ -26,7 +26,8 @@ check_proof, the compact multi-record proofs AuditMultiProof /
 make_multi_proof / check_multi_proof that certify several ordered records
 with the one root signature, plus their canonical transport encoding
 encode_audit_proof /
-decode_audit_proof. Append-only consistency proofs over the same tree:
+decode_audit_proof and encode_audit_multi_proof /
+decode_audit_multi_proof. Append-only consistency proofs over the same tree:
 AuditExtensionProof / make_extension / check_extension, letting an observer
 verify — from two threshold signatures alone — that an old record sequence
 is a prefix of a new one, without seeing any message or receipt, plus their
@@ -108,6 +109,8 @@ __all__ = [
     "check_multi_proof",
     "encode_audit_proof",
     "decode_audit_proof",
+    "encode_audit_multi_proof",
+    "decode_audit_multi_proof",
     "AuditExtensionProof",
     "make_extension",
     "check_extension",
@@ -4520,6 +4523,162 @@ def decode_audit_proof(payload: bytes) -> AuditProof:
     _validate_audit_proof_structure(proof)
     if encode_audit_proof(proof) != payload:
         raise ValueError("non-canonical audit proof")
+    return proof
+
+
+# ---------------------------------------------------------------------------
+# Canonical multi-record audit-proof transport: a self-delimiting,
+# byte-for-byte reproducible encoding of an AuditMultiProof for
+# cross-implementation exchange and persistence. Decoding restores structure
+# only — receipt payloads are not parsed, no signature is checked and no state
+# is kept, so check_multi_proof remains the sole verifier afterwards.
+# ---------------------------------------------------------------------------
+
+AUDIT_MULTI_PROOF_WIRE_TAG = b"thresholdsign/audit-multi-proof/v1"
+
+
+def encode_audit_multi_proof(proof: AuditMultiProof) -> bytes:
+    """Canonically encode a multi-record audit proof for transport or persistence.
+
+    The encoding is the direct concatenation, in order, of the tag
+    ``b"thresholdsign/audit-multi-proof/v1"``, ``VARINT(n)``, the index count
+    as a 4-byte unsigned big-endian integer followed by each index as a
+    ``VARINT`` in the proof's strictly increasing order, the record count as a
+    4-byte unsigned big-endian integer followed, per record, by the message
+    frame (a 4-byte unsigned big-endian length and the raw bytes, possibly
+    empty) and the receipt frame (a 4-byte unsigned big-endian non-zero length
+    and the raw :attr:`SigningAudit.payload` bytes), and finally the sibling
+    count as a 4-byte unsigned big-endian integer followed by the raw 32-byte
+    sibling digests in their original order. A ``VARINT`` is a 4-byte unsigned
+    big-endian body length followed by the shortest unsigned big-endian value
+    (zero is the single byte ``00`` and positive values carry no leading
+    zero); every other counter and frame length is a plain 4-byte unsigned
+    big-endian integer. The bounds are ``0 < n < 2**64``, a non-empty,
+    strictly increasing index tuple inside ``0 <= i < n`` with exactly one
+    non-empty-payload record per index, and 32-byte siblings.
+
+    Only a structurally legal :class:`AuditMultiProof` is accepted — wrong
+    field types raise TypeError and illegal bounds, an empty index or receipt,
+    a records tuple that does not pair one-to-one with the indices, or a
+    sibling of the wrong width raises ValueError, exactly as
+    :func:`check_multi_proof`'s structural checks do — but the receipts are
+    not parsed and no signature is checked: :func:`check_multi_proof` stays
+    the way to verify a proof afterwards. The output for a given proof is
+    unique and the encoding carries no network, storage or hidden state.
+    """
+    if not isinstance(proof, AuditMultiProof):
+        raise TypeError("proof must be an AuditMultiProof instance")
+    indices, count, proof_records, siblings = _validate_audit_multi_proof_structure(proof)
+
+    buffer = bytearray(AUDIT_MULTI_PROOF_WIRE_TAG)
+    buffer += _encode_varint(count)
+    buffer += len(indices).to_bytes(4, "big", signed=False)
+    for index in indices:
+        buffer += _encode_varint(index)
+    buffer += len(proof_records).to_bytes(4, "big", signed=False)
+    for message, audit in proof_records:
+        if len(message) > 0xFFFFFFFF:
+            raise ValueError("message encoding too long")
+        if len(audit.payload) > 0xFFFFFFFF:
+            raise ValueError("receipt encoding too long")
+        buffer += len(message).to_bytes(4, "big", signed=False)
+        buffer += message
+        buffer += len(audit.payload).to_bytes(4, "big", signed=False)
+        buffer += audit.payload
+    buffer += len(siblings).to_bytes(4, "big", signed=False)
+    for sibling in siblings:
+        buffer += sibling
+    return bytes(buffer)
+
+
+def decode_audit_multi_proof(payload: bytes) -> AuditMultiProof:
+    """Decode the canonical encoding produced by :func:`encode_audit_multi_proof`.
+
+    Accepts only the single canonical form: the tag
+    ``b"thresholdsign/audit-multi-proof/v1"``, ``VARINT(n)``, the 4-byte index
+    count followed by that many length-prefixed indices (each a 4-byte
+    unsigned big-endian length and its shortest unsigned big-endian value,
+    zero as the single byte ``00``), the 4-byte record count followed by that
+    many record pairs — a message frame (a 4-byte length, possibly zero, and
+    the raw message) then a receipt frame (a 4-byte non-zero length and the
+    raw receipt bytes) — and finally the 4-byte sibling count followed by
+    exactly that many raw 32-byte digests. A non-bytes argument raises
+    TypeError; a wrong or missing tag, truncation, trailing bytes, a
+    non-canonical integer (leading zero or over-long length), an empty index
+    or receipt, an ``n`` outside ``0 < n < 2**64``, an index out of range or
+    not strictly increasing, a record count that does not equal the index
+    count, a sibling that is not exactly 32 bytes, or a count that does not
+    match the stream raises ValueError. A successfully decoded proof
+    re-encodes to exactly the input bytes.
+
+    Decoding only restores the structure: the receipt payloads are stored
+    opaque and are neither parsed nor verified, no signature is checked and
+    no state is kept. A structurally legal proof whose receipts do not match
+    its messages, whose siblings rebuild a different root or whose sealing
+    signature is invalid is returned normally, and :func:`check_multi_proof`
+    reports it as ``False``.
+    """
+    if not isinstance(payload, bytes):
+        raise TypeError("payload must be bytes")
+    if not payload.startswith(AUDIT_MULTI_PROOF_WIRE_TAG):
+        raise ValueError("bad audit multi proof tag")
+    offset = len(AUDIT_MULTI_PROOF_WIRE_TAG)
+
+    count, offset = _read_varint(payload, offset, what="audit multi proof n")
+
+    if offset + 4 > len(payload):
+        raise ValueError("truncated audit multi proof index count")
+    index_count = int.from_bytes(payload[offset:offset + 4], "big")
+    offset += 4
+    if index_count == 0:
+        raise ValueError("audit multi proof indices must be non-empty")
+    indices = []
+    for _ in range(index_count):
+        index, offset = _read_varint(payload, offset, what="audit multi proof index")
+        if indices and index <= indices[-1]:
+            raise ValueError("audit multi proof indices must be strictly increasing")
+        indices.append(index)
+
+    if offset + 4 > len(payload):
+        raise ValueError("truncated audit multi proof record count")
+    record_count = int.from_bytes(payload[offset:offset + 4], "big")
+    offset += 4
+    if record_count != index_count:
+        raise ValueError("audit multi proof record count must match the index count")
+    records = []
+    for _ in range(record_count):
+        message, offset = _read_audit_proof_block(
+            payload, offset, what="multi proof message", allow_empty=True
+        )
+        receipt, offset = _read_audit_proof_block(
+            payload, offset, what="multi proof receipt"
+        )
+        records.append((message, SigningAudit(payload=receipt)))
+
+    if offset + 4 > len(payload):
+        raise ValueError("truncated audit multi proof sibling count")
+    sibling_count = int.from_bytes(payload[offset:offset + 4], "big")
+    offset += 4
+    siblings = []
+    for _ in range(sibling_count):
+        if offset + AUDIT_PROOF_DIGEST_SIZE > len(payload):
+            raise ValueError("truncated audit multi proof siblings")
+        siblings.append(
+            bytes(payload[offset:offset + AUDIT_PROOF_DIGEST_SIZE])
+        )
+        offset += AUDIT_PROOF_DIGEST_SIZE
+    if offset != len(payload):
+        raise ValueError("trailing bytes after audit multi proof")
+
+    proof = AuditMultiProof(
+        indices=tuple(indices),
+        n=count,
+        records=tuple(records),
+        siblings=tuple(siblings),
+    )
+    _validate_audit_multi_proof_structure(proof)
+    if encode_audit_multi_proof(proof) != payload:
+        raise ValueError("non-canonical audit multi proof")
     return proof
 
 

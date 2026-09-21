@@ -471,6 +471,25 @@ assert check_multi_proof(proof, signature, key)
 越界或非严格递增、`records` 与 `indices` 数量不同、空回执、兄弟非 32 字节或数量
 缺失/多余、回执或签名结构非法抛 `ValueError`。
 
+要跨实现传输或持久化多记录证明，用
+`encode_audit_multi_proof` / `decode_audit_multi_proof` 的公开规范编码，它只还原
+结构、不解析回执、不验签、不留状态：
+
+```python
+from thresholdsign import encode_audit_multi_proof, decode_audit_multi_proof
+
+blob = encode_audit_multi_proof(proof)             # bytes，可自由传输/落盘，无隐藏状态
+restored = decode_audit_multi_proof(blob)          # AuditMultiProof
+assert encode_audit_multi_proof(restored) == blob  # 成功解码必可逐字节复现
+```
+
+编码依次直拼标签 `b"thresholdsign/audit-multi-proof/v1"`、`VARINT(n)`、4 字节
+索引数及按证明中严格递增顺序的各 `VARINT(index)`、4 字节记录数，再逐条写 4 字节
+消息长度与原字节（消息可空）、4 字节回执长度与 `SigningAudit.payload`（回执非
+空），最后写 4 字节兄弟数及按原顺序逐字的 32 字节摘要；除 `VARINT` 外所有计数与
+长度均为 4 字节无符号大端。`VARINT` 为 4 字节无符号大端长度 + 最短无符号大端
+值（零是单字节 `00`，正数禁前导零）。
+
 ### 追加一致性证明
 
 要向第三方证明一条旧记录序列是某条更长新序列的前缀，而不必公开任何消息或回执时，
@@ -821,6 +840,23 @@ python3 -m thresholdsign
   越界或超 2^64-1 的 `n`、非规范整数（前导零或超长）、截断/尾随字节及计数/路径
   不符；成功后重编码必逐字节等于输入。非 `bytes` 入参抛 `TypeError`，其余非法
   情形抛 `ValueError`；结构合法但回执或签名不匹配由 `check_proof` 返回 `False`
+- `encode_audit_multi_proof(proof) -> bytes` — 多记录证明的规范传输/持久化编码：
+  依次直拼标签 `b"thresholdsign/audit-multi-proof/v1"`、`VARINT(n)`、4 字节索引
+  数及按严格递增顺序的各 `VARINT(index)`、4 字节记录数，再逐条写消息帧（4 字节
+  长度 + 原字节，可空）与回执帧（4 字节非零长度 + `SigningAudit.payload`），最后
+  写 4 字节兄弟数及逐字 32 字节兄弟摘要；除 `VARINT` 外所有计数与长度均为 4 字节
+  无符号大端，`VARINT` 为 4 字节长度 + 最短无符号大端值（零为 `00`，正数禁前导
+  零）。只接受结构合法的 `AuditMultiProof`（`0 < n < 2^64`、索引非空、严格递增
+  且不越界、记录与索引一一对应、回执非空、兄弟均为 32 字节），不解析回执、不验签；
+  输出唯一、无状态。非 `AuditMultiProof` 入参或字段类型错误抛 `TypeError`，空
+  索引/回执、越界/溢出、计数不符或摘要宽度错误、超长帧抛 `ValueError`
+- `decode_audit_multi_proof(payload) -> AuditMultiProof` —
+  `encode_audit_multi_proof` 的逆操作，仅还原结构、不解析回执、不验签、不留状态：
+  拒绝非 `bytes`、坏/缺标签、空索引或空回执、`n` 越界或超 2^64-1、下标越界或非
+  严格递增、索引数与记录数不符、摘要非 32 字节、截断/尾随字节及非规范整数（前导
+  零或超长）；成功后重编码必逐字节等于输入。非 `bytes` 入参抛 `TypeError`，其余
+  非法情形抛 `ValueError`；结构合法但回执、兄弟或签名不匹配由 `check_multi_proof`
+  返回 `False`
 - `AuditExtensionProof(old_n, leaves)` — 冻结数据类；追加一致性证明：`old_n` 为
   旧记录数，`leaves` 为新序列全部 32 字节叶摘要的保序元组，可按位置构造、按值相等
 - `make_extension(records, old_n) -> (old_message, new_message, proof)` — 沿用
