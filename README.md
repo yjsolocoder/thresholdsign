@@ -756,6 +756,28 @@ python3 -m thresholdsign
   `item.commitment`，解得 `s = (z1 - z2)/(a1 - a2) mod q` 须等于
   `item.share` 且满足 `g^s = Y_i mod p`；任何不匹配返回 `False`，全部
   一致才返回 `True`；无状态
+- `NonceLeakReport(items)` — 冻结数据类，仅含 `items` 字段，可按位置
+  构造、按值相等；`items` 为非空的 `NonceLeak` 元组，各项按
+  `(signer_id, commitment)` 严格递增且无重复，恰如 `recover_leaks` 的
+  输出顺序；构造时不校验，编解码与验证函数负责检查
+- `encode_nonce_leak_report(report) -> bytes` — 批量泄露证据的规范
+  传输/持久化编码：依次拼接标签 `b"thresholdsign/nlr/v1"`、4 字节无符号
+  大端项数 `n`（非零）及各项的 `U32(len(x)) || x` 帧，其中 `x` 为该项
+  `encode_nonce_leak` 的输出；按原序写入、不排序、不验泄露，要求非空
+  且键严格递增、无重复。非 `NonceLeakReport`、`items` 非元组、元素非
+  `NonceLeak` 或嵌套类型错误（含布尔冒充整数）抛 `TypeError`；空报告、
+  乱序/重复键、嵌套结构非法或超长帧抛 `ValueError`；输出唯一、无状态
+- `decode_nonce_leak_report(blob) -> NonceLeakReport` —
+  `encode_nonce_leak_report` 的逆操作，逐帧调用 `decode_nonce_leak`
+  （拒绝一切非规范嵌套编码），不排序、不验泄露：拒绝非 `bytes`、坏/缺
+  标签、零帧计数、声明计数与帧数不符、空帧、截断、尾随字节、嵌套非法
+  以及解码后乱序/重复的键；非 `bytes` 入参抛 `TypeError`，其余非法情形
+  抛 `ValueError`；成功后重编码必逐字节等于输入
+- `verify_nonce_leak_report(report, key) -> bool` — 仅凭签名密钥逐项
+  复核报告：先按 `encode_nonce_leak_report` 的结构要求校验 `report`
+  （类型错误抛 `TypeError`，空报告、非元组、乱序/重复键或嵌套结构非法
+  抛 `ValueError`），再对各项调用 `verify_nonce_leak`；全部为 `True`
+  才返回 `True`，任一项合法不匹配即为 `False`；无状态
 - `Rotation(old, new, ids, t, q, p, g, sig)` — 冻结数据类，可按位置构造、按值
   相等；公开可验证的密钥轮换授权证书：`old`/`new` 为新旧联合公钥，`ids` 为严格
   递增的新成员编号元组，`t` 为新 threshold，`q`/`p`/`g` 为域素数、群素数与
