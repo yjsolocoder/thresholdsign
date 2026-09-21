@@ -28,7 +28,8 @@ SealHistory / history_message / check_history and its canonical
 transport encoding encode_history / decode_history, plus single-seal
 Merkle inclusion proofs SealHistoryProof / make_history_proof /
 check_history_proof that locate one seal in a sealed history without
-the full history, publicly
+the full history, plus their canonical transport encoding
+encode_history_proof / decode_history_proof, publicly
 verifiable key-rotation authorization: Rotation / rotation_payload /
 verify_rotation, the persistent, multi-hop authorization chain
 RotationChain / verify_rotation_chain / encode_rotation_chain /
@@ -121,6 +122,8 @@ __all__ = [
     "SealHistoryProof",
     "make_history_proof",
     "check_history_proof",
+    "encode_history_proof",
+    "decode_history_proof",
     "Rotation",
     "rotation_payload",
     "verify_rotation",
@@ -6402,3 +6405,123 @@ def check_history_proof(
         generator=generator,
         prime=field_prime,
     )
+
+
+# ---------------------------------------------------------------------------
+# Canonical history-proof transport: a self-delimiting, byte-for-byte
+# reproducible encoding of a SealHistoryProof for cross-implementation
+# exchange and persistence. Decoding restores structure only — the nested
+# seal is decoded but neither it nor any signature is verified, and no state
+# is kept, so check_history_proof remains the sole verifier afterwards.
+# ---------------------------------------------------------------------------
+
+SEAL_HISTORY_PROOF_WIRE_TAG = b"thresholdsign/seal-history-proof/v1"
+
+
+def encode_history_proof(proof: SealHistoryProof) -> bytes:
+    """Canonically encode a seal history inclusion proof for transport.
+
+    The encoding is the direct concatenation, in order, of the tag
+    ``b"thresholdsign/seal-history-proof/v1"``, ``VARINT(index)`` and
+    ``VARINT(total)``, the seal frame — the 4-byte unsigned big-endian
+    length ``len(E)`` followed by the raw seal encoding
+    ``E = encode_seal(proof.seal)`` — the sibling count as a 4-byte
+    unsigned big-endian integer, and then the raw 32-byte sibling
+    digests concatenated in path order, from the leaf level up to the
+    root. A ``VARINT`` is a 4-byte unsigned big-endian body length
+    followed by the shortest unsigned big-endian value (zero is the
+    single byte ``00`` and positive values carry no leading zero);
+    ``total`` must satisfy ``0 < total < 2**64`` and ``index`` must
+    satisfy ``0 <= index < total``, and the sibling count must be
+    ``(total - 1).bit_length()`` entries of exactly 32 bytes.
+
+    Only a structurally legal :class:`SealHistoryProof` is accepted —
+    wrong field types raise TypeError and illegal bounds, a bad path
+    shape, a structurally illegal nested seal or an over-long seal
+    frame raise ValueError, exactly as :func:`check_history_proof`'s
+    structural checks and :func:`encode_seal` do — but the seal is not
+    verified and no signature is checked: :func:`check_history_proof`
+    stays the way to verify a proof afterwards. The output for a given
+    proof is unique and the encoding carries no network, storage or
+    hidden state.
+    """
+    index, total, seal, siblings = _validate_history_proof_structure(proof)
+    encoded_seal = encode_seal(seal)
+    if len(encoded_seal) > 0xFFFFFFFF:
+        raise ValueError("seal encoding too long")
+
+    buffer = bytearray(SEAL_HISTORY_PROOF_WIRE_TAG)
+    buffer += _encode_varint(index)
+    buffer += _encode_varint(total)
+    buffer += len(encoded_seal).to_bytes(4, "big", signed=False)
+    buffer += encoded_seal
+    buffer += len(siblings).to_bytes(4, "big", signed=False)
+    for sibling in siblings:
+        buffer += sibling
+    return bytes(buffer)
+
+
+def decode_history_proof(blob: bytes) -> SealHistoryProof:
+    """Decode the canonical encoding produced by :func:`encode_history_proof`.
+
+    Accepts only the single canonical form: the tag
+    ``b"thresholdsign/seal-history-proof/v1"``, the length-prefixed
+    integers ``index`` and ``total`` (each a 4-byte unsigned big-endian
+    length followed by its shortest unsigned big-endian value, zero
+    encoded as the single byte ``00``), the seal frame (a 4-byte
+    non-zero length followed by bytes that :func:`decode_seal`
+    accepts), the 4-byte sibling count and then exactly that many raw
+    32-byte sibling digests. A non-bytes argument raises TypeError; a
+    wrong or missing tag, an empty or over-long seal frame, a nested
+    seal that :func:`decode_seal` rejects, a ``total`` outside
+    ``0 < total < 2**64``, an ``index`` outside ``0 <= index < total``,
+    a non-canonical integer (leading zero or over-long length), a
+    sibling count that does not equal ``(total - 1).bit_length()``,
+    truncation, or trailing bytes raises ValueError. A successfully
+    decoded proof re-encodes to exactly the input bytes.
+
+    Decoding only restores the structure: the nested seal is decoded
+    with :func:`decode_seal` (which verifies no finding and checks no
+    signature) and nothing else is verified. A structurally legal proof
+    whose seal does not verify or whose root signature is invalid is
+    returned normally, and :func:`check_history_proof` reports it as
+    ``False``.
+    """
+    if not isinstance(blob, bytes):
+        raise TypeError("blob must be bytes")
+    if not blob.startswith(SEAL_HISTORY_PROOF_WIRE_TAG):
+        raise ValueError("bad seal history proof tag")
+    offset = len(SEAL_HISTORY_PROOF_WIRE_TAG)
+
+    index, offset = _read_varint(blob, offset, what="seal history proof index")
+    total, offset = _read_varint(blob, offset, what="seal history proof total")
+    encoded_seal, offset = _read_audit_proof_block(
+        blob, offset, what="seal history proof seal"
+    )
+    seal = decode_seal(encoded_seal)
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated seal history proof sibling count")
+    sibling_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    siblings = []
+    for _ in range(sibling_count):
+        if offset + SEAL_HISTORY_PROOF_DIGEST_SIZE > len(blob):
+            raise ValueError("truncated seal history proof siblings")
+        siblings.append(
+            bytes(blob[offset:offset + SEAL_HISTORY_PROOF_DIGEST_SIZE])
+        )
+        offset += SEAL_HISTORY_PROOF_DIGEST_SIZE
+    if offset != len(blob):
+        raise ValueError("trailing bytes after seal history proof")
+
+    proof = SealHistoryProof(
+        index=index,
+        total=total,
+        seal=seal,
+        siblings=tuple(siblings),
+    )
+    _validate_history_proof_structure(proof)
+    if encode_history_proof(proof) != blob:
+        raise ValueError("non-canonical seal history proof encoding")
+    return proof
