@@ -471,6 +471,31 @@ assert check_multi_proof(proof, signature, key)
 越界或非严格递增、`records` 与 `indices` 数量不同、空回执、兄弟非 32 字节或数量
 缺失/多余、回执或签名结构非法抛 `ValueError`。
 
+要跨实现传输或持久化多记录证明，用 `encode_audit_multi_proof` /
+`decode_audit_multi_proof` 的公开规范编码，它只还原结构、不解析回执、不验签、不留
+状态：
+
+```python
+from thresholdsign import encode_audit_multi_proof, decode_audit_multi_proof
+
+blob = encode_audit_multi_proof(proof)             # bytes，可自由传输/落盘，无隐藏状态
+restored = decode_audit_multi_proof(blob)          # AuditMultiProof
+assert encode_audit_multi_proof(restored) == blob  # 成功解码必可逐字节复现
+```
+
+编码依次直拼标签 `b"thresholdsign/audit-multi-proof/v1"`、`VARINT(n)`、4 字节
+无符号大端索引数及按证明中严格递增顺序排列的各 `VARINT(index)`；再写 4 字节无符号
+大端记录数，每条记录依次写消息帧（4 字节长度 + 原字节，消息可空）与回执帧（4 字节
+长度 + `SigningAudit.payload` 原字节，回执非空）；最后写 4 字节无符号大端兄弟数及
+按原序排列的逐字 32 字节兄弟摘要。所有 U32 计数与长度均为 4 字节无符号大端；
+`VARINT` 为 4 字节无符号大端长度 + 最短无符号大端值（零是单字节 `00`，正数禁前导
+零）。`encode_audit_multi_proof` 只接受结构合法的证明（非证明或字段类型错误抛
+`TypeError`，空索引、空回执、`n` 越界、计数不符、兄弟宽度错误等抛 `ValueError`），
+不解析回执、不验签；`decode_audit_multi_proof` 拒绝非 `bytes` 入参（`TypeError`）与
+坏标签、空索引或空回执、`n` 越界、计数不符、摘要宽度错误、截断、尾随字节及非规范
+整数（`ValueError`）；成功后重编码必逐字节等于输入，结构合法但记录或签名不匹配由
+`check_multi_proof` 返回 `False`。
+
 ### 追加一致性证明
 
 要向第三方证明一条旧记录序列是某条更长新序列的前缀，而不必公开任何消息或回执时，
@@ -821,6 +846,20 @@ python3 -m thresholdsign
   越界或超 2^64-1 的 `n`、非规范整数（前导零或超长）、截断/尾随字节及计数/路径
   不符；成功后重编码必逐字节等于输入。非 `bytes` 入参抛 `TypeError`，其余非法
   情形抛 `ValueError`；结构合法但回执或签名不匹配由 `check_proof` 返回 `False`
+- `encode_audit_multi_proof(proof) -> bytes` — 多记录证明的规范传输/持久化编码：
+  依次直拼标签 `b"thresholdsign/audit-multi-proof/v1"`、`VARINT(n)`、U32 索引数
+  及按严格递增顺序的各 `VARINT(index)`、U32 记录数、每条记录的消息帧（U32 长度 +
+  原字节，消息可空）与回执帧（U32 长度 + `SigningAudit.payload`，回执非空）、U32
+  兄弟数及按原序的逐字 32 字节兄弟摘要；U32 均为 4 字节无符号大端，`VARINT` 规则同
+  单叶证明。只接受结构合法的 `AuditMultiProof`，不解析回执、不验签；输出唯一、无
+  状态。非证明或字段类型错误抛 `TypeError`，空索引/空回执、越界/溢出、计数不符或
+  兄弟宽度错误抛 `ValueError`
+- `decode_audit_multi_proof(payload) -> AuditMultiProof` —
+  `encode_audit_multi_proof` 的逆操作，仅还原结构、不解析回执、不验签、不留状态：
+  拒绝非 `bytes`、坏/缺标签、空索引或空回执、越界的 `n`、记录数与索引数不符、下标
+  非严格递增或越界、非规范整数（前导零或超长）、摘要宽度错误、截断/尾随字节；成功后
+  重编码必逐字节等于输入。非 `bytes` 入参抛 `TypeError`，其余非法情形抛
+  `ValueError`；结构合法但记录或签名不匹配由 `check_multi_proof` 返回 `False`
 - `AuditExtensionProof(old_n, leaves)` — 冻结数据类；追加一致性证明：`old_n` 为
   旧记录数，`leaves` 为新序列全部 32 字节叶摘要的保序元组，可按位置构造、按值相等
 - `make_extension(records, old_n) -> (old_message, new_message, proof)` — 沿用
