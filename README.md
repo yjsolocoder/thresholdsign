@@ -946,6 +946,36 @@ python3 -m thresholdsign
   `TypeError`，其余非法情形抛 `ValueError`；成功后重编码必逐字节等于
   输入，结构合法但封印或签名不匹配由 `check_history_multi_proof`
   返回 `False`
+- `SealHistoryMultiProofBundle(proof, signature)` — 冻结数据类，字段
+  依次为 `SealHistoryMultiProof` 与其根消息
+  `b"sh/r" || U64(total) || root` 上的 `AggregateSignature`；可按位置
+  构造、按值相等，构造时不校验，核验由
+  `verify_history_multi_proof_bundle` 负责；不含网络、存储或隐藏状态
+- `encode_history_multi_proof_bundle(bundle) -> bytes` — 多证明连同根
+  签名的规范传输/持久化编码：依次拼接标签 `b"ts/shmpb/v1"`、
+  `U32(len(P))` 与嵌套证明字节 `P = encode_history_multi_proof(proof)`
+  （帧非空），随后为签名的 `VARINT(R)`、`VARINT(z)`、`U32` 签名者数
+  `k` 及按升序的各 `VARINT(id)`。`U32` 为 4 字节无符号大端，`VARINT`
+  为 4 字节无符号大端长度加最短无符号大端整数（零为单字节 `00`，正
+  数禁前导零）；要求 `R > 0`、`z >= 0`、签名者非空且编号为正并严格
+  递增。非 `SealHistoryMultiProofBundle` 入参或字段、签名者、嵌套证
+  明/封印类型错抛 `TypeError`；证明结构非法、`R` 非正、`z` 为负、签
+  名者为空/非正/非递增或超长帧抛 `ValueError`；只验结构、不验封印与
+  签名真伪，输出唯一、无状态；旧接口保持不变
+- `decode_history_multi_proof_bundle(blob) -> SealHistoryMultiProofBundle`
+  — `encode_history_multi_proof_bundle` 的逆操作：嵌套证明经
+  `decode_history_multi_proof` 还原，不验封印、不验签；拒绝非
+  `bytes`、坏/缺标签、空/截断证明帧、非规范嵌套证明、`R` 为零、签名
+  者数为零或不符、编号非正或非严格递增、`VARINT` 非规范、截断及尾随
+  字节。非 `bytes` 入参抛 `TypeError`，其余格式错误抛 `ValueError`；
+  解码仅恢复结构，成功后重编码必逐字节等于输入，结构合法但封印或签
+  名不匹配由 `verify_history_multi_proof_bundle` 返回 `False`
+- `verify_history_multi_proof_bundle(bundle, key) -> bool` — 结果等同
+  于 `check_history_multi_proof(bundle.proof, bundle.signature, key)`：
+  逐项复核封印、由索引与兄弟重建 Merkle 根并以 `key` 的群参数验证根
+  签名；非 `SealHistoryMultiProofBundle` 入参抛 `TypeError`，其余类
+  型/结构错误与 `check_history_multi_proof` 一致，结构合法但不匹配返
+  回 `False`
 - `Rotation(old, new, ids, t, q, p, g, sig)` — 冻结数据类，可按位置构造、按值
   相等；公开可验证的密钥轮换授权证书：`old`/`new` 为新旧联合公钥，`ids` 为严格
   递增的新成员编号元组，`t` 为新 threshold，`q`/`p`/`g` 为域素数、群素数与
