@@ -437,6 +437,52 @@ assert encode_audit_proof(restored) == blob  # 成功解码必可逐字节复现
 无符号大端长度 + 原字节，消息可空、回执非空。约束 `0 < n < 2^64`、`0 <= i < n`、
 路径数恰为 `(n-1).bit_length()`。
 
+### 追加一致性证明
+
+要向第三方证明一条旧记录序列是某条更长新序列的前缀，而不必公开任何消息或回执时，
+可用同一棵 Merkle 树的追加一致性（extension）证明。冻结数据类
+`AuditExtensionProof(old_n, leaves)` 字段依次为旧记录数 `int` 与新序列全部叶摘要
+的保序元组 `tuple[bytes, ...]`（每项恰为 32 字节，即
+`H(b"am/l" || U64(i) || H(message) || H(audit.payload))`），可按位置构造、按值相等。
+
+`make_extension(records, old_n) -> tuple[bytes, bytes, AuditExtensionProof]` 沿用
+`make_proof` 的树规则，返回旧、新两条待签消息（均为
+`b"am/r" || U64(n) || root`，`n` 分别为旧记录数与总记录数）与携带全部叶摘要的证明；
+两条消息各自由门限 quorum 签署后：
+
+```python
+from thresholdsign import make_extension, check_extension
+
+old_message, new_message, proof = make_extension(records, old_n)
+old_sig = sign_threshold(key, old_message)
+new_sig = sign_threshold(key, new_message)
+assert check_extension(proof, old_sig, new_sig, key)  # 观察者仅凭两个签名核验前缀关系
+```
+
+`check_extension(proof, old_sig, new_sig, key) -> bool` 由前 `old_n` 个叶重建旧根、
+由全部叶重建新根，再对两条 `b"am/r"||U64(n)||root` 消息分别调用
+`verify_signature`；两者皆验返回 `True`，合法但不匹配（篡改叶或 `old_n`、签名
+对调或错配、换密钥核验等）返回 `False`。约束 `0 < old_n < n < 2^64`，叶元组非空
+且每项恰为 32 字节；类型错误抛 `TypeError`，越界、空叶、叶宽错误等抛 `ValueError`。
+
+要跨实现传输或持久化一致性证明，用 `encode_extension` / `decode_extension` 的公开
+规范编码，它只还原结构、不解析叶摘要、不验签、不留状态：
+
+```python
+from thresholdsign import encode_extension, decode_extension
+
+blob = encode_extension(proof)             # bytes，可自由传输/落盘，无隐藏状态
+restored = decode_extension(blob)          # AuditExtensionProof
+assert encode_extension(restored) == blob  # 成功解码必可逐字节复现
+```
+
+编码依次直拼标签 `b"thresholdsign/audit-extension/v1"`、8 字节无符号大端 `old_n`、
+8 字节无符号大端叶数 `n`，再按原顺序直拼全部 32 字节叶摘要，不含额外分隔符；
+约束 `0 < old_n < n < 2^64`，故总长度由标签与 `n` 唯一确定。`encode_extension`
+只接受结构合法的证明（不调用 `check_extension`，不要求签名）；`decode_extension`
+拒绝非 `bytes` 入参（`TypeError`）与坏标签、截断、尾随字节、计数不符、空叶、
+越界或叶宽错误（`ValueError`）。
+
 
 ## 命令行演示
 
@@ -719,6 +765,30 @@ python3 -m thresholdsign
   越界或超 2^64-1 的 `n`、非规范整数（前导零或超长）、截断/尾随字节及计数/路径
   不符；成功后重编码必逐字节等于输入。非 `bytes` 入参抛 `TypeError`，其余非法
   情形抛 `ValueError`；结构合法但回执或签名不匹配由 `check_proof` 返回 `False`
+- `AuditExtensionProof(old_n, leaves)` — 冻结数据类；追加一致性证明：`old_n` 为
+  旧记录数，`leaves` 为新序列全部 32 字节叶摘要的保序元组，可按位置构造、按值相等
+- `make_extension(records, old_n) -> (old_message, new_message, proof)` — 沿用
+  `make_proof` 的树规则，返回旧、新两条待签消息（均为
+  `b"am/r"||U64(n)||root`）与携带全部叶摘要的 `AuditExtensionProof`。`old_n`
+  非整数（含布尔）或记录类型错误抛 `TypeError`；空记录、计数超过 2^64-1 或
+  `old_n` 不在 `0 < old_n < n` 抛 `ValueError`
+- `check_extension(proof, old_sig, new_sig, key) -> bool` — 由前 `old_n` 个叶与
+  全部叶分别重建旧、新根，对两条 `b"am/r"||U64(n)||root` 消息各调用
+  `verify_signature`；皆验返回 `True`，结构合法但不匹配返回 `False`。非
+  `AuditExtensionProof`/`AggregateSignature` 入参或字段类型错误抛 `TypeError`，
+  空叶、叶非 32 字节、总数超 2^64-1、`old_n` 越界或签名/密钥结构非法抛
+  `ValueError`
+- `encode_extension(proof) -> bytes` — 一致性证明的规范传输/持久化编码：依次直拼
+  标签 `b"thresholdsign/audit-extension/v1"`、8 字节无符号大端 `old_n`、8 字节
+  无符号大端叶数 `n` 及按原顺序的全部 32 字节叶摘要，不含额外分隔符；总长度由
+  标签与 `n` 唯一确定。只接受结构合法的 `AuditExtensionProof`
+  （`0 < old_n < n < 2^64`），不调用 `check_extension`、不要求签名；输出唯一、
+  无状态。字段类型错误抛 `TypeError`，空叶、越界或叶宽错误抛 `ValueError`
+- `decode_extension(payload) -> AuditExtensionProof` — `encode_extension` 的逆
+  操作，仅还原结构、不解析叶摘要、不验签、不留状态：拒绝非 `bytes`、坏/缺标签、
+  空叶、越界、截断、尾随字节及计数不符；成功后重编码必逐字节等于输入。非
+  `bytes` 入参抛 `TypeError`，其余非法情形抛 `ValueError`；结构合法但签名不匹配
+  由 `check_extension` 返回 `False`
 
 ### 门限 Schnorr 群参数与边界
 

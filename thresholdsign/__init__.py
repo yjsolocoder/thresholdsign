@@ -26,7 +26,8 @@ check_proof, plus their canonical transport encoding encode_audit_proof /
 decode_audit_proof. Append-only consistency proofs over the same tree:
 AuditExtensionProof / make_extension / check_extension, letting an observer
 verify — from two threshold signatures alone — that an old record sequence
-is a prefix of a new one, without seeing any message or receipt.
+is a prefix of a new one, without seeing any message or receipt, plus their
+canonical transport encoding encode_extension / decode_extension.
 """
 
 from __future__ import annotations
@@ -104,6 +105,8 @@ __all__ = [
     "AuditExtensionProof",
     "make_extension",
     "check_extension",
+    "encode_extension",
+    "decode_extension",
 ]
 
 # Mersenne prime 2**127 - 1: large enough for integer secrets, small enough that
@@ -4426,3 +4429,88 @@ def check_extension(
         generator=generator,
         prime=field_prime,
     )
+
+
+# ---------------------------------------------------------------------------
+# Canonical audit-extension transport: a fixed-width, byte-for-byte
+# reproducible encoding of an AuditExtensionProof for cross-implementation
+# exchange and persistence. Decoding restores structure only — the leaf
+# digests are not parsed, no signature is checked and no state is kept, so
+# check_extension remains the sole verifier afterwards.
+# ---------------------------------------------------------------------------
+
+AUDIT_EXTENSION_WIRE_TAG = b"thresholdsign/audit-extension/v1"
+
+
+def encode_extension(proof: AuditExtensionProof) -> bytes:
+    """Canonically encode a consistency proof for transport or persistence.
+
+    The encoding is the direct concatenation, in order, of the tag
+    ``b"thresholdsign/audit-extension/v1"``, ``old_n`` as an 8-byte unsigned
+    big-endian integer, the leaf count ``n`` as an 8-byte unsigned big-endian
+    integer and then every leaf digest in its original order, each exactly
+    32 bytes, with no further separators; the total length is therefore
+    uniquely determined by the tag and ``n``. The bounds are
+    ``0 < old_n < n < 2**64``.
+
+    Only a structurally legal :class:`AuditExtensionProof` is accepted —
+    wrong field types raise TypeError and illegal bounds, an empty leaf
+    tuple or a leaf of the wrong width raise ValueError, exactly as
+    :func:`check_extension`'s structural checks do — but the leaf digests
+    are not parsed and no signature is required or checked:
+    :func:`check_extension` stays the way to verify a proof afterwards. The
+    output for a given proof is unique and the encoding carries no network,
+    storage or hidden state.
+    """
+    old_n, leaves = _validate_audit_extension_structure(proof)
+    count = len(leaves)
+    buffer = bytearray(AUDIT_EXTENSION_WIRE_TAG)
+    buffer += old_n.to_bytes(8, "big", signed=False)
+    buffer += count.to_bytes(8, "big", signed=False)
+    for leaf in leaves:
+        buffer += leaf
+    return bytes(buffer)
+
+
+def decode_extension(payload: bytes) -> AuditExtensionProof:
+    """Decode the canonical encoding produced by :func:`encode_extension`.
+
+    Accepts only the single canonical form: the tag
+    ``b"thresholdsign/audit-extension/v1"``, ``old_n`` and the leaf count
+    ``n`` as 8-byte unsigned big-endian integers, and then exactly ``n``
+    raw 32-byte leaf digests with nothing before, between or after them.
+    A non-bytes argument raises TypeError; a wrong or missing tag, an empty
+    leaf sequence, an ``old_n`` outside ``0 < old_n < n``, an ``n`` of
+    ``2**64`` or more, truncation, trailing bytes, or a leaf count that
+    does not match the remaining bytes raises ValueError. A successfully
+    decoded proof re-encodes to exactly the input bytes.
+
+    Decoding only restores the structure: the leaf digests are stored
+    opaque and are neither parsed nor verified, no signature is checked and
+    no state is kept. A structurally legal proof whose signatures do not
+    match its roots is returned normally, and :func:`check_extension`
+    reports it as ``False``.
+    """
+    if not isinstance(payload, bytes):
+        raise TypeError("payload must be bytes")
+    if not payload.startswith(AUDIT_EXTENSION_WIRE_TAG):
+        raise ValueError("bad audit extension tag")
+    offset = len(AUDIT_EXTENSION_WIRE_TAG)
+
+    if offset + 16 > len(payload):
+        raise ValueError("truncated audit extension header")
+    old_n = int.from_bytes(payload[offset:offset + 8], "big", signed=False)
+    count = int.from_bytes(payload[offset + 8:offset + 16], "big", signed=False)
+    offset += 16
+
+    body = payload[offset:]
+    if len(body) != count * AUDIT_PROOF_DIGEST_SIZE:
+        raise ValueError("audit extension leaf count does not match the payload")
+    leaves = tuple(
+        body[index * AUDIT_PROOF_DIGEST_SIZE:(index + 1) * AUDIT_PROOF_DIGEST_SIZE]
+        for index in range(count)
+    )
+
+    proof = AuditExtensionProof(old_n=old_n, leaves=leaves)
+    _validate_audit_extension_structure(proof)
+    return proof
