@@ -694,6 +694,35 @@ assert verify_audit_extension_delta_checkpoint_chain(restored, key)  # 先展开
 展开为普通检查点链，再复用 `verify_audit_extension_checkpoint_chain`，全真
 才返回 `True`，无状态、不引入网络或存储状态。
 
+增量链还支持连续区间裁剪与相邻链拼接，用于分段传输与归档重组：
+
+```python
+from thresholdsign import (
+    compact_audit_extension_delta_checkpoint_chain,
+    concatenate_audit_extension_delta_checkpoint_chains,
+    expand_audit_extension_delta_checkpoint_chain,
+    slice_audit_extension_delta_checkpoint_chain,
+)
+
+piece = slice_audit_extension_delta_checkpoint_chain(delta, start, stop)
+restored = concatenate_audit_extension_delta_checkpoint_chains(head, tail)
+```
+
+`slice_audit_extension_delta_checkpoint_chain(chain, start, stop)` 先展开为
+普通检查点链，取展开证明的半开区间 `proofs[start:stop]` 与夹住该区间的
+`signatures[start:stop+1]`（证明 `i` 仍由签名 `i`、`i+1` 夹住），再压回
+增量链；单跳段（`additions` 为空）、首段、尾段均与普通链对应区间逐值相等。
+`concatenate_audit_extension_delta_checkpoint_chains(left, right)` 将两侧
+展开链证明按左后右连接，接缝处共享的检查点签名只保留一份：要求左链末证明
+的 `leaves` 等于右链首证明中长度为其 `old_n` 的叶前缀，且左末签名与右首
+签名按值相等，否则拒绝；结果就是两侧展开链顺序连接的增量形式，展开后逐值
+等于连接链、规范编码可逐字节往返。两入口都不验签、不存状态，旧接口不变；
+段与重组链的签名真伪仍由 `verify_audit_extension_delta_checkpoint_chain`
+核验。两入口对链或字段类型错、`start`/`stop` 非整数（含布尔）抛
+`TypeError`；空区间（`start >= stop`）、越界（含负界、超出证明数）、嵌套
+结构或签名数错、接缝叶前缀不一致（缺口/重叠）或共享签名不一致抛
+`ValueError`，不以 `False` 代替异常。
+
 
 ## 命令行演示
 
@@ -1425,6 +1454,18 @@ python3 -m thresholdsign
   签名原序保留；不验签、无状态。非 `AuditExtensionCheckpointChain` 入参或
   字段、元素类型错误抛 `TypeError`；空链、签名数不符、嵌套证明或签名非法、
   相邻前缀断裂抛 `ValueError`
+- `slice_audit_extension_delta_checkpoint_chain(chain, start, stop) -> AuditExtensionDeltaCheckpointChain`
+  — 先展开普通检查点链，取半开区间 `proofs[start:stop]` 与
+  `signatures[start:stop+1]` 再压回增量链，用于分段传输；单跳、首段、尾段
+  均与普通链对应区间逐值相等；不验签、无状态。链或字段类型错、`start`/
+  `stop` 非整数（含布尔）抛 `TypeError`；空区间、负界或越界、嵌套结构或
+  签名数错抛 `ValueError`
+- `concatenate_audit_extension_delta_checkpoint_chains(left, right) -> AuditExtensionDeltaCheckpointChain`
+  — 两侧展开链证明按左后右连接、接缝共享检查点签名仅保留一份，用于归档
+  重组：要求左末证明 `leaves` 等于右首证明长度为 `old_n` 的叶前缀且左末
+  签名与右首签名按值相等；结果等于两侧展开链顺序连接且规范编码逐字节往返；
+  不验签、无状态。链或字段类型错抛 `TypeError`；嵌套结构或签名数错、叶
+  前缀缺口/重叠、共享签名不一致抛 `ValueError`
 - `encode_audit_extension_delta_checkpoint_chain(chain) -> bytes` — 仅接受现有
   增量链并输出唯一规范编码：标签 `b"ts/aepdcc/v1"`、`U32(len(P))||P`
   （`P = encode_extension(first)`）、`U32(b)`、`b` 个追加批及 `b + 2` 个签名帧；

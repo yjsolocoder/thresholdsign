@@ -73,7 +73,10 @@ expand_audit_extension_delta_checkpoint_chain /
 compact_audit_extension_delta_checkpoint_chain and its canonical
 transport encoding encode_audit_extension_delta_checkpoint_chain /
 decode_audit_extension_delta_checkpoint_chain /
-verify_audit_extension_delta_checkpoint_chain.
+verify_audit_extension_delta_checkpoint_chain, plus half-open interval
+slicing slice_audit_extension_delta_checkpoint_chain and adjacent-chain
+splicing concatenate_audit_extension_delta_checkpoint_chains for
+segmented transport and archive reassembly.
 """
 
 from __future__ import annotations
@@ -218,6 +221,8 @@ __all__ = [
     "AuditExtensionDeltaCheckpointChain",
     "expand_audit_extension_delta_checkpoint_chain",
     "compact_audit_extension_delta_checkpoint_chain",
+    "slice_audit_extension_delta_checkpoint_chain",
+    "concatenate_audit_extension_delta_checkpoint_chains",
     "encode_audit_extension_delta_checkpoint_chain",
     "decode_audit_extension_delta_checkpoint_chain",
     "verify_audit_extension_delta_checkpoint_chain",
@@ -7248,6 +7253,129 @@ def compact_audit_extension_delta_checkpoint_chain(
     return AuditExtensionDeltaCheckpointChain(
         first=proofs[0], additions=tuple(additions), signatures=signatures
     )
+
+
+def _check_segment_bound(value: object, name: str) -> int:
+    """Type-check one half-open segment bound (``start`` or ``stop``).
+
+    The bound must be an integer and, like every other index in the
+    library, must not be a boolean; out-of-range values are reported by
+    the segment entry points themselves as ValueError.
+    """
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"{name} must be an integer")
+    return value
+
+
+def slice_audit_extension_delta_checkpoint_chain(
+    chain: AuditExtensionDeltaCheckpointChain,
+    start: int,
+    stop: int,
+) -> AuditExtensionDeltaCheckpointChain:
+    """Take a non-empty half-open hop segment of a delta checkpoint chain.
+
+    The chain is first expanded into a plain
+    :class:`AuditExtensionCheckpointChain`; the segment keeps expanded
+    proofs ``start:stop`` and the bracketing signatures
+    ``start:stop + 1`` — proof ``i`` stays bracketed by signatures ``i``
+    and ``i + 1`` — and the segment is then compacted back into an
+    :class:`AuditExtensionDeltaCheckpointChain`. The result is therefore
+    exactly the delta form of the plain chain's corresponding interval:
+    single-hop, head and tail segments all match it value by value. No
+    signature is verified here and no state is kept — verification stays
+    with :func:`verify_audit_extension_delta_checkpoint_chain` on the
+    result.
+
+    A non-:class:`AuditExtensionDeltaCheckpointChain` chain argument or
+    any wrong field or element type raises TypeError, exactly as
+    :func:`expand_audit_extension_delta_checkpoint_chain` does; a
+    non-integer ``start`` or ``stop`` — booleans included — also raises
+    TypeError. A negative or otherwise out-of-range bound or an empty
+    interval (``start >= stop``) raises ValueError, as does any
+    structural error the expanded chain or its nested proofs or
+    signatures would raise on their own.
+    """
+    start = _check_segment_bound(start, "start")
+    stop = _check_segment_bound(stop, "stop")
+    expanded = expand_audit_extension_delta_checkpoint_chain(chain)
+    proof_count = len(expanded.proofs)
+    if start < 0 or stop < 0 or start > proof_count or stop > proof_count:
+        raise ValueError("slice bounds out of range")
+    if start >= stop:
+        raise ValueError("slice interval must be non-empty")
+    segment = AuditExtensionCheckpointChain(
+        proofs=expanded.proofs[start:stop],
+        signatures=expanded.signatures[start:stop + 1],
+    )
+    return compact_audit_extension_delta_checkpoint_chain(segment)
+
+
+def concatenate_audit_extension_delta_checkpoint_chains(
+    left: AuditExtensionDeltaCheckpointChain,
+    right: AuditExtensionDeltaCheckpointChain,
+) -> AuditExtensionDeltaCheckpointChain:
+    """Concatenate two adjacent delta checkpoint chains into one chain.
+
+    Both chains are first expanded into plain
+    :class:`AuditExtensionCheckpointChain` values; the proof sequences
+    are joined left then right and the checkpoint signature at the seam
+    is kept exactly once — the left chain's last new-root signature and
+    the right chain's first old-root signature must be the very same
+    value. The left chain's last proof must additionally end on the
+    exact tree the right chain's first proof starts from: the left
+    proof's ``leaves`` must equal the first ``old_n`` leaves of the
+    right proof. The joined plain chain is then compacted back into an
+    :class:`AuditExtensionDeltaCheckpointChain`, so the result is the
+    delta form of the two expanded chains joined in order and
+    round-trips through the canonical encoding byte for byte. No
+    signature is verified here and no state is kept — verification
+    stays with :func:`verify_audit_extension_delta_checkpoint_chain` on
+    the result.
+
+    A non-:class:`AuditExtensionDeltaCheckpointChain` argument or any
+    wrong field or element type raises TypeError, exactly as
+    :func:`expand_audit_extension_delta_checkpoint_chain` does. A leaf
+    prefix mismatch at the seam (a gap or overlap between the last left
+    hop and the first right hop) or a mismatch between the two shared
+    checkpoint signatures raises ValueError, as does any structural
+    error either chain or its nested proofs or signatures would raise on
+    its own.
+    """
+    left_expanded = expand_audit_extension_delta_checkpoint_chain(left)
+    right_expanded = expand_audit_extension_delta_checkpoint_chain(right)
+
+    left_last = left_expanded.proofs[-1]
+    right_first = right_expanded.proofs[0]
+    old_n = right_first.old_n
+    if len(left_last.leaves) != old_n or left_last.leaves != right_first.leaves[:old_n]:
+        raise ValueError(
+            "chains do not link: the left chain's last leaves must be the "
+            "right chain's first proof old prefix"
+        )
+    if left_expanded.signatures[-1] != right_expanded.signatures[0]:
+        raise ValueError(
+            "chains do not link: the shared checkpoint signature must be "
+            "identical by value"
+        )
+
+    joined = AuditExtensionCheckpointChain(
+        proofs=left_expanded.proofs + right_expanded.proofs,
+        signatures=(
+            left_expanded.signatures + right_expanded.signatures[1:]
+        ),
+    )
+    result = compact_audit_extension_delta_checkpoint_chain(joined)
+
+    # Defence in depth: the returned delta chain must expand back into
+    # exactly the two expanded chains joined in order, and its canonical
+    # encoding must round-trip byte for byte; refuse anything else.
+    reexpanded = expand_audit_extension_delta_checkpoint_chain(result)
+    if reexpanded != joined:
+        raise ValueError("concatenated chain does not match the joined chains")
+    encoded = encode_audit_extension_delta_checkpoint_chain(result)
+    if decode_audit_extension_delta_checkpoint_chain(encoded) != result:
+        raise ValueError("concatenated chain does not encode byte for byte")
+    return result
 
 
 # ---------------------------------------------------------------------------
