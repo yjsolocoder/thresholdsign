@@ -67,7 +67,11 @@ verify_audit_extension_proof_bundle_chain, and the flattened checkpoint
 chain AuditExtensionCheckpointChain /
 encode_audit_extension_checkpoint_chain /
 decode_audit_extension_checkpoint_chain /
-verify_audit_extension_checkpoint_chain.
+verify_audit_extension_checkpoint_chain, and the incremental delta form
+AuditExtensionDeltaCheckpointChain /
+expand_audit_extension_delta_checkpoint_chain /
+compact_audit_extension_delta_checkpoint_chain that stores only each
+hop's newly appended leaves instead of re-stating the full history.
 """
 
 from __future__ import annotations
@@ -209,6 +213,9 @@ __all__ = [
     "encode_audit_extension_checkpoint_chain",
     "decode_audit_extension_checkpoint_chain",
     "verify_audit_extension_checkpoint_chain",
+    "AuditExtensionDeltaCheckpointChain",
+    "expand_audit_extension_delta_checkpoint_chain",
+    "compact_audit_extension_delta_checkpoint_chain",
 ]
 
 # Mersenne prime 2**127 - 1: large enough for integer secrets, small enough that
@@ -7033,6 +7040,212 @@ def verify_audit_extension_checkpoint_chain(
                 result = False
         previous_leaves = proof.leaves
     return result
+
+
+# ---------------------------------------------------------------------------
+# Incremental audit-extension checkpoint chains: the delta form of an
+# AuditExtensionCheckpointChain. Every hop after the first re-states the
+# full leaf history, so a long chain repeats every historical leaf digest
+# at every hop; the delta chain stores the first hop's proof in full and
+# then only each later hop's newly appended leaves, keeping the shared
+# checkpoint signatures in order. Expanding rebuilds the ordinary
+# checkpoint chain — verified by verify_audit_extension_checkpoint_chain
+# exactly as before — and compacting extracts the per-hop additions from
+# a linked chain. Neither conversion checks a signature and no state is
+# kept.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AuditExtensionDeltaCheckpointChain:
+    """An incremental checkpoint chain storing only each hop's new leaves.
+
+    The fields, in order, are ``first`` (the :class:`AuditExtensionProof`
+    of the first hop, carrying the full leaf history up to its new root),
+    ``additions`` (one non-empty tuple of 32-byte leaf digests per later
+    hop, in chain order — exactly the leaves that hop appends, in their
+    original order) and ``signatures`` (the tuple of
+    :class:`AggregateSignature` checkpoint root signatures, exactly
+    ``len(additions) + 2`` long): the first signature covers the first
+    hop's old root, and each hop — the first proof, then one per batch —
+    is bracketed by signatures ``i`` and ``i + 1``, so the new-root
+    signature of one hop is the old-root signature of the next and is
+    stored only once. The dataclass is frozen, positionally constructible
+    and compared by value, and carries no network, storage or hidden
+    state. Field types and bounds are not checked at construction time —
+    :func:`expand_audit_extension_delta_checkpoint_chain` checks the
+    structure and :func:`verify_audit_extension_checkpoint_chain` remains
+    the way to verify the expanded chain afterwards.
+    """
+
+    first: AuditExtensionProof
+    additions: tuple[tuple[bytes, ...], ...]
+    signatures: tuple[AggregateSignature, ...]
+
+
+def _check_audit_extension_delta_checkpoint_chain_fields(
+    chain: object,
+) -> tuple[
+    AuditExtensionProof,
+    tuple[tuple[bytes, ...], ...],
+    tuple[AggregateSignature, ...],
+]:
+    """Type- and structure-check a delta checkpoint chain's fields.
+
+    ``first`` must be an :class:`AuditExtensionProof`, ``additions`` a
+    tuple of non-empty tuples of 32-byte leaf digests and ``signatures``
+    a tuple of :class:`AggregateSignature` values exactly
+    ``len(additions) + 2`` long; the nested proof and signatures are
+    structure-checked (via :func:`_validate_audit_extension_structure`
+    and :func:`_check_history_proof_bundle_signature`) but no signature
+    is verified. Returns ``(first, additions, signatures)``.
+    """
+    if not isinstance(chain, AuditExtensionDeltaCheckpointChain):
+        raise TypeError(
+            "chain must be an AuditExtensionDeltaCheckpointChain instance"
+        )
+    first = chain.first
+    additions = chain.additions
+    signatures = chain.signatures
+    if not isinstance(first, AuditExtensionProof):
+        raise TypeError(
+            "chain.first must be an AuditExtensionProof instance"
+        )
+    if not isinstance(additions, tuple):
+        raise TypeError("chain.additions must be a tuple")
+    if not isinstance(signatures, tuple):
+        raise TypeError("chain.signatures must be a tuple")
+    for batch in additions:
+        if not isinstance(batch, tuple):
+            raise TypeError("each chain addition batch must be a tuple")
+        for digest in batch:
+            if not isinstance(digest, bytes):
+                raise TypeError("each chain addition digest must be bytes")
+    for signature in signatures:
+        if not isinstance(signature, AggregateSignature):
+            raise TypeError(
+                "each chain signature must be an AggregateSignature instance"
+            )
+    try:
+        batch_count = len(additions)
+        signature_count = len(signatures)
+    except OverflowError:
+        raise ValueError("too many chain items") from None
+    if signature_count != batch_count + 2:
+        raise ValueError(
+            "chain.signatures must contain exactly len(chain.additions) + 2 "
+            "signatures"
+        )
+
+    _validate_audit_extension_structure(first)
+    for batch in additions:
+        if len(batch) == 0:
+            raise ValueError("each chain addition batch must be non-empty")
+        for digest in batch:
+            if len(digest) != AUDIT_PROOF_DIGEST_SIZE:
+                raise ValueError(
+                    "each chain addition digest must be exactly 32 bytes"
+                )
+    for index, signature in enumerate(signatures):
+        _check_history_proof_bundle_signature(
+            signature, field=f"chain.signatures[{index}]"
+        )
+    return first, additions, signatures
+
+
+def expand_audit_extension_delta_checkpoint_chain(
+    chain: AuditExtensionDeltaCheckpointChain,
+) -> AuditExtensionCheckpointChain:
+    """Expand a delta checkpoint chain into the full checkpoint chain.
+
+    The expanded chain's first proof is ``chain.first``; each later hop
+    ``i`` appends ``chain.additions[i - 1]`` to the running leaf history
+    and takes the previous total as its ``old_n``, so its ``leaves`` are
+    the full history up to and including that batch, in the original
+    order. The ``len(additions) + 2`` checkpoint signatures are reused in
+    order, so hop ``i`` is bracketed by signatures ``i`` and ``i + 1``
+    exactly as in :class:`AuditExtensionCheckpointChain`. The result is
+    an ordinary checkpoint chain: no signature is checked here and
+    :func:`verify_audit_extension_checkpoint_chain` remains the way to
+    verify it afterwards.
+
+    A non-:class:`AuditExtensionDeltaCheckpointChain` argument, a
+    non-:class:`AuditExtensionProof` ``first``, a non-tuple field, a
+    non-tuple batch, a non-bytes digest or a
+    non-:class:`AggregateSignature` signature raises TypeError; a
+    signature count other than ``len(additions) + 2``, an empty batch, a
+    digest that is not exactly 32 bytes, or a structurally illegal nested
+    proof or signature raises ValueError. The function is stateless.
+    """
+    first, additions, signatures = (
+        _check_audit_extension_delta_checkpoint_chain_fields(chain)
+    )
+    proofs = [first]
+    leaves = first.leaves
+    for batch in additions:
+        old_n = len(leaves)
+        leaves = leaves + batch
+        if len(leaves) > 0xFFFFFFFFFFFFFFFF:
+            raise ValueError("too many leaves")
+        proofs.append(AuditExtensionProof(old_n=old_n, leaves=leaves))
+    return AuditExtensionCheckpointChain(
+        proofs=tuple(proofs), signatures=signatures
+    )
+
+
+def compact_audit_extension_delta_checkpoint_chain(
+    chain: AuditExtensionCheckpointChain,
+) -> AuditExtensionDeltaCheckpointChain:
+    """Compact a full checkpoint chain into its incremental delta form.
+
+    ``first`` is the chain's first proof; every later hop contributes one
+    batch — the leaves it appends, ``proof.leaves[proof.old_n:]``, in
+    their original order — and the ``len(proofs) + 1`` checkpoint
+    signatures are reused in order. Expanding the result with
+    :func:`expand_audit_extension_delta_checkpoint_chain` reproduces the
+    input chain exactly. No signature is verified: a chain whose
+    signatures do not match is compacted normally and the expanded chain
+    is still reported by
+    :func:`verify_audit_extension_checkpoint_chain`.
+
+    A non-:class:`AuditExtensionCheckpointChain` argument, a non-tuple
+    field, a non-:class:`AuditExtensionProof` proof or a
+    non-:class:`AggregateSignature` signature raises TypeError; an empty
+    proof tuple, a signature count other than ``len(proofs) + 1``, a
+    structurally illegal nested proof or signature, or a prefix break
+    between neighbours — the predecessor's leaf count differing from the
+    successor's ``old_n``, or its leaves differing from the successor's
+    first ``old_n`` leaves — raises ValueError. The function is
+    stateless.
+    """
+    _proof_count, proofs, signatures = (
+        _check_audit_extension_checkpoint_chain_fields(chain)
+    )
+    for proof in proofs:
+        _validate_audit_extension_structure(proof)
+    for index, signature in enumerate(signatures):
+        _check_history_proof_bundle_signature(
+            signature, field=f"chain.signatures[{index}]"
+        )
+
+    additions = []
+    previous_leaves = proofs[0].leaves
+    for proof in proofs[1:]:
+        old_n = proof.old_n
+        if (
+            len(previous_leaves) != old_n
+            or previous_leaves != proof.leaves[:old_n]
+        ):
+            raise ValueError(
+                "checkpoint chain prefix break between neighbours"
+            )
+        additions.append(proof.leaves[old_n:])
+        previous_leaves = proof.leaves
+    return AuditExtensionDeltaCheckpointChain(
+        first=proofs[0],
+        additions=tuple(additions),
+        signatures=signatures,
+    )
 
 
 # ---------------------------------------------------------------------------
