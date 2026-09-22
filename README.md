@@ -599,6 +599,36 @@ U32 长度 + 现有单包规范编码 `E`。编解码只检查容器与嵌套结
 抛 `TypeError`；结构合法但签名不匹配或相邻不衔接由
 `verify_audit_extension_proof_bundle_chain` 返回 `False`。
 
+若只需把多跳一致性证明与检查点根签名打包，而每跳共享的检查点签名只想存一份，
+用冻结数据类 `AuditExtensionCheckpointChain(proofs, signatures)`：`proofs` 为
+非空的 `AuditExtensionProof` 元组，`signatures` 为恰含 `len(proofs) + 1` 个
+`AggregateSignature` 的元组；第 `i` 个证明由第 `i` 与第 `i + 1` 个签名夹住
+（旧根、新根），相邻证明的衔接规则不变——前项叶数等于后项 `old_n`，且前项
+`leaves` 恰为后项 `leaves[:old_n]`：
+
+```python
+from thresholdsign import (
+    AuditExtensionCheckpointChain,
+    encode_audit_extension_checkpoint_chain,
+    decode_audit_extension_checkpoint_chain,
+    verify_audit_extension_checkpoint_chain,
+)
+
+chain = AuditExtensionCheckpointChain(proofs, signatures)   # n 个证明、n+1 个检查点签名
+blob = encode_audit_extension_checkpoint_chain(chain)       # b"ts/aepcc/v1"||U32(n)||n 证明帧||n+1 签名帧
+restored = decode_audit_extension_checkpoint_chain(blob)    # 仅还原结构
+assert encode_audit_extension_checkpoint_chain(restored) == blob
+assert verify_audit_extension_checkpoint_chain(restored, key)  # 逐跳 check_extension + 衔接
+```
+
+编码依次为标签 `b"ts/aepcc/v1"`、U32 证明数 `n`，再按链序写 `n` 个 U32 长度帧，
+每帧帧体为现有 `encode_extension(proof)` 结果，最后依次写 `n + 1` 个签名帧；
+签名帧完全沿用 `AuditProofBundle` 的规范规则（`VARINT(R)`、`VARINT(z)`、U32
+签名者数 `k` 及 `k` 个递增 `VARINT(id)`）。编解码只检查字段、计数与嵌套结构，
+不验签、不检查衔接：类型错误抛 `TypeError`，空链、坏标签、签名计数不等于
+`n + 1`、帧或嵌套非法、截断或尾随字节抛 `ValueError`；结构合法但签名错配或
+相邻不衔接由 `verify_audit_extension_checkpoint_chain` 返回 `False`。
+
 
 ## 命令行演示
 
@@ -1279,6 +1309,36 @@ python3 -m thresholdsign
   签名错配、篡改叶或 `old_n`、相邻缺口/重叠、换密钥核验等返回 `False`。非
   `AuditExtensionProofBundleChain` 入参、非元组序列或元素类型错误抛
   `TypeError`，空链或嵌套结构非法抛 `ValueError`
+- `AuditExtensionCheckpointChain(proofs, signatures)` — 冻结数据类，字段依次为
+  非空保序的 `AuditExtensionProof` 元组与恰含 `len(proofs) + 1` 个
+  `AggregateSignature` 的元组，可按位置构造、按值相等；第 `i` 个证明由第
+  `i`、`i + 1` 个签名夹住。构造时不校验，结构由
+  `encode_audit_extension_checkpoint_chain` 检查、衔接与真伪由
+  `verify_audit_extension_checkpoint_chain` 核验；不含网络、存储或隐藏状态
+- `encode_audit_extension_checkpoint_chain(chain) -> bytes` — 检查点链的规范
+  传输/持久化编码：依次直拼标签 `b"ts/aepcc/v1"`、U32 证明数 `n`、按链序的
+  `n` 个 U32 长度帧（帧体为现有 `encode_extension(proof)` 结果，非空）与
+  `n + 1` 个签名帧；签名帧完全沿用 `AuditProofBundle` 的规范规则
+  （`VARINT(R)`、`VARINT(z)`、U32 签名者数 `k` 及 `k` 个递增 `VARINT(id)`）。
+  仅校验字段、计数与嵌套结构，不验签、不检查衔接；输出唯一、无状态。非
+  `AuditExtensionCheckpointChain` 入参、非元组字段或元素类型错误抛
+  `TypeError`，空链、签名计数不等于 `n + 1`、计数或帧超长、嵌套结构非法抛
+  `ValueError`
+- `decode_audit_extension_checkpoint_chain(blob) -> AuditExtensionCheckpointChain`
+  — `encode_audit_extension_checkpoint_chain` 的逆操作，仅还原结构、不验签、
+  不检查相邻衔接、不留状态：嵌套证明经 `decode_extension` 还原；拒绝非
+  `bytes`、坏/缺标签、空链、零或超长证明帧、签名帧数不等于 `n + 1`、嵌套
+  证明或签名帧非法、非规范整数、截断及尾随字节；成功后重编码必逐字节等于
+  输入。非 `bytes` 入参抛 `TypeError`，其余非法情形抛 `ValueError`；结构
+  合法但签名不匹配或相邻不衔接由
+  `verify_audit_extension_checkpoint_chain` 返回 `False`
+- `verify_audit_extension_checkpoint_chain(chain, key) -> bool` — 对第 `i` 个
+  证明调用 `check_extension(proofs[i], signatures[i], signatures[i+1], key)`，
+  并检查每对相邻证明：前项叶数等于后项 `old_n` 且前项 `leaves` 等于后项
+  `leaves[:old_n]`；全部逐跳验证与所有衔接皆成立才返回 `True`，结构合法但
+  签名错配、篡改叶或 `old_n`、相邻缺口/重叠、换密钥核验等返回 `False`。非
+  `AuditExtensionCheckpointChain` 入参、非元组字段或元素类型错误抛
+  `TypeError`，空链、签名计数不等于 `n + 1` 或嵌套结构非法抛 `ValueError`
 
 ### 门限 Schnorr 群参数与边界
 

@@ -63,7 +63,11 @@ verify_audit_extension_proof_bundle, and the non-empty, order-preserving
 chain of such bundles AuditExtensionProofBundleChain /
 encode_audit_extension_proof_bundle_chain /
 decode_audit_extension_proof_bundle_chain /
-verify_audit_extension_proof_bundle_chain.
+verify_audit_extension_proof_bundle_chain, and the flattened checkpoint
+chain AuditExtensionCheckpointChain /
+encode_audit_extension_checkpoint_chain /
+decode_audit_extension_checkpoint_chain /
+verify_audit_extension_checkpoint_chain.
 """
 
 from __future__ import annotations
@@ -201,6 +205,10 @@ __all__ = [
     "encode_audit_extension_proof_bundle_chain",
     "decode_audit_extension_proof_bundle_chain",
     "verify_audit_extension_proof_bundle_chain",
+    "AuditExtensionCheckpointChain",
+    "encode_audit_extension_checkpoint_chain",
+    "decode_audit_extension_checkpoint_chain",
+    "verify_audit_extension_checkpoint_chain",
 ]
 
 # Mersenne prime 2**127 - 1: large enough for integer secrets, small enough that
@@ -6747,6 +6755,283 @@ def verify_audit_extension_proof_bundle_chain(
             ):
                 result = False
         previous = bundle
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Canonical audit-extension checkpoint chain transport: a self-delimiting,
+# byte-for-byte reproducible encoding of a non-empty, order-preserving
+# sequence of AuditExtensionProof values together with the n+1 checkpoint
+# root signatures that bracket them. Adjacent proofs link when the
+# predecessor's leaf set is exactly the successor's old prefix; the shared
+# checkpoint signature between two hops is stored only once. Decoding
+# restores structure only — the nested proofs go through decode_extension,
+# their leaf digests stay opaque and no signature or linkage is checked, so
+# verify_audit_extension_checkpoint_chain remains the sole verifier
+# afterwards.
+# ---------------------------------------------------------------------------
+
+AUDIT_EXTENSION_CHECKPOINT_CHAIN_WIRE_TAG = b"ts/aepcc/v1"
+
+
+@dataclass(frozen=True)
+class AuditExtensionCheckpointChain:
+    """A non-empty, order-preserving chain of consistency proofs and checkpoints.
+
+    The fields, in order, are ``proofs`` (the non-empty tuple of
+    :class:`AuditExtensionProof` values in chain order) and ``signatures``
+    (the tuple of :class:`AggregateSignature` checkpoint root signatures,
+    exactly ``len(proofs) + 1`` long): proof ``i`` is bracketed by
+    signatures ``i`` (its old root) and ``i + 1`` (its new root), so the
+    new-root signature of one hop is the old-root signature of the next.
+    For every adjacent proof pair the predecessor's leaf count must equal
+    the successor's ``proof.old_n`` and the predecessor's ``leaves`` must
+    equal the successor's ``leaves[:old_n]`` (enforced by
+    :func:`verify_audit_extension_checkpoint_chain`, not by construction).
+    The dataclass is frozen, positionally constructible and compared by
+    value, and carries no network, storage or hidden state. Field types
+    and bounds are not checked at construction time —
+    :func:`encode_audit_extension_checkpoint_chain` checks the structure
+    and :func:`verify_audit_extension_checkpoint_chain` is the way to test
+    a chain afterwards.
+    """
+
+    proofs: tuple[AuditExtensionProof, ...]
+    signatures: tuple[AggregateSignature, ...]
+
+
+def _check_audit_extension_checkpoint_chain_fields(
+    chain: object,
+) -> tuple[int, tuple[AuditExtensionProof, ...], tuple[AggregateSignature, ...]]:
+    """Type- and structure-check a checkpoint chain's fields, without verifying.
+
+    ``proofs`` must be a non-empty tuple of :class:`AuditExtensionProof`
+    values and ``signatures`` a tuple of :class:`AggregateSignature`
+    values exactly one longer than ``proofs``; the proofs and signatures
+    themselves are neither encoded nor verified here (that is
+    :func:`check_extension`'s job during verification). Returns
+    ``(proof_count, proofs, signatures)``.
+    """
+    if not isinstance(chain, AuditExtensionCheckpointChain):
+        raise TypeError(
+            "chain must be an AuditExtensionCheckpointChain instance"
+        )
+    proofs = chain.proofs
+    signatures = chain.signatures
+    if not isinstance(proofs, tuple):
+        raise TypeError("chain.proofs must be a tuple")
+    if not isinstance(signatures, tuple):
+        raise TypeError("chain.signatures must be a tuple")
+    try:
+        proof_count = len(proofs)
+        signature_count = len(signatures)
+    except OverflowError:
+        raise ValueError("too many chain items") from None
+    if proof_count == 0:
+        raise ValueError("chain.proofs must be non-empty")
+    for proof in proofs:
+        if not isinstance(proof, AuditExtensionProof):
+            raise TypeError(
+                "each chain proof must be an AuditExtensionProof instance"
+            )
+    for signature in signatures:
+        if not isinstance(signature, AggregateSignature):
+            raise TypeError(
+                "each chain signature must be an AggregateSignature instance"
+            )
+    if signature_count != proof_count + 1:
+        raise ValueError(
+            "chain.signatures must contain exactly len(chain.proofs) + 1 "
+            "signatures"
+        )
+    return proof_count, proofs, signatures
+
+
+def encode_audit_extension_checkpoint_chain(
+    chain: AuditExtensionCheckpointChain,
+) -> bytes:
+    """Canonically encode a checkpoint chain for transport or persistence.
+
+    The encoding is, in order, the tag ``b"ts/aepcc/v1"``, the proof count
+    ``n = len(chain.proofs)`` as a 4-byte unsigned big-endian integer, then
+    one frame per proof in chain order — each the 4-byte unsigned
+    big-endian length ``len(E)`` followed by
+    ``E = encode_extension(proof)`` (never empty) — and finally the
+    ``n + 1`` checkpoint signature frames in order, proof ``i`` bracketed
+    by frames ``i`` and ``i + 1``. Every signature frame is exactly the
+    signature frame of :func:`encode_audit_proof_bundle`:
+    ``VARINT(R)``, ``VARINT(z)``, the 4-byte unsigned big-endian signer
+    count ``k`` and one ``VARINT(id)`` per ascending signer id.
+
+    Only the chain container and the nested proof and signature
+    structures are checked — the prefix linkage is not verified and no
+    signature is checked against any root:
+    :func:`verify_audit_extension_checkpoint_chain` stays the way to
+    verify a chain afterwards. A non-chain argument or non-tuple field
+    raises TypeError, and a non-:class:`AuditExtensionProof` proof or
+    non-:class:`AggregateSignature` signature element raises TypeError
+    exactly as :func:`encode_extension` and
+    :func:`encode_audit_extension_proof_bundle` do for their fields. An
+    empty proof tuple, a signature count other than ``n + 1``, an
+    over-long count or frame, or an illegal nested proof or signature
+    raises ValueError. The output for a given chain is unique and the
+    encoding carries no network, storage or hidden state.
+    """
+    proof_count, proofs, signatures = (
+        _check_audit_extension_checkpoint_chain_fields(chain)
+    )
+    if proof_count > 0xFFFFFFFF:
+        raise ValueError("too many chain proofs")
+
+    bodies = []
+    for proof in proofs:
+        body = encode_extension(proof)
+        if len(body) > 0xFFFFFFFF:
+            raise ValueError("audit extension proof encoding too long")
+        bodies.append(body)
+
+    signer_counts = []
+    for index, signature in enumerate(signatures):
+        signer_count = _check_history_proof_bundle_signature(
+            signature, field=f"chain.signatures[{index}]"
+        )
+        if signer_count > 0xFFFFFFFF:
+            raise ValueError("too many signer ids")
+        signer_counts.append(signer_count)
+
+    buffer = bytearray(AUDIT_EXTENSION_CHECKPOINT_CHAIN_WIRE_TAG)
+    buffer += proof_count.to_bytes(4, "big", signed=False)
+    for body in bodies:
+        buffer += len(body).to_bytes(4, "big", signed=False)
+        buffer += body
+    for signature, signer_count in zip(signatures, signer_counts):
+        buffer += _encode_varint(signature.R)
+        buffer += _encode_varint(signature.z)
+        buffer += signer_count.to_bytes(4, "big", signed=False)
+        for signer_id in signature.signer_ids:
+            buffer += _encode_varint(signer_id)
+    return bytes(buffer)
+
+
+def decode_audit_extension_checkpoint_chain(
+    blob: bytes,
+) -> AuditExtensionCheckpointChain:
+    """Decode the canonical encoding produced by :func:`encode_audit_extension_checkpoint_chain`.
+
+    Accepts only the single canonical form: the tag
+    ``b"ts/aepcc/v1"``, the 4-byte unsigned big-endian non-zero proof
+    count ``n``, then exactly ``n`` frames, each a 4-byte unsigned
+    big-endian non-zero length followed by bytes that
+    :func:`decode_extension` accepts, and finally exactly ``n + 1``
+    signature frames, each the length-prefixed integers ``R`` and ``z``,
+    the 4-byte non-zero signer count ``k`` and exactly ``k`` strictly
+    increasing positive signer ids. A non-bytes argument raises
+    TypeError; a wrong or missing tag, an empty chain, a zero or
+    over-long proof frame length, a non-canonical nested proof or
+    signature integer, a zero ``R``, a zero signer count, a non-positive
+    or non-increasing signer id, a count mismatch, truncation, or
+    trailing bytes raises ValueError. A successfully decoded chain
+    re-encodes to exactly the input bytes.
+
+    Decoding only restores the structure: every nested proof goes through
+    :func:`decode_extension`, whose leaf digests stay opaque, no
+    signature frame is checked and the prefix linkage between adjacent
+    proofs is not checked either. A structurally legal chain whose
+    signatures do not match or whose proofs do not link is returned
+    normally, and :func:`verify_audit_extension_checkpoint_chain`
+    reports it as ``False``.
+    """
+    if not isinstance(blob, bytes):
+        raise TypeError("blob must be bytes")
+    if not blob.startswith(AUDIT_EXTENSION_CHECKPOINT_CHAIN_WIRE_TAG):
+        raise ValueError("bad audit extension checkpoint chain tag")
+    offset = len(AUDIT_EXTENSION_CHECKPOINT_CHAIN_WIRE_TAG)
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated audit extension checkpoint chain count")
+    count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    if count == 0:
+        raise ValueError("audit extension checkpoint chain must be non-empty")
+
+    proofs = []
+    for index in range(count):
+        body, offset = _read_audit_proof_block(
+            blob,
+            offset,
+            what=f"audit extension checkpoint chain proof {index + 1}",
+        )
+        proofs.append(decode_extension(body))
+
+    signatures = []
+    for index in range(count + 1):
+        signature, offset = _read_bundle_signature_frame(
+            blob,
+            offset,
+            what=f"audit extension checkpoint chain signature {index + 1}",
+        )
+        signatures.append(signature)
+    if offset != len(blob):
+        raise ValueError(
+            "trailing bytes after audit extension checkpoint chain"
+        )
+
+    chain = AuditExtensionCheckpointChain(
+        proofs=tuple(proofs), signatures=tuple(signatures)
+    )
+    if encode_audit_extension_checkpoint_chain(chain) != blob:
+        raise ValueError(
+            "non-canonical audit extension checkpoint chain encoding"
+        )
+    return chain
+
+
+def verify_audit_extension_checkpoint_chain(
+    chain: AuditExtensionCheckpointChain, key: SigningDKGResult
+) -> bool:
+    """Verify every proof hop of a checkpoint chain and the linkage between neighbours.
+
+    Proof ``i`` is verified with
+    ``check_extension(chain.proofs[i], chain.signatures[i],
+    chain.signatures[i + 1], key)``: the checkpoint signatures bracket
+    each hop and the new root of one hop shares its signature with the
+    next hop's old root. For every adjacent proof pair the predecessor's
+    leaf count must equal the successor's ``old_n`` and the
+    predecessor's ``leaves`` must equal the first ``old_n`` leaves of the
+    successor's ``leaves`` — the old tree of each hop is exactly the new
+    tree of the previous one. Returns ``True`` only when every hop
+    verifies and every linkage holds; a well-formed chain with a
+    mismatched signature, tampered leaves, a gap or overlap between
+    neighbours, or one presented under another key returns ``False``.
+
+    A non-:class:`AuditExtensionCheckpointChain` argument raises
+    TypeError; an empty proof tuple, a non-tuple field, a
+    non-:class:`AuditExtensionProof` proof or
+    non-:class:`AggregateSignature` signature element, a signature count
+    other than ``len(proofs) + 1``, or an illegal nested proof or key
+    structure raises TypeError/ValueError, exactly as the structural
+    checks of :func:`encode_audit_extension_checkpoint_chain` and
+    :func:`check_extension` do. The function is stateless.
+    """
+    _proof_count, proofs, signatures = (
+        _check_audit_extension_checkpoint_chain_fields(chain)
+    )
+
+    result = True
+    previous_leaves = None
+    for index, proof in enumerate(proofs):
+        if not check_extension(
+            proof, signatures[index], signatures[index + 1], key
+        ):
+            result = False
+        if previous_leaves is not None:
+            old_n = proof.old_n
+            if (
+                len(previous_leaves) != old_n
+                or previous_leaves != proof.leaves[:old_n]
+            ):
+                result = False
+        previous_leaves = proof.leaves
     return result
 
 
