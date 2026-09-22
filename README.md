@@ -629,6 +629,41 @@ assert verify_audit_extension_checkpoint_chain(restored, key)  # 逐跳 check_ex
 `n + 1`、帧或嵌套非法、截断或尾随字节抛 `ValueError`；结构合法但签名错配或
 相邻不衔接由 `verify_audit_extension_checkpoint_chain` 返回 `False`。
 
+检查点链的每一跳都完整携带全部历史叶摘要，跳数越多重复越多。冻结数据类
+`AuditExtensionDeltaCheckpointChain(first, additions, signatures)` 是等价的
+增量形式：`first` 为完整携带首跳全部叶的 `AuditExtensionProof`，
+`additions` 为 `tuple[tuple[bytes, ...], ...]`，每批非空、按原序保存该跳新增
+的 32 字节叶摘要（历史叶只存一份，不再逐跳重复），`signatures` 为恰含
+`len(additions) + 2` 个 `AggregateSignature` 的元组——首证明由第 0、1 个
+签名夹住，第 `i` 批产生由第 `i + 1`、`i + 2` 个签名夹住的后继检查点，签名
+按原序复用。可按位置构造、按值相等，不含隐藏状态：
+
+```python
+from thresholdsign import (
+    AuditExtensionDeltaCheckpointChain,
+    compact_audit_extension_delta_checkpoint_chain,
+    expand_audit_extension_delta_checkpoint_chain,
+    verify_audit_extension_checkpoint_chain,
+)
+
+delta = AuditExtensionDeltaCheckpointChain(first, (batch1, batch2), signatures)
+chain = expand_audit_extension_delta_checkpoint_chain(delta)   # AuditExtensionCheckpointChain
+assert verify_audit_extension_checkpoint_chain(chain, key)     # 仍由既有验证器核验
+assert compact_audit_extension_delta_checkpoint_chain(chain) == delta
+```
+
+`expand_audit_extension_delta_checkpoint_chain(chain)` 按原序展开：首证明
+原样保留，第 `i` 批追加在累计叶序列之后，生成 `old_n` 为展开前累计叶数、
+`leaves` 为累计叶加本批的后继证明，展开后共 `len(additions) + 1` 个证明、
+签名原序复用；`compact_audit_extension_delta_checkpoint_chain(chain)` 是其
+逆操作，提取各跳新增叶（`proof.leaves[proof.old_n:]`），不验签。两个转换
+入口对非本类入参或字段、元素类型错误（含非元组批、非 `bytes` 摘要）抛
+`TypeError`；对空链、签名数不符（`expand` 要求 `len(additions) + 2`，
+`compact` 要求 `len(proofs) + 1`）、空批、摘要非 32 字节、嵌套证明或签名
+非法、相邻前缀断裂（`compact`）抛 `ValueError`。两函数都不验签、不引入
+网络、存储或隐藏状态，展开后的链仍由既有
+`verify_audit_extension_checkpoint_chain` 核验，旧接口不变。
+
 
 ## 命令行演示
 
@@ -1339,6 +1374,27 @@ python3 -m thresholdsign
   签名错配、篡改叶或 `old_n`、相邻缺口/重叠、换密钥核验等返回 `False`。非
   `AuditExtensionCheckpointChain` 入参、非元组字段或元素类型错误抛
   `TypeError`，空链、签名计数不等于 `n + 1` 或嵌套结构非法抛 `ValueError`
+- `AuditExtensionDeltaCheckpointChain(first, additions, signatures)` — 冻结
+  数据类；检查点链的增量形式，历史叶只存一份：`first` 为完整携带首跳全部叶
+  的 `AuditExtensionProof`，`additions` 为非空批的元组
+  `tuple[tuple[bytes, ...], ...]`，每批按原序保存该跳新增的 32 字节叶摘要，
+  `signatures` 为恰含 `len(additions) + 2` 个 `AggregateSignature` 的元组，
+  首证明由第 0、1 个签名夹住，第 `i` 批产生由第 `i + 1`、`i + 2` 个签名夹住
+  的后继检查点。可按位置构造、按值相等；构造时不校验，结构由
+  `expand_audit_extension_delta_checkpoint_chain` 检查、展开后的真伪仍由
+  `verify_audit_extension_checkpoint_chain` 核验；不含网络、存储或隐藏状态
+- `expand_audit_extension_delta_checkpoint_chain(chain) -> AuditExtensionCheckpointChain`
+  — 按原序展开增量链：首证明原样保留，第 `i` 批追加在累计叶序列之后，生成
+  `old_n` 为展开前累计叶数、`leaves` 为累计叶加本批的后继证明，共
+  `len(additions) + 1` 个证明，签名原序复用；不验签、无状态。非本类入参或
+  字段、元素类型错误抛 `TypeError`；空批、摘要非 32 字节、签名数不符、嵌套
+  证明或签名非法、累计叶数超过 2^64-1 抛 `ValueError`
+- `compact_audit_extension_delta_checkpoint_chain(chain) -> AuditExtensionDeltaCheckpointChain`
+  — `expand_audit_extension_delta_checkpoint_chain` 的逆操作：首跳证明完整
+  保留为 `first`，此后每跳提取新增叶 `proof.leaves[proof.old_n:]` 作为一批，
+  签名原序保留；不验签、无状态。非 `AuditExtensionCheckpointChain` 入参或
+  字段、元素类型错误抛 `TypeError`；空链、签名数不符、嵌套证明或签名非法、
+  相邻前缀断裂抛 `ValueError`
 
 ### 门限 Schnorr 群参数与边界
 
