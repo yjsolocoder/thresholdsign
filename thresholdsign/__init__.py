@@ -95,7 +95,11 @@ encode_dr / decode_dr and key-bound verifier verify_dr, and the
 self-contained diagnostic bundle DeltaReportBundle that carries the
 diagnosed segment set together with its report, with its transport
 encoding encode_delta_report_bundle / decode_delta_report_bundle and
-key-bound verifier verify_delta_report_bundle.
+key-bound verifier verify_delta_report_bundle, and the non-empty
+order-preserving archive DeltaReportBundleArchive of whole bundles,
+with its transport encoding
+encode_delta_report_bundle_archive / decode_delta_report_bundle_archive
+and key-bound verifier verify_delta_report_bundle_archive.
 """
 
 from __future__ import annotations
@@ -261,6 +265,10 @@ __all__ = [
     "encode_delta_report_bundle",
     "decode_delta_report_bundle",
     "verify_delta_report_bundle",
+    "DeltaReportBundleArchive",
+    "encode_delta_report_bundle_archive",
+    "decode_delta_report_bundle_archive",
+    "verify_delta_report_bundle_archive",
 ]
 
 # Mersenne prime 2**127 - 1: large enough for integer secrets, small enough that
@@ -8689,6 +8697,214 @@ def verify_delta_report_bundle(
     if not isinstance(bundle, DeltaReportBundle):
         raise TypeError("bundle must be a DeltaReportBundle instance")
     return verify_dr(bundle.report, bundle.segments, key)
+
+
+# ---------------------------------------------------------------------------
+# Archives of whole delta report bundles: a non-empty, order-preserving
+# batch of DeltaReportBundle values archived as one self-delimiting object.
+# Like the other codecs the archive encoding restores structure only — the
+# bundles are neither sorted nor matched against one another and no signature
+# is checked — and verify_delta_report_bundle_archive simply delegates to
+# verify_delta_report_bundle per item, so it keeps no state of its own.
+# ---------------------------------------------------------------------------
+
+DELTA_REPORT_BUNDLE_ARCHIVE_WIRE_TAG = (
+    b"thresholdsign/delta-report-bundle-archive/v1"
+)
+
+
+@dataclass(frozen=True)
+class DeltaReportBundleArchive:
+    """A non-empty, order-preserving archive of delta report bundles.
+
+    The single field ``items`` is a non-empty tuple of
+    :class:`DeltaReportBundle` values in archive order. The dataclass is
+    frozen, positionally constructible and compared by value; the items
+    keep their order and the archive carries no network, storage or
+    hidden state. Field and element types and the non-empty bound are
+    not checked at construction time —
+    :func:`encode_delta_report_bundle_archive` checks the structure and
+    :func:`verify_delta_report_bundle_archive` is the way to test an
+    archive against a key afterwards.
+    """
+
+    items: tuple[DeltaReportBundle, ...]
+
+
+def encode_delta_report_bundle_archive(
+    archive: DeltaReportBundleArchive,
+) -> bytes:
+    """Canonically encode a non-empty ordered archive of delta report
+    bundles as one self-delimiting object.
+
+    The encoding is, in order, the tag
+    ``b"thresholdsign/delta-report-bundle-archive/v1"``, the 4-byte
+    unsigned big-endian item count (never zero), then one frame per
+    bundle in tuple order — each the 4-byte unsigned big-endian byte
+    length followed by the exact bytes of
+    :func:`encode_delta_report_bundle` for that item, with no further
+    separators. Every U32 is a 4-byte unsigned big-endian integer.
+
+    Only the archive container and the structure of each individual
+    bundle are checked — the items are not sorted or otherwise
+    reordered, they are not matched against one another and no
+    signature is checked:
+    :func:`verify_delta_report_bundle_archive` is the way to test an
+    archive afterwards. A non-:class:`DeltaReportBundleArchive`
+    argument, a non-tuple ``items`` field or a
+    non-:class:`DeltaReportBundle` element raises TypeError, as does
+    any wrong field or element type nested inside a bundle, its
+    segments or its report. An empty items tuple, an over-long count
+    or frame, or any structural error a bundle would raise on its own
+    raises ValueError. The output for a given archive is unique and the
+    encoding carries no network, storage or hidden state.
+    """
+    if not isinstance(archive, DeltaReportBundleArchive):
+        raise TypeError(
+            "archive must be a DeltaReportBundleArchive instance"
+        )
+    items = archive.items
+    if not isinstance(items, tuple):
+        raise TypeError("items must be a tuple")
+    for item in items:
+        if not isinstance(item, DeltaReportBundle):
+            raise TypeError(
+                "each archive item must be a DeltaReportBundle instance"
+            )
+    item_count = len(items)
+    if item_count == 0:
+        raise ValueError("archive items must be a non-empty tuple")
+    if item_count > 0xFFFFFFFF:
+        raise ValueError("too many delta report bundle archive items")
+
+    # Encode every item first — each call raises TypeError/ValueError
+    # for an illegal bundle exactly as the single-bundle codec does —
+    # and only then frame the results, so a single illegal item aborts
+    # the whole archive.
+    frames = []
+    for index, item in enumerate(items):
+        encoded = encode_delta_report_bundle(item)
+        if len(encoded) > 0xFFFFFFFF:
+            raise ValueError(
+                f"delta report bundle archive item {index + 1} "
+                "encoding too long"
+            )
+        frames.append(encoded)
+
+    buffer = bytearray(DELTA_REPORT_BUNDLE_ARCHIVE_WIRE_TAG)
+    buffer += item_count.to_bytes(4, "big", signed=False)
+    for encoded in frames:
+        buffer += len(encoded).to_bytes(4, "big", signed=False)
+        buffer += encoded
+    return bytes(buffer)
+
+
+def decode_delta_report_bundle_archive(
+    blob: bytes,
+) -> DeltaReportBundleArchive:
+    """Decode the canonical encoding produced by
+    :func:`encode_delta_report_bundle_archive`.
+
+    Accepts only the single canonical form: the tag
+    ``b"thresholdsign/delta-report-bundle-archive/v1"``, a 4-byte
+    unsigned big-endian non-zero item count, then exactly that many
+    frames, each a 4-byte unsigned big-endian non-zero byte length
+    followed by the exact canonical encoding of one
+    :class:`DeltaReportBundle` that
+    :func:`decode_delta_report_bundle` accepts. The bundles are
+    restored in their original order as a tuple; they are neither
+    sorted nor matched against one another and no signature is
+    verified — :func:`verify_delta_report_bundle_archive` judges the
+    archive afterwards. A non-bytes argument raises TypeError; a wrong
+    or missing tag, a zero item count, a zero or over-long frame
+    length, a count mismatch, truncation, trailing bytes, or a frame
+    whose nested bundle, segment or report encoding is illegal or
+    non-canonical (including a frame that would not re-encode byte for
+    byte) raises ValueError. A successfully decoded archive
+    re-encodes to exactly the input bytes.
+
+    Decoding only restores structure: an archive whose bundles do not
+    diagnose their carried segment sets or whose signatures do not
+    seal them is returned normally, and
+    :func:`verify_delta_report_bundle_archive` reports it as
+    ``False``.
+    """
+    if not isinstance(blob, bytes):
+        raise TypeError("blob must be bytes")
+    if not blob.startswith(DELTA_REPORT_BUNDLE_ARCHIVE_WIRE_TAG):
+        raise ValueError("bad delta report bundle archive tag")
+    offset = len(DELTA_REPORT_BUNDLE_ARCHIVE_WIRE_TAG)
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated delta report bundle archive item count")
+    item_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    if item_count == 0:
+        raise ValueError("delta report bundle archive items must be non-empty")
+
+    items = []
+    for index in range(item_count):
+        frame, offset = _read_audit_proof_block(
+            blob,
+            offset,
+            what=f"delta report bundle archive item {index + 1}",
+        )
+        items.append(decode_delta_report_bundle(frame))
+
+    if offset != len(blob):
+        raise ValueError("trailing bytes after delta report bundle archive")
+
+    archive = DeltaReportBundleArchive(items=tuple(items))
+    if encode_delta_report_bundle_archive(archive) != blob:
+        raise ValueError("non-canonical delta report bundle archive encoding")
+    return archive
+
+
+def verify_delta_report_bundle_archive(
+    archive: DeltaReportBundleArchive, key: SigningDKGResult
+) -> bool:
+    """Verify an archive of delta report bundles against the threshold key.
+
+    ``archive`` must be a structurally legal
+    :class:`DeltaReportBundleArchive` exactly as
+    :func:`encode_delta_report_bundle_archive` requires and ``key`` a
+    legal :class:`SigningDKGResult`; every item is passed to
+    :func:`verify_delta_report_bundle` in archive order, so the
+    archive verifies only when every single bundle verifies under
+    ``key``. The items are neither sorted nor reordered and the
+    function keeps no state of its own. A structurally legal archive
+    containing one bundle whose diagnosis does not match its carried
+    segments, whose signature was tampered with, or which is presented
+    under another key returns ``False`` instead of raising.
+
+    A non-:class:`DeltaReportBundleArchive` argument, a non-tuple
+    ``items`` field, a non-:class:`DeltaReportBundle` element or a
+    non-:class:`SigningDKGResult` ``key`` raises TypeError; an empty
+    items tuple or any structurally illegal nested bundle, segment or
+    report raises ValueError, exactly along the boundaries of
+    :func:`verify_delta_report_bundle` and
+    :func:`encode_delta_report_bundle_archive`.
+    """
+    if not isinstance(archive, DeltaReportBundleArchive):
+        raise TypeError(
+            "archive must be a DeltaReportBundleArchive instance"
+        )
+    items = archive.items
+    if not isinstance(items, tuple):
+        raise TypeError("items must be a tuple")
+    for item in items:
+        if not isinstance(item, DeltaReportBundle):
+            raise TypeError(
+                "each archive item must be a DeltaReportBundle instance"
+            )
+    # Structurally validate every item before any cryptographic verdict,
+    # so an empty archive or an illegal bundle at any position raises
+    # exactly as the encoder does, independent of an earlier item that
+    # is structurally legal but merely fails verification.
+    encode_delta_report_bundle_archive(archive)
+    return all(
+        verify_delta_report_bundle(item, key) for item in items
+    )
 
 
 # ---------------------------------------------------------------------------

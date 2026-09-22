@@ -810,6 +810,38 @@ assert verify_delta_report_bundle(restored, key)   # 直接复用 verify_dr
 全部一致才返回 `True`，结构合法但诊断不符、报告密封的是另一组分段、签名被
 篡改或密钥不匹配返回 `False`；既有全部接口行为不变。
 
+多个完整的诊断报告包还可按原序归档为一个非空、保序的整体对象：
+
+```python
+from thresholdsign import (
+    DeltaReportBundleArchive,
+    decode_delta_report_bundle_archive,
+    encode_delta_report_bundle_archive,
+    verify_delta_report_bundle_archive,
+)
+
+archive = DeltaReportBundleArchive((bundle0, bundle1))  # 唯一字段为 items
+blob = encode_delta_report_bundle_archive(archive)      # 仅检查容器及单包结构
+restored = decode_delta_report_bundle_archive(blob)     # 仅按原序恢复结构
+assert restored == archive
+assert verify_delta_report_bundle_archive(restored, key)  # 逐项核验，全真才真
+```
+
+`DeltaReportBundleArchive` 是冻结、可按位置构造、按值相等的数据类，唯一字段
+为非空保序的 `items: tuple[DeltaReportBundle, ...]`，不含网络、存储或隐藏
+状态，构造时不校验。编码依次为标签
+`b"thresholdsign/delta-report-bundle-archive/v1"`、U32 项数和原序
+`U32(len(E))||E` 帧，其中 `E = encode_delta_report_bundle(item)`；所有 U32
+均为 4 字节无符号大端。编码仅验容器和单包结构，不排序、不验签，输出唯一且
+无状态。解码逐帧调用 `decode_delta_report_bundle` 按原序恢复，成功后重编码
+须逐字节等于输入，不验签、不保存状态；单包自身合法但诊断或签名不匹配照样
+正常返回，由核验入口判定。入参非 `DeltaReportBundleArchive`、`items` 非
+元组、元素非 `DeltaReportBundle` 或嵌套字段类型错误抛 `TypeError`；空归档、
+坏标签、零长或超长帧、计数错、截断、尾随或非规范嵌套编码抛 `ValueError`。
+`verify_delta_report_bundle_archive(archive, key)` 逐项调用
+`verify_delta_report_bundle`，全部为 `True` 才返回 `True`，任一包结构合法但
+核验不过则整体为 `False`；既有全部接口行为不变。
+
 
 ## 命令行演示
 
@@ -1609,6 +1641,29 @@ python3 -m thresholdsign
   报告公钥等于 `key.public_key` 且签名验过方为 `True`；结构合法但诊断、分段
   摘要、签名或密钥不匹配返回 `False`。非 `DeltaReportBundle` 入参或
   `key` 类型错误抛 `TypeError`，空分段元组或嵌套结构非法抛 `ValueError`
+- `DeltaReportBundleArchive(items)` — 冻结数据类，唯一字段为非空保序的
+  `items: tuple[DeltaReportBundle, ...]`，把多个完整诊断报告包归档为一个整体；
+  可按位置构造、按值相等，不含网络、存储或隐藏状态，构造时不校验字段类型与
+  非空约束
+- `encode_delta_report_bundle_archive(archive) -> bytes` — 报告包归档的规范
+  传输/持久化编码：标签
+  `b"thresholdsign/delta-report-bundle-archive/v1"`、U32 项数，随后按原序写
+  每项的 `U32(len(E))||E` 帧（`E = encode_delta_report_bundle(item)`）；U32
+  均为 4 字节无符号大端。仅验容器和单包结构，不排序、不验签，输出唯一且无
+  状态。入参非 `DeltaReportBundleArchive`、`items` 非元组、元素非
+  `DeltaReportBundle` 或嵌套字段类型错误抛 `TypeError`；空归档、计数或帧
+  超长及嵌套结构错误抛 `ValueError`
+- `decode_delta_report_bundle_archive(blob: bytes) -> DeltaReportBundleArchive`
+  — 恢复 `encode_delta_report_bundle_archive` 的唯一规范形式：逐帧调用
+  `decode_delta_report_bundle` 按原序还原各项；成功后重编码须逐字节等于输入，
+  仅恢复结构，不验签、不保存状态，单包结构合法但诊断或签名不匹配照样正常
+  返回。入参非 `bytes` 抛 `TypeError`；坏标签、零项数、零长/超长帧、计数错、
+  截断、尾随或非规范嵌套编码抛 `ValueError`
+- `verify_delta_report_bundle_archive(archive, key) -> bool` — 逐项调用
+  `verify_delta_report_bundle`，全部为 `True` 方为 `True`，任一包结构合法但
+  核验不过则整体为 `False`。非 `DeltaReportBundleArchive` 入参、`items` 非
+  元组、元素非 `DeltaReportBundle` 或 `key` 类型错误抛 `TypeError`，空归档
+  或嵌套结构非法抛 `ValueError`
 
 ### 门限 Schnorr 群参数与边界
 
