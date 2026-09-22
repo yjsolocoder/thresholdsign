@@ -48,7 +48,9 @@ check_proof, the compact multi-record proofs AuditMultiProof /
 make_multi_proof / check_multi_proof that certify several ordered records
 with the one root signature, plus their canonical transport encodings
 encode_audit_proof / decode_audit_proof and encode_audit_multi_proof /
-decode_audit_multi_proof. Append-only consistency proofs over the same tree:
+decode_audit_multi_proof, and the proof-plus-signature bundle
+AuditProofBundle / encode_audit_proof_bundle / decode_audit_proof_bundle /
+verify_audit_proof_bundle. Append-only consistency proofs over the same tree:
 AuditExtensionProof / make_extension / check_extension, letting an observer
 verify — from two threshold signatures alone — that an old record sequence
 is a prefix of a new one, without seeing any message or receipt, plus their
@@ -167,6 +169,10 @@ __all__ = [
     "check_multi_proof",
     "encode_audit_proof",
     "decode_audit_proof",
+    "AuditProofBundle",
+    "encode_audit_proof_bundle",
+    "decode_audit_proof_bundle",
+    "verify_audit_proof_bundle",
     "encode_audit_multi_proof",
     "decode_audit_multi_proof",
     "AuditExtensionProof",
@@ -5492,6 +5498,182 @@ def decode_audit_proof(payload: bytes) -> AuditProof:
     if encode_audit_proof(proof) != payload:
         raise ValueError("non-canonical audit proof")
     return proof
+
+
+# ---------------------------------------------------------------------------
+# Canonical audit-proof bundle transport: a self-delimiting, byte-for-byte
+# reproducible encoding of an AuditProof together with the AggregateSignature
+# on its b"am/r" || U64(n) || root statement, for cross-implementation
+# exchange and persistence. Decoding restores structure only — the nested
+# proof goes through decode_audit_proof and no receipt or signature is
+# checked, so verify_audit_proof_bundle remains the sole verifier afterwards.
+# ---------------------------------------------------------------------------
+
+AUDIT_PROOF_BUNDLE_WIRE_TAG = b"ts/apb/v1"
+
+
+@dataclass(frozen=True)
+class AuditProofBundle:
+    """A single-record audit proof together with its root signature.
+
+    The fields, in order, are ``proof`` (an :class:`AuditProof`) and
+    ``signature`` (the :class:`AggregateSignature` on the proof's
+    ``b"am/r" || U64(n) || root`` statement). The dataclass is frozen,
+    positionally constructible and compared by value, and carries no
+    network, storage or hidden state. Field types and bounds are not
+    checked at construction time — :func:`encode_audit_proof_bundle`
+    checks the structure and :func:`verify_audit_proof_bundle` is the
+    way to test a bundle afterwards.
+    """
+
+    proof: AuditProof
+    signature: AggregateSignature
+
+
+def encode_audit_proof_bundle(bundle: AuditProofBundle) -> bytes:
+    """Canonically encode an audit proof bundle for transport or persistence.
+
+    The encoding is, in order, the tag ``b"ts/apb/v1"``, the 4-byte
+    unsigned big-endian length ``len(P)`` followed by
+    ``P = encode_audit_proof(bundle.proof)`` (never empty), and then the
+    signature frame: ``VARINT(R)``, ``VARINT(z)``, the 4-byte unsigned
+    big-endian signer count ``k`` and one ``VARINT(id)`` per ascending
+    signer id. A ``VARINT`` is a 4-byte unsigned big-endian body length
+    followed by the shortest unsigned big-endian value (zero is the
+    single byte ``00``, positive values carry no leading zero); ``R``
+    must be positive and ``z`` may be zero.
+
+    Only a structurally legal :class:`AuditProofBundle` is accepted — a
+    non-bundle or non-:class:`AuditProof` proof argument, or wrong
+    proof/signature field types, raise TypeError and illegal proof or
+    signature structure (the exact bounds of :func:`encode_audit_proof`,
+    a non-positive ``R``, a negative ``z``, an empty or
+    non-strictly-increasing signer id tuple) or an over-long frame raises
+    ValueError, exactly as :func:`check_proof`'s structural checks do —
+    but the receipt is not parsed and the signature is not checked
+    against the root, so a proof and signature that do not match still
+    encode: :func:`verify_audit_proof_bundle` stays the way to verify a
+    bundle afterwards. The output for a given bundle is unique and the
+    encoding carries no network, storage or hidden state.
+    """
+    if not isinstance(bundle, AuditProofBundle):
+        raise TypeError("bundle must be an AuditProofBundle instance")
+    if not isinstance(bundle.proof, AuditProof):
+        raise TypeError("bundle.proof must be an AuditProof instance")
+    encoded_proof = encode_audit_proof(bundle.proof)
+    signer_count = _check_history_proof_bundle_signature(bundle.signature)
+    if len(encoded_proof) > 0xFFFFFFFF:
+        raise ValueError("audit proof encoding too long")
+    if signer_count > 0xFFFFFFFF:
+        raise ValueError("too many signer ids")
+
+    buffer = bytearray(AUDIT_PROOF_BUNDLE_WIRE_TAG)
+    buffer += len(encoded_proof).to_bytes(4, "big", signed=False)
+    buffer += encoded_proof
+    buffer += _encode_varint(bundle.signature.R)
+    buffer += _encode_varint(bundle.signature.z)
+    buffer += signer_count.to_bytes(4, "big", signed=False)
+    for signer_id in bundle.signature.signer_ids:
+        buffer += _encode_varint(signer_id)
+    return bytes(buffer)
+
+
+def decode_audit_proof_bundle(blob: bytes) -> AuditProofBundle:
+    """Decode the canonical encoding produced by :func:`encode_audit_proof_bundle`.
+
+    Accepts only the single canonical form: the tag ``b"ts/apb/v1"``, a
+    4-byte non-zero frame length followed by bytes that
+    :func:`decode_audit_proof` accepts, the length-prefixed integers
+    ``R`` and ``z``, the 4-byte non-zero signer count ``k`` and then
+    exactly ``k`` strictly increasing positive signer ids. A non-bytes
+    argument raises TypeError; a wrong or missing tag, a zero or
+    over-long proof frame length, a non-canonical nested proof, a zero
+    ``R``, a non-canonical integer (leading zero or over-long length), a
+    zero signer count, a non-positive or non-increasing signer id,
+    truncation, or trailing bytes raises ValueError. A successfully
+    decoded bundle re-encodes to exactly the input bytes.
+
+    Decoding only restores the structure: the nested proof is decoded
+    with :func:`decode_audit_proof` (which parses no receipt) and the
+    signature is not checked. A structurally legal bundle whose receipt
+    does not match its message or whose signature does not sign the root
+    is returned normally, and :func:`verify_audit_proof_bundle` reports
+    it as ``False``.
+    """
+    if not isinstance(blob, bytes):
+        raise TypeError("blob must be bytes")
+    if not blob.startswith(AUDIT_PROOF_BUNDLE_WIRE_TAG):
+        raise ValueError("bad audit proof bundle tag")
+    offset = len(AUDIT_PROOF_BUNDLE_WIRE_TAG)
+
+    encoded_proof, offset = _read_audit_proof_block(
+        blob, offset, what="audit proof bundle proof"
+    )
+    proof = decode_audit_proof(encoded_proof)
+
+    R, offset = _read_varint(
+        blob, offset, what="audit proof bundle signature R"
+    )
+    z, offset = _read_varint(
+        blob, offset, what="audit proof bundle signature z"
+    )
+    if R == 0:
+        raise ValueError("audit proof bundle signature R must be positive")
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated audit proof bundle signer count")
+    signer_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    if signer_count == 0:
+        raise ValueError("audit proof bundle must name at least one signer")
+
+    signer_ids = []
+    for _ in range(signer_count):
+        signer_id, offset = _read_varint(
+            blob,
+            offset,
+            what="audit proof bundle signer id",
+        )
+        if signer_id == 0:
+            raise ValueError("audit proof bundle signer ids must be positive")
+        if signer_ids and signer_id <= signer_ids[-1]:
+            raise ValueError(
+                "audit proof bundle signer ids must be strictly "
+                "increasing and unique"
+            )
+        signer_ids.append(signer_id)
+    if offset != len(blob):
+        raise ValueError("trailing bytes after audit proof bundle")
+
+    bundle = AuditProofBundle(
+        proof=proof,
+        signature=AggregateSignature(R=R, z=z, signer_ids=tuple(signer_ids)),
+    )
+    if encode_audit_proof_bundle(bundle) != blob:
+        raise ValueError("non-canonical audit proof bundle encoding")
+    return bundle
+
+
+def verify_audit_proof_bundle(
+    bundle: AuditProofBundle, key: SigningDKGResult
+) -> bool:
+    """Verify a bundle exactly as :func:`check_proof` would.
+
+    This is a convenience wrapper over
+    ``check_proof(bundle.proof, bundle.signature, key)``: the Merkle root
+    is rebuilt from the proof, the embedded record is re-checked with
+    :func:`check_audit` and the signature verified on
+    ``b"am/r" || U64(n) || root``. Returns ``True`` only when all of them
+    hold; a well-formed bundle with a tampered record, sibling path or
+    signature, or one presented under another key, returns ``False``.
+
+    A non-:class:`AuditProofBundle` argument raises TypeError; illegal
+    nested proof, signature or key structure raises TypeError/ValueError,
+    exactly as :func:`check_proof` does.
+    """
+    if not isinstance(bundle, AuditProofBundle):
+        raise TypeError("bundle must be an AuditProofBundle instance")
+    return check_proof(bundle.proof, bundle.signature, key)
 
 
 # ---------------------------------------------------------------------------
