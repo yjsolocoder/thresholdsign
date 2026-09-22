@@ -962,6 +962,58 @@ assert verify_dc(restored, key)  # 结构合法但签名错配仍正常返回对
 解码入参非 `bytes` 抛 `TypeError`。`drasc_message`、`verify_dc`、各嵌套封印
 及全部旧接口行为不变。
 
+#### 归档封印链的紧凑多封印包含证明
+
+要一次向第三方证明若干归档封印同属一条有序封印链（同一棵树）而只出示一个根
+签名时，可用紧凑多封印证明，它不改变链与既有任何接口。冻结数据类
+`SMP(i, n, s, p)` 字段依次为待证叶下标元组 `i: tuple[int, ...]`（非空、严格
+递增、互不相同且不含布尔）、链项总数 `n: int`、按下标逐项对应的封印元组
+`s: tuple[DeltaReportBundleArchiveSeal, ...]` 与按层升序（自叶向根）、层内
+自左向右排列的同伴摘要元组 `p: tuple[bytes, ...]`（每项恰 32 字节），可按
+位置构造、按值相等且不可变，不带任何隐藏状态。
+
+`make_smp(chain, i) -> tuple[bytes, SMP]` 要求 `chain` 为现有的
+`DeltaReportBundleArchiveSealChain`（其 `items` 为非空、结构合法的封印元组），
+`i` 为非空、严格递增、不含布尔的整数元组，并满足
+`0 <= i_j < n < 2^64`，其中 `n` 取链项数、`s` 按 `i` 取链中对应项。记
+`H = SHA256`、`U64` 为 8 字节无符号大端、`E_j` 为第 `j` 项封印的既有规范
+编码 `encode_delta_report_bundle_archive_seal`，树规则为
+
+```text
+leaf_j = H(b"ds/l1" || U64(j) || H(E_j))
+node   = H(b"ds/n1" || left || right)      # 每层奇数尾节点复制自身配对
+```
+
+返回同样的待签根消息与多封印证明：
+
+```python
+from thresholdsign import make_smp, check_smp
+
+message, proof = make_smp(chain, (0, 2, 4))
+signature = sign_threshold(key, message)   # 同一个根签名覆盖多个位置的封印
+assert check_smp(proof, signature, key)
+```
+
+根消息为 `b"ds/r1" || U64(n) || root`。`p` 逐层自叶向根收集、层内自左向右
+处理：同伴本身也是已披露封印（其摘要已由证明携带）或当前节点是奇数宽度层的
+最后一个（以自身配对）时不入 `p`，否则恰好追加一次该同伴摘要；下层已证节点
+按树规则升入上层，同一摘要绝不发送两次。故 `p` 的顺序与数量完全由 `n` 与
+`i` 唯一确定。
+
+`check_smp(proof, sig, key) -> bool` 先对每个封印按 `i` 顺序调用
+`verify_delta_report_bundle_archive_seal`（归档内每个包及封印自身签名都须核验
+通过），再由各位置与封印重算叶摘要，逐层按层升序、层内左到右消费 `p` 重建
+根：同伴本身在当前层则直接取其摘要，奇数尾无同伴则复制自身配对，否则消费下
+一个 `p` 项（奇尾复制并尽 `p` 而用）；宽度按 `(width+1)//2` 上收。重建须
+恰好用尽全部 `p` 并唯一到达根后，对 `b"ds/r1"||U64(n)||root` 调用
+`verify_signature`；全部一致返回 `True`，结构合法但不匹配（封印互换或改动、
+下标改动、`p` 缺失/多余/错位、摘要或签名不符、换密钥核验等）返回 `False`。
+非 `SMP`/`AggregateSignature`/`SigningDKGResult` 入参或字段类型错误（含
+布尔下标与布尔 `n`）抛 `TypeError`；空下标、`n` 非正或超过 2^64-1、下标
+越界或非严格递增、`s` 与 `i` 数量不同、`p` 项非恰 32 字节或数量缺失/多余、
+封印或签名结构非法抛 `ValueError`。证明不含传输编码，链、封印与全部旧接口
+行为不变。
+
 
 ## 命令行演示
 
@@ -1853,6 +1905,30 @@ python3 -m thresholdsign
   非法嵌套、截断及尾随，成功须逐字节重编码等于输入；结构合法但签名错配仍
   返回对象（由 `verify_dc` 判定）。非 `bytes` 入参抛 `TypeError`，其余非法
   抛 `ValueError`；无状态
+- `SMP(i, n, s, p)` — 归档封印链的紧凑多封印包含证明，冻结、可按位置构造、
+  按值相等且不可变；字段依次为非空严格递增、不含布尔的下标元组
+  `i: tuple[int, ...]`、链项总数 `n: int`、与下标逐项对应的
+  `s: tuple[DeltaReportBundleArchiveSeal, ...]` 及每项恰 32 字节的同伴摘要
+  元组 `p: tuple[bytes, ...]`（自叶向根、层内左到右；已披露同伴与奇数尾
+  不入 `p`）；不含网络、存储或隐藏状态，构造时不校验
+- `make_smp(chain, i) -> tuple[bytes, SMP]` — 对现有
+  `DeltaReportBundleArchiveSealChain` 按非空严格递增整数元组 `i`
+  （`0 <= i_j < n < 2^64`，`n` 取链项数）构建多封印证明，`s` 按 `i` 取链
+  项；叶为 `H(b"ds/l1"||U64(j)||H(E_j))`（`E_j` 为该项既有规范封印编码），
+  节点为 `H(b"ds/n1"||left||right)`，奇数尾复制自身配对；返回根消息
+  `b"ds/r1"||U64(n)||root` 与证明，`p` 的顺序和数量仅由 `n`、`i` 唯一
+  确定。非链入参、`i` 非元组或下标非整数（含布尔）、链项字段类型错误抛
+  `TypeError`；空链、空下标、下标越界或非严格递增、`n` 达到 2^64、嵌套
+  封印结构非法抛 `ValueError`；无状态，不要求外层链签名有效
+- `check_smp(proof, signature, key) -> bool` — 先逐项调用
+  `verify_delta_report_bundle_archive_seal` 复核封印，再以 `p` 按层升序、
+  层内左到右重建根（同伴已披露则直接取其摘要，奇数尾复制自身配对，否则
+  消费下一个 `p` 项并须恰好用尽），最后对 `b"ds/r1"||U64(n)||root` 验证
+  门限 Schnorr 签名；全部一致为 `True`，结构合法但封印、同伴、根或签名
+  不匹配（含换密钥）返回 `False`。非 `SMP`/`AggregateSignature`
+  /`SigningDKGResult` 入参或字段类型错误抛 `TypeError`；空下标、`n`
+  越界、下标非法、`s` 与 `i` 数量不符、`p` 项非 32 字节或数量缺失/多余、
+  嵌套封印、签名或密钥结构非法抛 `ValueError`；无状态
 
 ### 门限 Schnorr 群参数与边界
 
