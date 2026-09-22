@@ -1073,6 +1073,57 @@ bundle.signature, key)` 的便捷委托：重建根、逐个复核披露封印�
 结构非法按 `check_smp` 的边界抛 `TypeError`/`ValueError`。束不引入任何网络、
 存储或隐藏状态。
 
+多份 `SMPBundle` 还可按原序组成一个非空、保序的归档，再由一个门限 Schnorr
+外签整体认证：
+
+```python
+from thresholdsign import (
+    SMPBundleArchive,
+    smp_bundle_archive_message,
+    verify_smp_bundle_archive,
+)
+
+# items 为非空保序的 SMPBundle 元组
+message = smp_bundle_archive_message(items, key.public_key)
+outer_signature = sign_threshold(key, message)   # 门限 quorum 两轮签署该 message
+archive = SMPBundleArchive(items, outer_signature)
+assert verify_smp_bundle_archive(archive, key)    # 逐包 verify_smp_bundle，再验外签
+```
+
+`SMPBundleArchive(items, signature)` 是冻结、可按位置构造、按值相等的数据类，
+字段依次为 `items: tuple[SMPBundle, ...]`（非空且保序）与
+`signature: AggregateSignature`，均无默认，不含网络、存储或隐藏状态，构造时
+不校验字段类型与结构。归档消息
+`smp_bundle_archive_message(items, public_key) -> bytes` 为
+
+```text
+b"ts/smpba/m1" || SHA256(C) || V(public_key)
+C = U32(n) || Σ_i ( U32(len(E_i)) || E_i )
+```
+
+其中 `n = len(items)`，`U32` 为 4 字节无符号大端，`E_i` 为第 `i` 项束的既有
+规范传输编码 `encode_smp_bundle(items[i])`，按原序排列；`V` 为 4 字节无符号
+大端长度加最短无符号大端整数（零为单字节 `00`，正值禁前导零）。消息绑定全部
+束字节的摘要与验证公钥，故增删、替换、重排任一束以及换用另一把密钥呈现，
+外层签名均失效。`items` 须为非空元组且每项都是结构合法、可被
+`encode_smp_bundle` 接受的 `SMPBundle`，`public_key` 须为非布尔非负整数。
+`items` 非元组或元素非 `SMPBundle`、`public_key` 非整数（含布尔）抛
+`TypeError`；空元组、嵌套束结构非法或 `public_key` 为负抛 `ValueError`。
+消息本身不含签名，也不引入任何网络、存储或隐藏状态。
+
+`verify_smp_bundle_archive(archive: SMPBundleArchive, key: SigningDKGResult)
+-> bool` 先查外层签名与 `key` 的结构（以及每项束的结构），因此坏束不会掩盖
+非法的外层签名或密钥；随后按归档原序对每个束调用 `verify_smp_bundle`
+（束内披露封印的既有核验与根签名都须通过），再用 `key` 的群参数对
+`smp_bundle_archive_message(archive.items, key.public_key)` 经
+`verify_signature` 验证外层签名。全部为真才返回 `True`，结构合法但任一束
+不匹配、外层签名被篡改、密封另一组束或另一把密钥均返回 `False`；增删、替换、
+重排、换钥由验证返回 `False` 而非抛错。非 `SMPBundleArchive` 入参、`items`
+非元组、元素非 `SMPBundle`、`key` 非 `SigningDKGResult` 或嵌套字段类型错误
+抛 `TypeError`；空归档、外层签名结构非法、密钥结构非法或嵌套束结构非法抛
+`ValueError`。归档不引入传输编解码，也不引入任何网络、存储或隐藏状态；
+全部旧接口行为不变。
+
 
 ## 命令行演示
 
@@ -2012,6 +2063,24 @@ python3 -m thresholdsign
   验证根签名；错配（改动封印/下标/同伴/签名或换密钥呈现）返 `False`。非
   `SMPBundle` 入参抛 `TypeError`；嵌套结构非法按 `check_smp` 边界抛
   `TypeError`/`ValueError`；无状态
+- `SMPBundleArchive(items, signature)` — 冻结数据类，字段依次为非空保序的
+  `items: tuple[SMPBundle, ...]` 与归档外签 `signature: AggregateSignature`；
+  可按位置构造、按值相等，不含网络、存储或隐藏状态，构造时不校验字段类型与
+  结构
+- `smp_bundle_archive_message(items, public_key) -> bytes` — 归档外签消息
+  `b"ts/smpba/m1"||SHA256(C)||V(public_key)`，其中
+  `C = U32(n)||Σ(U32(len(E_i))||E_i)`、`E_i = encode_smp_bundle(items[i])`
+  按原序构造，`V` 为 4 字节无符号大端长度加最短无符号大端整数（零为单字节
+  `00`，正值禁前导零）；增删、替换、重排或换钥均改变消息。`items` 非元组或
+  元素非 `SMPBundle`、`public_key` 非整数（含布尔）抛 `TypeError`；空元组、
+  嵌套束结构非法或负公钥抛 `ValueError`；无签名、无状态
+- `verify_smp_bundle_archive(archive, key) -> bool` — 先查外签与密钥结构，
+  再按原序逐包调用 `verify_smp_bundle`，最后用 `key` 的群参数经
+  `verify_signature` 验证 `smp_bundle_archive_message(archive.items,
+  key.public_key)` 上的外签；全真才为 `True`，增删、替换、重排、换钥或篡改
+  签名返 `False`。非 `SMPBundleArchive` 入参、`items` 非元组、元素非
+  `SMPBundle`、`key` 类型错误或嵌套字段类型错误抛 `TypeError`；空归档、外签
+  结构非法、密钥结构非法或嵌套束结构非法抛 `ValueError`；无状态
 
 ### 门限 Schnorr 群参数与边界
 
