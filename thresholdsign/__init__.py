@@ -82,7 +82,10 @@ for splitting a long chain into several consecutive hop segments at
 once and folding an ordered tuple of segments back into one chain, and
 the self-delimiting segment-set transport encoding
 encode_delta_chain_segments / decode_delta_chain_segments for archiving
-or transferring several consecutive segments as one ordered object.
+or transferring several consecutive segments as one ordered object, and
+the stateless whole-set verifier verify_delta_chain_segments for
+confirming every segment's signatures and every seam between neighbours
+in one call.
 """
 
 from __future__ import annotations
@@ -236,6 +239,7 @@ __all__ = [
     "verify_audit_extension_delta_checkpoint_chain",
     "encode_delta_chain_segments",
     "decode_delta_chain_segments",
+    "verify_delta_chain_segments",
 ]
 
 # Mersenne prime 2**127 - 1: large enough for integer secrets, small enough that
@@ -7870,6 +7874,79 @@ def decode_delta_chain_segments(
     if encode_delta_chain_segments(segments_tuple) != blob:
         raise ValueError("non-canonical delta chain segments encoding")
     return segments_tuple
+
+
+def verify_delta_chain_segments(
+    segments: tuple[AuditExtensionDeltaCheckpointChain, ...],
+    key: SigningDKGResult,
+) -> bool:
+    """Verify an ordered tuple of delta chain segments as one whole chain.
+
+    ``segments`` must be a non-empty tuple of
+    :class:`AuditExtensionDeltaCheckpointChain` values in chain order;
+    the tuple is checked exactly as it lies — the segments are never
+    sorted or otherwise reordered. Each segment is first checked against
+    the existing single-chain structural boundary (the same checks
+    :func:`expand_audit_extension_delta_checkpoint_chain` performs), the
+    segments are then folded left to right with
+    :func:`join_delta_chain_segments` — so every seam must satisfy that
+    splice's two link conditions: the left segment's last expanded
+    leaves must equal the old prefix of the right segment's first
+    expanded proof, and the two shared checkpoint signatures at the seam
+    must be identical by value — and the joined chain is verified with
+    :func:`verify_audit_extension_delta_checkpoint_chain` under ``key``.
+    Returns ``True`` only when every segment is structurally legal,
+    every seam links and every hop signature of the joined chain
+    verifies under ``key``; a structurally legal set presented in the
+    wrong order, with a leaf prefix gap or overlap at a seam, with a
+    mismatched shared checkpoint signature, with tampered leaf digests
+    or checkpoint signatures, or one presented under another key returns
+    ``False`` instead of raising. Because the verdict depends only on
+    the segment values, round-tripping the tuple through
+    :func:`encode_delta_chain_segments` and
+    :func:`decode_delta_chain_segments` never changes it.
+
+    A non-tuple ``segments`` argument, a
+    non-:class:`AuditExtensionDeltaCheckpointChain` element, a
+    non-:class:`SigningDKGResult` ``key`` or any wrong field or element
+    type inside a segment raises TypeError, exactly as
+    :func:`join_delta_chain_segments` and the structural checks of
+    :func:`verify_audit_extension_delta_checkpoint_chain` do. An empty
+    ``segments`` tuple or any structural error a segment or its nested
+    proofs or signatures would raise on its own — an empty addition
+    batch, a digest that is not exactly 32 bytes, a signature count
+    other than ``len(additions) + 2``, an illegal nested proof or
+    signature — raises ValueError along the existing single-chain
+    boundary; only the seam link failures of a structurally legal set
+    are reported as ``False``. The function is stateless and keeps no
+    hidden state.
+    """
+    if not isinstance(segments, tuple):
+        raise TypeError("segments must be a tuple")
+    for segment in segments:
+        if not isinstance(segment, AuditExtensionDeltaCheckpointChain):
+            raise TypeError(
+                "each segment must be an "
+                "AuditExtensionDeltaCheckpointChain instance"
+            )
+    if not isinstance(key, SigningDKGResult):
+        raise TypeError("key must be a SigningDKGResult instance")
+    if len(segments) == 0:
+        raise ValueError("segments must be a non-empty tuple")
+
+    # Structural validation of each segment up front, along the existing
+    # single-chain boundary: expansion raises TypeError/ValueError for
+    # any illegal nested proof, batch, digest or signature, so the join
+    # below can only fail on the seam link conditions of an otherwise
+    # legal set — exactly the failures that must surface as False.
+    for segment in segments:
+        expand_audit_extension_delta_checkpoint_chain(segment)
+
+    try:
+        joined = join_delta_chain_segments(segments)
+    except ValueError:
+        return False
+    return verify_audit_extension_delta_checkpoint_chain(joined, key)
 
 
 # ---------------------------------------------------------------------------
