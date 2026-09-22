@@ -571,6 +571,34 @@ assert verify_audit_extension_proof_bundle(restored, key)     # 委托 check_ext
 签名真伪：类型错误抛 `TypeError`，结构非法抛 `ValueError`，结构合法但签名与
 根不匹配由 `verify_audit_extension_proof_bundle` 返回 `False`。
 
+要把多次连续追加的一致性证明打包传输或落盘，用冻结数据类
+`AuditExtensionProofBundleChain(items)`（`items` 为非空保序的
+`AuditExtensionProofBundle` 元组，可按位置构造、按值相等）及其规范编码。除逐项
+调用 `verify_audit_extension_proof_bundle` 外，核验还要求相邻两包衔接：前项叶数
+等于后项 `proof.old_n`，且前项 `proof.leaves` 恰为后项 `proof.leaves[:old_n]`
+——每一跳的旧树正是上一跳的新树：
+
+```python
+from thresholdsign import (
+    AuditExtensionProofBundleChain,
+    encode_audit_extension_proof_bundle_chain,
+    decode_audit_extension_proof_bundle_chain,
+    verify_audit_extension_proof_bundle_chain,
+)
+
+chain = AuditExtensionProofBundleChain((bundle0, bundle1, bundle2))
+blob = encode_audit_extension_proof_bundle_chain(chain)      # b"ts/aepbc/v1"||U32(n)||Σ帧
+restored = decode_audit_extension_proof_bundle_chain(blob)  # 仅还原结构
+assert encode_audit_extension_proof_bundle_chain(restored) == blob
+assert verify_audit_extension_proof_bundle_chain(restored, key)  # 逐项验签 + 相邻衔接
+```
+
+编码依次为标签 `b"ts/aepbc/v1"`、U32 项数 `n`，再按链序写 `n` 个帧，每帧为
+U32 长度 + 现有单包规范编码 `E`。编解码只检查容器与嵌套结构，不验签、不检查
+衔接；空链、帧长或嵌套非法、计数不符、截断或尾随字节抛 `ValueError`，类型错误
+抛 `TypeError`；结构合法但签名不匹配或相邻不衔接由
+`verify_audit_extension_proof_bundle_chain` 返回 `False`。
+
 
 ## 命令行演示
 
@@ -1227,6 +1255,30 @@ python3 -m thresholdsign
   的便捷封装；两个签名皆验返回 `True`，篡改叶或 `old_n`、签名对调或错配、
   换密钥核验等返回 `False`。非 `AuditExtensionProofBundle` 入参抛 `TypeError`，
   嵌套证明、签名或密钥结构非法抛 `TypeError`/`ValueError`
+- `AuditExtensionProofBundleChain(items)` — 冻结数据类；`items` 为非空、保序的
+  `AuditExtensionProofBundle` 元组，可按位置构造、按值相等；构造时不校验，
+  结构由 `encode_audit_extension_proof_bundle_chain` 检查、衔接与真伪由
+  `verify_audit_extension_proof_bundle_chain` 核验；不含网络、存储或隐藏状态
+- `encode_audit_extension_proof_bundle_chain(chain) -> bytes` — 证明包链的规范
+  传输/持久化编码：依次直拼标签 `b"ts/aepbc/v1"`、U32 项数 `n` 与按链序的
+  `n` 个帧，每帧为 U32 长度加现有单包规范编码
+  `encode_audit_extension_proof_bundle`（非空）。仅校验容器与嵌套结构，不验签、
+  不检查衔接；输出唯一、无状态。非 `AuditExtensionProofBundleChain` 入参、
+  非元组序列或元素非 `AuditExtensionProofBundle` 抛 `TypeError`，空链、计数或
+  帧超长、嵌套结构非法抛 `ValueError`
+- `decode_audit_extension_proof_bundle_chain(blob) -> AuditExtensionProofBundleChain`
+  — `encode_audit_extension_proof_bundle_chain` 的逆操作，仅还原结构、不验签、
+  不检查相邻衔接、不留状态：拒绝非 `bytes`、坏/缺标签、空链、零或超长帧、嵌套
+  非法、计数不符、截断及尾随字节；成功后重编码必逐字节等于输入。非 `bytes`
+  入参抛 `TypeError`，其余非法情形抛 `ValueError`；结构合法但签名不匹配或
+  相邻不衔接由 `verify_audit_extension_proof_bundle_chain` 返回 `False`
+- `verify_audit_extension_proof_bundle_chain(chain, key) -> bool` — 逐项对
+  `key` 调用 `verify_audit_extension_proof_bundle`，并检查每对相邻包：前项叶数
+  等于后项 `proof.old_n` 且前项 `proof.leaves` 等于后项
+  `proof.leaves[:old_n]`；全部单包与所有衔接皆成立才返回 `True`，结构合法但
+  签名错配、篡改叶或 `old_n`、相邻缺口/重叠、换密钥核验等返回 `False`。非
+  `AuditExtensionProofBundleChain` 入参、非元组序列或元素类型错误抛
+  `TypeError`，空链或嵌套结构非法抛 `ValueError`
 
 ### 门限 Schnorr 群参数与边界
 

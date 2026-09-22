@@ -59,7 +59,11 @@ is a prefix of a new one, without seeing any message or receipt, plus their
 canonical transport encoding encode_extension / decode_extension, and the
 dual-signature consistency bundle AuditExtensionProofBundle /
 encode_audit_extension_proof_bundle / decode_audit_extension_proof_bundle /
-verify_audit_extension_proof_bundle.
+verify_audit_extension_proof_bundle, and the non-empty, order-preserving
+chain of such bundles AuditExtensionProofBundleChain /
+encode_audit_extension_proof_bundle_chain /
+decode_audit_extension_proof_bundle_chain /
+verify_audit_extension_proof_bundle_chain.
 """
 
 from __future__ import annotations
@@ -193,6 +197,10 @@ __all__ = [
     "encode_audit_extension_proof_bundle",
     "decode_audit_extension_proof_bundle",
     "verify_audit_extension_proof_bundle",
+    "AuditExtensionProofBundleChain",
+    "encode_audit_extension_proof_bundle_chain",
+    "decode_audit_extension_proof_bundle_chain",
+    "verify_audit_extension_proof_bundle_chain",
 ]
 
 # Mersenne prime 2**127 - 1: large enough for integer secrets, small enough that
@@ -6528,6 +6536,218 @@ def verify_audit_extension_proof_bundle(
     return check_extension(
         bundle.proof, bundle.old_signature, bundle.new_signature, key
     )
+
+
+# ---------------------------------------------------------------------------
+# Canonical audit-extension bundle chain transport: a self-delimiting,
+# byte-for-byte reproducible encoding of a non-empty, order-preserving
+# sequence of AuditExtensionProofBundle values, for cross-implementation
+# exchange and persistence. Adjacent bundles link when the predecessor's
+# leaf set is exactly the successor's old prefix. Decoding restores
+# structure only and neither the per-bundle signatures nor the linkage are
+# checked, so verify_audit_extension_proof_bundle_chain remains the sole
+# verifier afterwards.
+# ---------------------------------------------------------------------------
+
+AUDIT_EXTENSION_PROOF_BUNDLE_CHAIN_WIRE_TAG = b"ts/aepbc/v1"
+
+
+@dataclass(frozen=True)
+class AuditExtensionProofBundleChain:
+    """A non-empty, order-preserving chain of extension-proof bundles.
+
+    ``items`` is the non-empty tuple of
+    :class:`AuditExtensionProofBundle` values in chain order: for every
+    adjacent pair the predecessor's leaf count must equal the successor's
+    ``proof.old_n`` and the predecessor's ``proof.leaves`` must equal the
+    successor's ``proof.leaves[:old_n]`` (enforced by
+    :func:`verify_audit_extension_proof_bundle_chain`, not by
+    construction). The dataclass is frozen, positionally constructible and
+    compared by value, and carries no network, storage or hidden state.
+    Item types and the non-empty bound are not checked at construction
+    time — :func:`encode_audit_extension_proof_bundle_chain` checks the
+    structure and :func:`verify_audit_extension_proof_bundle_chain` is the
+    way to test a chain afterwards.
+    """
+
+    items: tuple[AuditExtensionProofBundle, ...]
+
+
+def _check_audit_extension_proof_bundle_chain_items(items: object) -> int:
+    """Type- and structure-check a chain's items container, without verifying.
+
+    Items must be a non-empty tuple of
+    :class:`AuditExtensionProofBundle` values; the bundles themselves are
+    neither encoded nor verified here (that is
+    :func:`verify_audit_extension_proof_bundle`'s job during verification).
+    Returns the item count.
+    """
+    if not isinstance(items, tuple):
+        raise TypeError("items must be a tuple")
+    try:
+        count = len(items)
+    except OverflowError:
+        raise ValueError("too many chain items") from None
+    if count == 0:
+        raise ValueError("items must be non-empty")
+    for item in items:
+        if not isinstance(item, AuditExtensionProofBundle):
+            raise TypeError(
+                "each chain item must be an AuditExtensionProofBundle instance"
+            )
+    return count
+
+
+def encode_audit_extension_proof_bundle_chain(
+    chain: AuditExtensionProofBundleChain,
+) -> bytes:
+    """Canonically encode a chain of consistency-proof bundles.
+
+    The encoding is, in order, the tag ``b"ts/aepbc/v1"``, the item count
+    ``n = len(chain.items)`` as a 4-byte unsigned big-endian integer, and
+    then one frame per item in chain order: each frame is the 4-byte
+    unsigned big-endian length ``len(E)`` followed by
+    ``E = encode_audit_extension_proof_bundle(item)``, the existing
+    canonical single-bundle encoding (never empty).
+
+    Only the chain container and the bundle structures are checked — the
+    prefix linkage is not verified and neither signature is checked:
+    :func:`verify_audit_extension_proof_bundle_chain` stays the way to
+    verify a chain afterwards. A non-chain argument or a non-tuple item
+    sequence raises TypeError, and a non-:class:`AuditExtensionProofBundle`
+    element raises TypeError exactly as
+    :func:`encode_audit_extension_proof_bundle` does for its proof and
+    signature fields. An empty chain, an over-long count or frame, or an
+    illegal nested bundle raises ValueError. The output for a given chain
+    is unique and the encoding carries no network, storage or hidden
+    state.
+    """
+    if not isinstance(chain, AuditExtensionProofBundleChain):
+        raise TypeError(
+            "chain must be an AuditExtensionProofBundleChain instance"
+        )
+    count = _check_audit_extension_proof_bundle_chain_items(chain.items)
+    if count > 0xFFFFFFFF:
+        raise ValueError("too many chain items")
+
+    bodies = []
+    for item in chain.items:
+        body = encode_audit_extension_proof_bundle(item)
+        if len(body) > 0xFFFFFFFF:
+            raise ValueError("audit extension proof bundle encoding too long")
+        bodies.append(body)
+
+    buffer = bytearray(AUDIT_EXTENSION_PROOF_BUNDLE_CHAIN_WIRE_TAG)
+    buffer += count.to_bytes(4, "big", signed=False)
+    for body in bodies:
+        buffer += len(body).to_bytes(4, "big", signed=False)
+        buffer += body
+    return bytes(buffer)
+
+
+def decode_audit_extension_proof_bundle_chain(
+    blob: bytes,
+) -> AuditExtensionProofBundleChain:
+    """Decode the canonical encoding produced by :func:`encode_audit_extension_proof_bundle_chain`.
+
+    Accepts only the single canonical form: the tag
+    ``b"ts/aepbc/v1"``, the 4-byte unsigned big-endian non-zero item
+    count ``n``, and then exactly ``n`` frames, each a 4-byte unsigned
+    big-endian non-zero length followed by bytes that
+    :func:`decode_audit_extension_proof_bundle` accepts. A non-bytes
+    argument raises TypeError; a wrong or missing tag, an empty chain, a
+    zero or over-long frame length, an illegal nested bundle, a count
+    mismatch, truncation, or trailing bytes raises ValueError. A
+    successfully decoded chain re-encodes to exactly the input bytes.
+
+    Decoding only restores the structure: every nested bundle goes through
+    :func:`decode_audit_extension_proof_bundle`, whose leaf digests stay
+    opaque and whose signatures are not checked, and the prefix linkage
+    between adjacent bundles is not checked either. A structurally legal
+    chain whose signatures do not match or whose bundles do not link is
+    returned normally, and
+    :func:`verify_audit_extension_proof_bundle_chain` reports it as
+    ``False``.
+    """
+    if not isinstance(blob, bytes):
+        raise TypeError("blob must be bytes")
+    if not blob.startswith(AUDIT_EXTENSION_PROOF_BUNDLE_CHAIN_WIRE_TAG):
+        raise ValueError("bad audit extension proof bundle chain tag")
+    offset = len(AUDIT_EXTENSION_PROOF_BUNDLE_CHAIN_WIRE_TAG)
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated audit extension proof bundle chain count")
+    count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    if count == 0:
+        raise ValueError("audit extension proof bundle chain must be non-empty")
+
+    items = []
+    for index in range(count):
+        body, offset = _read_audit_proof_block(
+            blob,
+            offset,
+            what=f"audit extension proof bundle chain item {index + 1}",
+        )
+        items.append(decode_audit_extension_proof_bundle(body))
+    if offset != len(blob):
+        raise ValueError(
+            "trailing bytes after audit extension proof bundle chain"
+        )
+
+    chain = AuditExtensionProofBundleChain(items=tuple(items))
+    if encode_audit_extension_proof_bundle_chain(chain) != blob:
+        raise ValueError(
+            "non-canonical audit extension proof bundle chain encoding"
+        )
+    return chain
+
+
+def verify_audit_extension_proof_bundle_chain(
+    chain: AuditExtensionProofBundleChain, key: SigningDKGResult
+) -> bool:
+    """Verify every bundle of a chain and the prefix linkage between neighbours.
+
+    Each item is verified with
+    :func:`verify_audit_extension_proof_bundle` against ``key``, and for
+    every adjacent pair the predecessor's leaf count must equal the
+    successor's ``proof.old_n`` and the predecessor's ``proof.leaves``
+    must equal the first ``old_n`` leaves of the successor's
+    ``proof.leaves`` — the old tree of each hop is exactly the new tree
+    of the previous one. Returns ``True`` only when every single bundle
+    verifies and every linkage holds; a well-formed chain with a
+    mismatched signature pair, tampered leaves, a gap or overlap between
+    neighbours, or one presented under another key returns ``False``.
+
+    A non-:class:`AuditExtensionProofBundleChain` argument raises
+    TypeError; an empty chain, a non-tuple item sequence, a
+    non-:class:`AuditExtensionProofBundle` element, or an illegal nested
+    bundle or key structure raises TypeError/ValueError, exactly as the
+    structural checks of :func:`encode_audit_extension_proof_bundle_chain`
+    and :func:`verify_audit_extension_proof_bundle` do. The function is
+    stateless.
+    """
+    if not isinstance(chain, AuditExtensionProofBundleChain):
+        raise TypeError(
+            "chain must be an AuditExtensionProofBundleChain instance"
+        )
+    _check_audit_extension_proof_bundle_chain_items(chain.items)
+
+    result = True
+    previous = None
+    for bundle in chain.items:
+        if not verify_audit_extension_proof_bundle(bundle, key):
+            result = False
+        if previous is not None:
+            previous_leaves = previous.proof.leaves
+            old_n = bundle.proof.old_n
+            if (
+                len(previous_leaves) != old_n
+                or previous_leaves != bundle.proof.leaves[:old_n]
+            ):
+                result = False
+        previous = bundle
+    return result
 
 
 # ---------------------------------------------------------------------------
