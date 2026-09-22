@@ -109,7 +109,10 @@ order-preserving chain DeltaReportBundleArchiveSealChain of such seals,
 whose outer signature binds drasc_message over the existing canonical
 seal encodings and the verifying public key, with the key-bound
 verifier verify_dc that re-checks every seal before the outer
-signature.
+signature, and the canonical chain transport encoding
+encode_delta_report_bundle_archive_seal_chain /
+decode_delta_report_bundle_archive_seal_chain for transferring or
+persisting a whole chain as one self-delimiting byte string.
 """
 
 from __future__ import annotations
@@ -287,6 +290,8 @@ __all__ = [
     "DeltaReportBundleArchiveSealChain",
     "drasc_message",
     "verify_dc",
+    "encode_delta_report_bundle_archive_seal_chain",
+    "decode_delta_report_bundle_archive_seal_chain",
 ]
 
 # Mersenne prime 2**127 - 1: large enough for integer secrets, small enough that
@@ -9208,6 +9213,7 @@ def verify_delta_report_bundle_archive_seal(
 # ---------------------------------------------------------------------------
 
 DELTA_REPORT_BUNDLE_ARCHIVE_SEAL_CHAIN_TAG = b"dc/m1"
+DELTA_REPORT_BUNDLE_ARCHIVE_SEAL_CHAIN_WIRE_TAG = b"ts/drasc/w1"
 
 
 @dataclass(frozen=True)
@@ -9367,6 +9373,175 @@ def verify_dc(
         generator=generator,
         prime=field_prime,
     )
+
+
+def encode_delta_report_bundle_archive_seal_chain(
+    chain: DeltaReportBundleArchiveSealChain,
+) -> bytes:
+    """Canonically encode a chain of sealed archives for transport or
+    persistence.
+
+    The encoding is, in order, the tag ``b"ts/drasc/w1"``, the item count
+    ``n = len(chain.items)`` as a 4-byte unsigned big-endian integer, then
+    one frame per item strictly in chain order: the 4-byte unsigned
+    big-endian length ``len(E)`` followed by
+    ``E = encode_delta_report_bundle_archive_seal(item)``, the existing
+    canonical single-seal encoding (never empty), and finally one outer
+    signature frame, exactly the signature frame an
+    :class:`AuditProofBundle` carries: ``VARINT(R)``, ``VARINT(z)``, the
+    4-byte unsigned big-endian signer count ``k`` and one ``VARINT(id)``
+    per ascending signer id. A ``VARINT`` is a 4-byte unsigned big-endian
+    body length followed by the shortest unsigned big-endian value (zero
+    is the single byte ``00``, positive values carry no leading zero);
+    ``R`` must be positive and ``z`` may be zero.
+
+    Only a structurally legal :class:`DeltaReportBundleArchiveSealChain`
+    is accepted: the items must be a non-empty tuple of seals each
+    encodable by :func:`encode_delta_report_bundle_archive_seal` and the
+    outer signature an :class:`AggregateSignature` with a positive ``R``,
+    a non-negative ``z`` and a non-empty tuple of strictly increasing
+    positive ids, exactly the structural bounds an
+    :class:`AuditProofBundle` places on its own signature. Neither the
+    outer signature nor any nested seal signature is checked and the
+    sealed archives are not verified: the output for a given chain is
+    unique and the encoding carries no network, storage or hidden state.
+    A non-chain argument, a non-tuple ``items`` field or a
+    non-:class:`DeltaReportBundleArchiveSeal` element raises TypeError;
+    an empty chain, an illegal nested seal, an illegal outer signature,
+    an over-long count or frame or an over-long signer id list raises
+    ValueError.
+    """
+    if not isinstance(chain, DeltaReportBundleArchiveSealChain):
+        raise TypeError(
+            "chain must be a DeltaReportBundleArchiveSealChain instance"
+        )
+    items = chain.items
+    if not isinstance(items, tuple):
+        raise TypeError("items must be a tuple")
+    for item in items:
+        if not isinstance(item, DeltaReportBundleArchiveSeal):
+            raise TypeError(
+                "each chain item must be a "
+                "DeltaReportBundleArchiveSeal instance"
+            )
+    count = len(items)
+    if count == 0:
+        raise ValueError("chain items must be a non-empty tuple")
+    if count > 0xFFFFFFFF:
+        raise ValueError(
+            "too many delta report bundle archive seal chain items"
+        )
+
+    # Encode every seal first — each call raises TypeError/ValueError for
+    # an illegal seal exactly as the single-seal codec does — and only
+    # then frame the results, so a single illegal item aborts the whole
+    # encoding.
+    frames = []
+    for index, item in enumerate(items):
+        encoded = encode_delta_report_bundle_archive_seal(item)
+        if len(encoded) > 0xFFFFFFFF:
+            raise ValueError(
+                f"delta report bundle archive seal chain item {index + 1} "
+                "encoding too long"
+            )
+        frames.append(encoded)
+
+    signer_count = _check_history_proof_bundle_signature(chain.signature)
+    if signer_count > 0xFFFFFFFF:
+        raise ValueError("too many signer ids")
+
+    buffer = bytearray(DELTA_REPORT_BUNDLE_ARCHIVE_SEAL_CHAIN_WIRE_TAG)
+    buffer += count.to_bytes(4, "big", signed=False)
+    for encoded in frames:
+        buffer += len(encoded).to_bytes(4, "big", signed=False)
+        buffer += encoded
+    buffer += _encode_varint(chain.signature.R)
+    buffer += _encode_varint(chain.signature.z)
+    buffer += signer_count.to_bytes(4, "big", signed=False)
+    for signer_id in chain.signature.signer_ids:
+        buffer += _encode_varint(signer_id)
+    return bytes(buffer)
+
+
+def decode_delta_report_bundle_archive_seal_chain(
+    blob: bytes,
+) -> DeltaReportBundleArchiveSealChain:
+    """Decode the canonical encoding produced by
+    :func:`encode_delta_report_bundle_archive_seal_chain`.
+
+    Accepts only the single canonical form: the tag ``b"ts/drasc/w1"``,
+    the 4-byte unsigned big-endian non-zero item count ``n``, then
+    exactly ``n`` seal frames in order — each a 4-byte unsigned
+    big-endian non-zero length followed by bytes that
+    :func:`decode_delta_report_bundle_archive_seal` accepts — and finally
+    one outer signature frame, the length-prefixed integers ``R`` and
+    ``z``, the 4-byte non-zero signer count ``k`` and exactly ``k``
+    strictly increasing positive signer ids, the exact signature frame
+    layout an :class:`AuditProofBundle` uses. A non-bytes argument raises
+    TypeError; a wrong or missing tag, an empty chain, a zero-length or
+    over-long seal frame, a count that does not match the number of
+    frames, a non-canonical nested seal, a zero ``R``, a non-canonical
+    integer (leading zero or over-long length), a zero signer count, a
+    non-positive or non-increasing signer id, truncation, or trailing
+    bytes raises ValueError. A successfully decoded chain re-encodes to
+    exactly the input bytes.
+
+    Decoding only restores the structure: every nested seal goes through
+    :func:`decode_delta_report_bundle_archive_seal` (which verifies no
+    archive and checks no signature) and the outer signature is not
+    checked. A structurally legal chain whose nested seals or outer
+    signature do not match is returned normally, and :func:`verify_dc`
+    reports it as ``False``.
+    """
+    if not isinstance(blob, bytes):
+        raise TypeError("blob must be bytes")
+    if not blob.startswith(
+        DELTA_REPORT_BUNDLE_ARCHIVE_SEAL_CHAIN_WIRE_TAG
+    ):
+        raise ValueError("bad delta report bundle archive seal chain tag")
+    offset = len(DELTA_REPORT_BUNDLE_ARCHIVE_SEAL_CHAIN_WIRE_TAG)
+
+    if offset + 4 > len(blob):
+        raise ValueError(
+            "truncated delta report bundle archive seal chain item count"
+        )
+    count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    if count == 0:
+        raise ValueError(
+            "delta report bundle archive seal chain must be non-empty"
+        )
+
+    items = []
+    for index in range(count):
+        encoded_seal, offset = _read_audit_proof_block(
+            blob,
+            offset,
+            what=(
+                "delta report bundle archive seal chain item "
+                f"{index + 1}"
+            ),
+        )
+        items.append(decode_delta_report_bundle_archive_seal(encoded_seal))
+
+    signature, offset = _read_bundle_signature_frame(
+        blob,
+        offset,
+        what="delta report bundle archive seal chain outer signature",
+    )
+    if offset != len(blob):
+        raise ValueError(
+            "trailing bytes after delta report bundle archive seal chain"
+        )
+
+    chain = DeltaReportBundleArchiveSealChain(
+        items=tuple(items), signature=signature
+    )
+    if encode_delta_report_bundle_archive_seal_chain(chain) != blob:
+        raise ValueError(
+            "non-canonical delta report bundle archive seal chain encoding"
+        )
+    return chain
 
 
 # ---------------------------------------------------------------------------
