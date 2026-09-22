@@ -694,6 +694,39 @@ assert verify_audit_extension_delta_checkpoint_chain(restored, key)  # 先展开
 展开为普通检查点链，再复用 `verify_audit_extension_checkpoint_chain`，全真
 才返回 `True`，无状态、不引入网络或存储状态。
 
+增量链还支持分段传输与归档重组，两个入口都返回
+`AuditExtensionDeltaCheckpointChain`，同样不验签、不存状态，旧接口不变：
+
+```python
+from thresholdsign import (
+    concatenate_audit_extension_delta_checkpoint_chains,
+    slice_audit_extension_delta_checkpoint_chain,
+)
+
+segment = slice_audit_extension_delta_checkpoint_chain(delta, start, stop)  # 非空半开证明区间
+left = slice_audit_extension_delta_checkpoint_chain(delta, 0, boundary)
+right = slice_audit_extension_delta_checkpoint_chain(delta, boundary, hop_count)
+restored = concatenate_audit_extension_delta_checkpoint_chains(left, right)  # 相邻链拼接
+assert expand_audit_extension_delta_checkpoint_chain(restored) == (
+    expand_audit_extension_delta_checkpoint_chain(delta))  # 截后拼回即原链
+```
+
+`slice_audit_extension_delta_checkpoint_chain(chain, start, stop)` 先按
+`expand_audit_extension_delta_checkpoint_chain` 展开普通检查点链，按展开后的
+证明跳号取非空半开区间 `proofs[start:stop]` 与夹住该区间的
+`signatures[start:stop + 1]`（区间内每跳仍完整携带自己的叶序列，分段可独立
+存在），再经 `compact_audit_extension_delta_checkpoint_chain` 压回增量链；
+单跳段、首段、尾段展开后都与普通链对应区间逐值相等。
+`concatenate_audit_extension_delta_checkpoint_chains(left, right)` 先分别展开
+两条链，要求左链末证明的 `leaves` 等于右链首证明中长度为
+`right.first.old_n` 的叶前缀（叶数随之相等），且左链末签名（左末跳的新根
+签名）与右链首签名（右首跳的旧根签名）按值相等；证明按左后右顺序拼接，
+共享检查点签名只保留一份，再压回增量链。结果必须等于两侧展开链的顺序连接，
+且其规范编码可逐字节往返，否则拒绝。两入口对链或字段类型错、`start`/`stop`
+非整数（含布尔值）抛 `TypeError`；空区间（`start >= stop`）、区间越界或为负、
+链结构错误（空批、摘要宽度错、签名数错、嵌套非法）、叶前缀不一致（缺口、
+重叠或共享叶不同）或共享签名不一致抛 `ValueError`，绝不以 `False` 代替异常。
+
 
 ## 命令行演示
 
@@ -1443,6 +1476,19 @@ python3 -m thresholdsign
   签名错配、叶/摘要被篡改、相邻缺口/重叠或换密钥核验返回 `False`。结构错误
   （非本类入参、字段类型错误、空批、摘要非 32 字节、签名数不符、嵌套非法）
   照样抛 `TypeError`/`ValueError`；无状态
+- `slice_audit_extension_delta_checkpoint_chain(chain, start, stop) -> AuditExtensionDeltaCheckpointChain`
+  — 先展开为普通检查点链，按证明跳号取非空半开区间
+  `proofs[start:stop]` 与 `signatures[start:stop+1]`（每跳叶序列完整、分段可
+  独立），再压回增量链；单跳、首段、尾段均与普通链对应区间逐值相等。不验签、
+  无状态。非本类入参、字段类型错或 `start`/`stop` 非整数（含布尔）抛
+  `TypeError`；空区间（`start >= stop`）、负界或越界、链结构非法抛 `ValueError`
+- `concatenate_audit_extension_delta_checkpoint_chains(left, right) -> AuditExtensionDeltaCheckpointChain`
+  — 分别展开两链，要求左链末证明 `leaves` 等于右链首证明长度为
+  `right.first.old_n` 的叶前缀，且左末签名与右首签名按值相等；证明左后右拼接、
+  共享检查点签名仅保留一份，再压回增量链。结果须等于两侧展开链顺序连接且规范
+  编码逐字节往返，否则抛 `ValueError` 拒绝。不验签、无状态；非本类入参或字段
+  类型错抛 `TypeError`，叶前缀不一致（缺口/重叠/共享叶不同）或共享签名不一致
+  抛 `ValueError`
 
 ### 门限 Schnorr 群参数与边界
 
