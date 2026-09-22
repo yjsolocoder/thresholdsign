@@ -99,7 +99,14 @@ key-bound verifier verify_delta_report_bundle, and the non-empty
 order-preserving archive DeltaReportBundleArchive of whole bundles,
 with its transport encoding
 encode_delta_report_bundle_archive / decode_delta_report_bundle_archive
-and key-bound verifier verify_delta_report_bundle_archive.
+and key-bound verifier verify_delta_report_bundle_archive, and the
+whole-archive seal DeltaReportBundleArchiveSeal that authenticates an
+archive with one threshold Schnorr signature on the digest of its exact
+canonical encoding, with its signed-message builder
+archive_seal_message, transport encoding
+encode_delta_report_bundle_archive_seal /
+decode_delta_report_bundle_archive_seal and key-bound verifier
+verify_delta_report_bundle_archive_seal.
 """
 
 from __future__ import annotations
@@ -269,6 +276,11 @@ __all__ = [
     "encode_delta_report_bundle_archive",
     "decode_delta_report_bundle_archive",
     "verify_delta_report_bundle_archive",
+    "DeltaReportBundleArchiveSeal",
+    "archive_seal_message",
+    "encode_delta_report_bundle_archive_seal",
+    "decode_delta_report_bundle_archive_seal",
+    "verify_delta_report_bundle_archive_seal",
 ]
 
 # Mersenne prime 2**127 - 1: large enough for integer secrets, small enough that
@@ -8904,6 +8916,270 @@ def verify_delta_report_bundle_archive(
     encode_delta_report_bundle_archive(archive)
     return all(
         verify_delta_report_bundle(item, key) for item in items
+    )
+
+
+# ---------------------------------------------------------------------------
+# Whole-archive seals: one threshold Schnorr signature authenticating an
+# entire DeltaReportBundleArchive. The signed message commits to the
+# verifying public key and to the SHA256 digest of the exact canonical
+# archive encoding, so adding, deleting, reordering or substituting an
+# item — or presenting the seal under another key — all invalidate the
+# signature. The seal is a plain value with no network, storage or hidden
+# state; archive_seal_message builds the signed message,
+# encode_delta_report_bundle_archive_seal / ..._decode move it over the
+# wire, and verify_..._seal first verifies the archive itself and then
+# the signature.
+# ---------------------------------------------------------------------------
+
+ARCHIVE_SEAL_TAG = b"ts/dra/v1"
+ARCHIVE_SEAL_WIRE_TAG = b"ts/dra/w1"
+
+
+@dataclass(frozen=True)
+class DeltaReportBundleArchiveSeal:
+    """A whole delta report bundle archive sealed by one threshold signature.
+
+    ``archive`` is the sealed :class:`DeltaReportBundleArchive`;
+    ``signature`` is the threshold Schnorr :class:`AggregateSignature`
+    on :func:`archive_seal_message` of the archive and the verifying
+    public key. The dataclass is frozen, positionally constructible and
+    compared by value; it carries no network, storage or hidden state.
+    Neither field is checked at construction time —
+    :func:`verify_delta_report_bundle_archive_seal` is the way to test a
+    seal afterwards.
+    """
+
+    archive: DeltaReportBundleArchive
+    signature: AggregateSignature
+
+
+def archive_seal_message(
+    archive: DeltaReportBundleArchive, public_key: int
+) -> bytes:
+    """Encode the canonical message the threshold key signs to seal an archive.
+
+    Writing ``E`` for :func:`encode_delta_report_bundle_archive` output
+    of ``archive``, the message is, in order, the tag
+    ``b"ts/dra/v1"``, the 32-byte ``SHA256`` digest of ``E``, and
+    ``VARINT(public_key)`` — the same 4-byte unsigned big-endian length
+    followed by the shortest unsigned big-endian value used throughout
+    the canonical transport encodings (zero is the single byte ``00``,
+    positive values carry no leading zero). It carries no signature and
+    keeps no state.
+
+    ``archive`` must be a structurally legal
+    :class:`DeltaReportBundleArchive` exactly as
+    :func:`encode_delta_report_bundle_archive` requires and
+    ``public_key`` a non-boolean non-negative integer. Wrong field types
+    raise TypeError; an illegal archive, a negative or boolean public
+    key, or an over-long key encoding raises ValueError.
+    """
+    if not isinstance(archive, DeltaReportBundleArchive):
+        raise TypeError(
+            "archive must be a DeltaReportBundleArchive instance"
+        )
+    if not isinstance(public_key, int) or isinstance(public_key, bool):
+        raise TypeError("public_key must be an integer")
+    # Raises TypeError/ValueError for an illegal archive, exactly like
+    # the encoder itself.
+    encoded_archive = encode_delta_report_bundle_archive(archive)
+    encoded_key = _encode_varint(public_key)
+    return (
+        ARCHIVE_SEAL_TAG
+        + hashlib.sha256(encoded_archive).digest()
+        + encoded_key
+    )
+
+
+def encode_delta_report_bundle_archive_seal(
+    seal: DeltaReportBundleArchiveSeal,
+) -> bytes:
+    """Canonically encode an archive seal for transport or persistence.
+
+    The encoding is, in order, the tag ``b"ts/dra/w1"``, the 4-byte
+    unsigned big-endian length ``len(E)`` followed by the raw archive
+    encoding ``E = encode_delta_report_bundle_archive(seal.archive)``,
+    and then the signature frame exactly as used by the
+    :class:`AuditProofBundle` encodings: ``VARINT(R)``, ``VARINT(z)``,
+    the 4-byte unsigned big-endian signer count ``k``, and one
+    ``VARINT(id)`` per ascending signer id. A ``VARINT`` is a 4-byte
+    unsigned big-endian body length followed by the shortest unsigned
+    big-endian value (zero is the single byte ``00``, positive values
+    carry no leading zero); ``R`` must be positive and ``z`` may be
+    zero.
+
+    Only a structurally legal :class:`DeltaReportBundleArchiveSeal` is
+    accepted: the archive must be encodable by
+    :func:`encode_delta_report_bundle_archive` (a non-empty tuple of
+    legal :class:`DeltaReportBundle` values) and the signature an
+    :class:`AggregateSignature` with a positive ``R``, a non-negative
+    ``z`` and a non-empty tuple of strictly increasing positive ids.
+    The archive's bundles are not verified and the signature is not
+    checked against the archive: the output for a given seal is unique
+    and the encoding carries no network, storage or hidden state. Wrong
+    field types raise TypeError; an illegal archive or signature
+    structure or an over-long frame raises ValueError.
+    """
+    if not isinstance(seal, DeltaReportBundleArchiveSeal):
+        raise TypeError(
+            "seal must be a DeltaReportBundleArchiveSeal instance"
+        )
+    if not isinstance(seal.archive, DeltaReportBundleArchive):
+        raise TypeError(
+            "seal.archive must be a DeltaReportBundleArchive instance"
+        )
+    encoded_archive = encode_delta_report_bundle_archive(seal.archive)
+    signer_count = _check_history_proof_bundle_signature(
+        seal.signature, field="seal.signature"
+    )
+    if len(encoded_archive) > 0xFFFFFFFF:
+        raise ValueError("delta report bundle archive encoding too long")
+    if signer_count > 0xFFFFFFFF:
+        raise ValueError("too many signer ids")
+
+    buffer = bytearray(ARCHIVE_SEAL_WIRE_TAG)
+    buffer += len(encoded_archive).to_bytes(4, "big", signed=False)
+    buffer += encoded_archive
+    buffer += _encode_varint(seal.signature.R)
+    buffer += _encode_varint(seal.signature.z)
+    buffer += signer_count.to_bytes(4, "big", signed=False)
+    for signer_id in seal.signature.signer_ids:
+        buffer += _encode_varint(signer_id)
+    return bytes(buffer)
+
+
+def decode_delta_report_bundle_archive_seal(
+    blob: bytes,
+) -> DeltaReportBundleArchiveSeal:
+    """Decode the canonical encoding produced by
+    :func:`encode_delta_report_bundle_archive_seal`.
+
+    Accepts only the single canonical form: the tag ``b"ts/dra/w1"``,
+    a 4-byte non-zero archive length followed by bytes that
+    :func:`decode_delta_report_bundle_archive` accepts, the
+    length-prefixed integers ``R`` and ``z``, the 4-byte non-zero
+    signer count ``k`` and then exactly ``k`` strictly increasing
+    positive signer ids. A non-bytes argument raises TypeError; a wrong
+    or missing tag, a zero or over-long archive length, a
+    non-canonical nested archive, a zero ``R``, a negative value, a
+    zero or mismatched signer count, a non-canonical integer (leading
+    zero or over-long length), truncation, or trailing bytes raises
+    ValueError. A successfully decoded seal re-encodes to exactly the
+    input bytes.
+
+    Decoding only restores the structure and performs a canonical
+    round trip: the nested archive is decoded with
+    :func:`decode_delta_report_bundle_archive` (which verifies no
+    bundle or signature) and the seal signature is not checked. Adding,
+    deleting, reordering or substituting an archive item changes the
+    archive frame bytes, so such a blob restores a different seal and
+    never matches the original; a structurally legal seal whose archive
+    does not verify or whose signature does not seal it is returned
+    normally, and :func:`verify_delta_report_bundle_archive_seal`
+    reports it as ``False``.
+    """
+    if not isinstance(blob, bytes):
+        raise TypeError("blob must be bytes")
+    if not blob.startswith(ARCHIVE_SEAL_WIRE_TAG):
+        raise ValueError("bad delta report bundle archive seal tag")
+    offset = len(ARCHIVE_SEAL_WIRE_TAG)
+
+    encoded_archive, offset = _read_audit_proof_block(
+        blob, offset, what="sealed delta report bundle archive"
+    )
+    archive = decode_delta_report_bundle_archive(encoded_archive)
+
+    R, offset = _read_varint(
+        blob, offset, what="archive seal signature R"
+    )
+    z, offset = _read_varint(
+        blob, offset, what="archive seal signature z"
+    )
+    if R == 0:
+        raise ValueError("archive seal signature R must be positive")
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated archive seal signer count")
+    signer_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    if signer_count == 0:
+        raise ValueError("archive seal must name at least one signer")
+
+    signer_ids = []
+    for _ in range(signer_count):
+        signer_id, offset = _read_varint(
+            blob, offset, what="archive seal signer id"
+        )
+        if signer_id == 0:
+            raise ValueError("archive seal signer ids must be positive")
+        if signer_ids and signer_id <= signer_ids[-1]:
+            raise ValueError(
+                "archive seal signer ids must be strictly "
+                "increasing and unique"
+            )
+        signer_ids.append(signer_id)
+    if offset != len(blob):
+        raise ValueError("trailing bytes after delta report bundle archive seal")
+
+    seal = DeltaReportBundleArchiveSeal(
+        archive=archive,
+        signature=AggregateSignature(
+            R=R, z=z, signer_ids=tuple(signer_ids)
+        ),
+    )
+    if encode_delta_report_bundle_archive_seal(seal) != blob:
+        raise ValueError(
+            "non-canonical delta report bundle archive seal encoding"
+        )
+    return seal
+
+
+def verify_delta_report_bundle_archive_seal(
+    seal: DeltaReportBundleArchiveSeal, key: SigningDKGResult
+) -> bool:
+    """Verify an archive seal against its archive and the threshold key.
+
+    ``seal`` must be a structurally legal
+    :class:`DeltaReportBundleArchiveSeal` — its archive encodable by
+    :func:`encode_delta_report_bundle_archive` and its signature an
+    :class:`AggregateSignature` with a positive ``R``, a non-negative
+    ``z`` and a non-empty tuple of strictly increasing positive signer
+    ids — and ``key`` a legal :class:`SigningDKGResult`. Wrong field
+    types raise TypeError; an illegal archive, signature or key
+    structure raises ValueError.
+
+    Every bundle of the sealed archive is first checked through
+    :func:`verify_delta_report_bundle_archive` against ``key``; the
+    canonical :func:`archive_seal_message` of the archive and
+    ``key.public_key`` is then checked as the signature's threshold
+    Schnorr message via :func:`verify_signature` with the key's group
+    parameters. Returns ``True`` only when both checks pass; a
+    well-formed seal whose archive contains a bundle that does not
+    verify, whose archive had an item added, deleted, reordered or
+    substituted after signing, whose signature was tampered with, or
+    which seals another archive or key returns ``False``. The function
+    is stateless.
+    """
+    if not isinstance(seal, DeltaReportBundleArchiveSeal):
+        raise TypeError(
+            "seal must be a DeltaReportBundleArchiveSeal instance"
+        )
+    _result, public_key, field_prime, group_prime, generator = _check_signing_setup(key)
+    _check_signing_dkg_structure(key)
+    # Structural validation of the nested archive (TypeError/ValueError
+    # on a non-archive, non-tuple, wrong element type or empty tuple)
+    # precedes any cryptographic verdict.
+    if not verify_delta_report_bundle_archive(seal.archive, key):
+        return False
+    message = archive_seal_message(seal.archive, public_key)
+    return verify_signature(
+        message,
+        seal.signature,
+        public_key,
+        group_prime=group_prime,
+        generator=generator,
+        prime=field_prime,
     )
 
 
