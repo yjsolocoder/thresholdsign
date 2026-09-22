@@ -117,7 +117,10 @@ compact multi-seal inclusion proofs SMP / make_smp / check_smp that
 locate several archive seals at once in such a chain with one root
 signature over a SHA256 Merkle tree of the existing canonical seal
 encodings, carrying only the companion digests not themselves
-disclosed (and never an odd-tail self-pair).
+disclosed (and never an odd-tail self-pair), and the canonical SMP
+bundle transport SMPBundle / encode_smp_bundle / decode_smp_bundle /
+verify_smp_bundle that carries an SMP together with its root signature
+as one self-delimiting byte string.
 """
 
 from __future__ import annotations
@@ -300,6 +303,10 @@ __all__ = [
     "SMP",
     "make_smp",
     "check_smp",
+    "SMPBundle",
+    "encode_smp_bundle",
+    "decode_smp_bundle",
+    "verify_smp_bundle",
 ]
 
 # Mersenne prime 2**127 - 1: large enough for integer secrets, small enough that
@@ -9961,6 +9968,278 @@ def check_smp(
         generator=generator,
         prime=field_prime,
     )
+
+
+# ---------------------------------------------------------------------------
+# Canonical SMP bundle transport: a self-delimiting, byte-for-byte
+# reproducible encoding of an SMP together with the AggregateSignature on its
+# b"ds/r1" || U64(n) || root statement, for cross-implementation exchange and
+# persistence. Decoding restores structure only — the nested seals go through
+# decode_delta_report_bundle_archive_seal, nothing is verified and no state is
+# kept, so verify_smp_bundle remains the sole verifier afterwards.
+# ---------------------------------------------------------------------------
+
+SMP_BUNDLE_WIRE_TAG = b"ts/smpb/v1"
+
+
+@dataclass(frozen=True)
+class SMPBundle:
+    """A compact multi-seal inclusion proof together with its root signature.
+
+    The fields, in order, are ``proof`` (an :class:`SMP`) and
+    ``signature`` (the :class:`AggregateSignature` on the proof's
+    ``b"ds/r1" || U64(n) || root`` statement). The dataclass is frozen,
+    positionally constructible and compared by value, and carries no
+    network, storage or hidden state. Field types and bounds are not
+    checked at construction time — :func:`encode_smp_bundle` checks the
+    structure and :func:`verify_smp_bundle` is the way to test a bundle
+    afterwards.
+    """
+
+    proof: SMP
+    signature: AggregateSignature
+
+
+def encode_smp_bundle(bundle: SMPBundle) -> bytes:
+    """Canonically encode an SMP bundle for transport or persistence.
+
+    The encoding is, in order, the tag ``b"ts/smpb/v1"``, ``VARINT(n)``,
+    the 4-byte unsigned big-endian index count ``k`` and one
+    ``VARINT(index)`` per strictly increasing disclosed position, the
+    4-byte unsigned big-endian seal count (which must equal ``k``) and
+    one frame per disclosed seal — a 4-byte unsigned big-endian length
+    followed by the existing canonical encoding
+    ``E = encode_delta_report_bundle_archive_seal(seal)`` — then the
+    4-byte unsigned big-endian companion count and the raw 32-byte
+    companion digests in the proof's leaf-to-root, left-to-right order,
+    and finally the same signature frame an :class:`AuditProofBundle`
+    carries: ``VARINT(R)``, ``VARINT(z)``, the 4-byte unsigned
+    big-endian signer count and one ``VARINT(id)`` per ascending signer
+    id. A ``VARINT`` is a 4-byte unsigned big-endian body length followed
+    by the shortest unsigned big-endian value (zero is the single byte
+    ``00``, positive values carry no leading zero); ``R`` must be
+    positive and ``z`` may be zero.
+
+    Only a structurally legal :class:`SMPBundle` is accepted — a
+    non-bundle or non-:class:`SMP` proof argument, or wrong
+    proof/signature field types, raise TypeError and illegal proof or
+    signature structure (the exact bounds of :func:`check_smp`:
+    ``0 < n < 2**64``, a non-empty strictly increasing index tuple in
+    ``0 <= i < n`` with one structurally legal seal each, exactly the
+    number of 32-byte companions ``n`` and the indices determine, a
+    non-positive ``R``, a negative ``z``, an empty or
+    non-strictly-increasing signer id tuple) or an over-long frame
+    raises ValueError — but the seals are not verified and the signature
+    is not checked against the root: :func:`verify_smp_bundle` stays the
+    way to verify a bundle afterwards. The output for a given bundle is
+    unique and the encoding carries no network, storage or hidden state.
+    """
+    if not isinstance(bundle, SMPBundle):
+        raise TypeError("bundle must be an SMPBundle instance")
+    if not isinstance(bundle.proof, SMP):
+        raise TypeError("bundle.proof must be an SMP instance")
+    indices, count, seals, siblings = _validate_smp_structure(bundle.proof)
+    signer_count = _check_history_proof_bundle_signature(bundle.signature)
+    if len(indices) > 0xFFFFFFFF:
+        raise ValueError("too many disclosed indices")
+    if len(siblings) > 0xFFFFFFFF:
+        raise ValueError("too many companion digests")
+    encoded_seals = []
+    for seal in seals:
+        encoded_seal = encode_delta_report_bundle_archive_seal(seal)
+        if len(encoded_seal) > 0xFFFFFFFF:
+            raise ValueError("seal encoding too long")
+        encoded_seals.append(encoded_seal)
+    if signer_count > 0xFFFFFFFF:
+        raise ValueError("too many signer ids")
+
+    buffer = bytearray(SMP_BUNDLE_WIRE_TAG)
+    buffer += _encode_varint(count)
+    buffer += len(indices).to_bytes(4, "big", signed=False)
+    for index in indices:
+        buffer += _encode_varint(index)
+    buffer += len(encoded_seals).to_bytes(4, "big", signed=False)
+    for encoded_seal in encoded_seals:
+        buffer += len(encoded_seal).to_bytes(4, "big", signed=False)
+        buffer += encoded_seal
+    buffer += len(siblings).to_bytes(4, "big", signed=False)
+    for sibling in siblings:
+        buffer += sibling
+    buffer += _encode_varint(bundle.signature.R)
+    buffer += _encode_varint(bundle.signature.z)
+    buffer += signer_count.to_bytes(4, "big", signed=False)
+    for signer_id in bundle.signature.signer_ids:
+        buffer += _encode_varint(signer_id)
+    return bytes(buffer)
+
+
+def decode_smp_bundle(blob: bytes) -> SMPBundle:
+    """Decode the canonical encoding produced by :func:`encode_smp_bundle`.
+
+    Accepts only the single canonical form: the tag
+    ``b"ts/smpb/v1"``, the length-prefixed integer ``n`` with
+    ``0 < n < 2**64``, the 4-byte non-zero index count ``k`` followed by
+    ``k`` strictly increasing canonical ``VARINT`` indices in
+    ``0 <= i < n``, the 4-byte seal count (which must equal ``k``)
+    followed by that many frames — a 4-byte non-zero length followed by
+    bytes that :func:`decode_delta_report_bundle_archive_seal` accepts —
+    the 4-byte companion count followed by exactly that many raw
+    32-byte digests, where the count must be the unique one derived from
+    ``n`` and the indices, and finally the signature frame an
+    :class:`AuditProofBundle` uses: the length-prefixed integers ``R``
+    and ``z`` with ``R`` positive, the 4-byte non-zero signer count and
+    then exactly that many strictly increasing positive signer ids. A
+    non-bytes argument raises TypeError; a wrong or missing tag, a zero
+    or out-of-range ``n``, a zero index count, an out-of-range,
+    duplicate or non-increasing index, a seal count that does not equal
+    the index count, a zero or over-long seal frame length, a
+    non-canonical nested seal, a missing or extra companion relative to
+    what ``n`` and the indices require, a companion that is not exactly
+    32 bytes, a zero ``R``, a non-canonical integer (leading zero or
+    over-long length), a zero signer count, a non-positive or
+    non-increasing signer id, truncation, or trailing bytes raises
+    ValueError. A successfully decoded bundle re-encodes to exactly the
+    input bytes.
+
+    Decoding only restores the structure: every nested seal is decoded
+    with :func:`decode_delta_report_bundle_archive_seal` (which verifies
+    no bundle and checks no signature) and the root signature is not
+    checked. A structurally legal bundle whose seals do not verify or
+    whose signature does not sign the root is returned normally, and
+    :func:`verify_smp_bundle` reports it as ``False``.
+    """
+    if not isinstance(blob, bytes):
+        raise TypeError("blob must be bytes")
+    if not blob.startswith(SMP_BUNDLE_WIRE_TAG):
+        raise ValueError("bad SMP bundle tag")
+    offset = len(SMP_BUNDLE_WIRE_TAG)
+
+    count, offset = _read_varint(blob, offset, what="SMP bundle n")
+    if count <= 0:
+        raise ValueError("SMP bundle n must be positive")
+    if count > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("SMP bundle n too large")
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated SMP bundle index count")
+    index_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    if index_count == 0:
+        raise ValueError("SMP bundle indices must be non-empty")
+    indices = []
+    for _ in range(index_count):
+        index, offset = _read_varint(
+            blob, offset, what="SMP bundle index"
+        )
+        if indices and index <= indices[-1]:
+            raise ValueError(
+                "SMP bundle indices must be strictly increasing and unique"
+            )
+        if index < 0 or index >= count:
+            raise ValueError("SMP bundle index out of range")
+        indices.append(index)
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated SMP bundle seal count")
+    seal_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    if seal_count != index_count:
+        raise ValueError(
+            "SMP bundle seal count must match the index count"
+        )
+    seals = []
+    for _ in range(seal_count):
+        encoded_seal, offset = _read_audit_proof_block(
+            blob, offset, what="SMP bundle seal"
+        )
+        seals.append(decode_delta_report_bundle_archive_seal(encoded_seal))
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated SMP bundle companion count")
+    companion_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    required_companions = _required_smp_siblings(count, tuple(indices))
+    if companion_count != required_companions:
+        raise ValueError(
+            "SMP bundle companion count is not the one determined by n and i"
+        )
+    companions = []
+    for _ in range(companion_count):
+        if offset + SMP_DIGEST_SIZE > len(blob):
+            raise ValueError("truncated SMP bundle companion")
+        companions.append(
+            bytes(blob[offset:offset + SMP_DIGEST_SIZE])
+        )
+        offset += SMP_DIGEST_SIZE
+
+    R, offset = _read_varint(
+        blob, offset, what="SMP bundle signature R"
+    )
+    z, offset = _read_varint(
+        blob, offset, what="SMP bundle signature z"
+    )
+    if R == 0:
+        raise ValueError("SMP bundle signature R must be positive")
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated SMP bundle signer count")
+    signer_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    if signer_count == 0:
+        raise ValueError("SMP bundle must name at least one signer")
+
+    signer_ids = []
+    for _ in range(signer_count):
+        signer_id, offset = _read_varint(
+            blob,
+            offset,
+            what="SMP bundle signer id",
+        )
+        if signer_id == 0:
+            raise ValueError("SMP bundle signer ids must be positive")
+        if signer_ids and signer_id <= signer_ids[-1]:
+            raise ValueError(
+                "SMP bundle signer ids must be strictly increasing and unique"
+            )
+        signer_ids.append(signer_id)
+    if offset != len(blob):
+        raise ValueError("trailing bytes after SMP bundle")
+
+    bundle = SMPBundle(
+        proof=SMP(
+            i=tuple(indices),
+            n=count,
+            s=tuple(seals),
+            p=tuple(companions),
+        ),
+        signature=AggregateSignature(
+            R=R, z=z, signer_ids=tuple(signer_ids)
+        ),
+    )
+    if encode_smp_bundle(bundle) != blob:
+        raise ValueError("non-canonical SMP bundle encoding")
+    return bundle
+
+
+def verify_smp_bundle(bundle: SMPBundle, key: SigningDKGResult) -> bool:
+    """Verify a bundle exactly as :func:`check_smp` would.
+
+    This is a convenience wrapper over
+    ``check_smp(bundle.proof, bundle.signature, key)``: the Merkle root
+    is rebuilt from the proof while every disclosed seal is re-checked
+    with :func:`verify_delta_report_bundle_archive_seal`, and the
+    signature is verified on ``b"ds/r1" || U64(n) || root``. Returns
+    ``True`` only when all of them hold; a well-formed bundle with
+    tampered seals, indices, companions or signature, or one presented
+    under another key, returns ``False``.
+
+    A non-:class:`SMPBundle` argument raises TypeError; illegal nested
+    proof, signature or key structure raises TypeError/ValueError,
+    exactly as :func:`check_smp` does.
+    """
+    if not isinstance(bundle, SMPBundle):
+        raise TypeError("bundle must be an SMPBundle instance")
+    return check_smp(bundle.proof, bundle.signature, key)
 
 
 # ---------------------------------------------------------------------------
