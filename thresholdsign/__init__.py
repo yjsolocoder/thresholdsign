@@ -76,7 +76,10 @@ decode_audit_extension_delta_checkpoint_chain /
 verify_audit_extension_delta_checkpoint_chain, plus half-open interval
 slicing slice_audit_extension_delta_checkpoint_chain and adjacent-chain
 splicing concatenate_audit_extension_delta_checkpoint_chains for
-segmented transport and archive reassembly.
+segmented transport and archive reassembly, and the multi-cut batch
+form of the same pair partition_delta_chain / join_delta_chain_segments
+for splitting a long chain into several consecutive hop segments at
+once and folding an ordered tuple of segments back into one chain.
 """
 
 from __future__ import annotations
@@ -223,6 +226,8 @@ __all__ = [
     "compact_audit_extension_delta_checkpoint_chain",
     "slice_audit_extension_delta_checkpoint_chain",
     "concatenate_audit_extension_delta_checkpoint_chains",
+    "partition_delta_chain",
+    "join_delta_chain_segments",
     "encode_audit_extension_delta_checkpoint_chain",
     "decode_audit_extension_delta_checkpoint_chain",
     "verify_audit_extension_delta_checkpoint_chain",
@@ -7376,6 +7381,121 @@ def concatenate_audit_extension_delta_checkpoint_chains(
     if decode_audit_extension_delta_checkpoint_chain(encoded) != result:
         raise ValueError("concatenated chain does not encode byte for byte")
     return result
+
+
+def partition_delta_chain(
+    chain: AuditExtensionDeltaCheckpointChain,
+    cuts: tuple[int, ...],
+) -> tuple[AuditExtensionDeltaCheckpointChain, ...]:
+    """Split a delta checkpoint chain into consecutive hop segments.
+
+    ``cuts`` is a tuple of boundary indices into the expanded chain's
+    ``proofs`` sequence: cut ``c`` ends one segment just before expanded
+    proof ``c`` and starts the next segment at it, exactly as repeated
+    :func:`slice_audit_extension_delta_checkpoint_chain` calls over the
+    intervals ``[0, cuts[0])``, ``[cuts[0], cuts[1])``, ...,
+    ``[cuts[-1], len(proofs))`` would. The cuts must be strictly
+    increasing (hence unique) and each must lie in
+    ``1..len(proofs) - 1``, so every segment is non-empty; an empty
+    ``cuts`` tuple returns the whole chain as the single segment. The
+    segments are returned in chain order as a tuple of
+    :class:`AuditExtensionDeltaCheckpointChain` values, each the delta
+    form of its expanded interval. No signature is verified here and no
+    state is kept — verification stays with
+    :func:`verify_audit_extension_delta_checkpoint_chain` on each
+    segment, and :func:`join_delta_chain_segments` folds the segments
+    back into the original chain.
+
+    A non-:class:`AuditExtensionDeltaCheckpointChain` chain argument or
+    any wrong field or element type raises TypeError, exactly as
+    :func:`expand_audit_extension_delta_checkpoint_chain` does; a
+    non-tuple ``cuts`` or a non-integer cut — booleans included — also
+    raises TypeError. A repeated, non-increasing or out-of-range cut
+    raises ValueError, as does any structural error the expanded chain
+    or its nested proofs or signatures would raise on their own.
+    """
+    expanded = expand_audit_extension_delta_checkpoint_chain(chain)
+    if not isinstance(cuts, tuple):
+        raise TypeError("cuts must be a tuple")
+    proof_count = len(expanded.proofs)
+    previous = 0
+    for cut in cuts:
+        _check_segment_bound(cut, "each cut")
+        if cut < 1 or cut > proof_count - 1:
+            raise ValueError(
+                "each cut must lie in 1..len(proofs) - 1"
+            )
+        if cut <= previous:
+            raise ValueError("cuts must be strictly increasing and unique")
+        previous = cut
+
+    bounds = (0,) + cuts + (proof_count,)
+    segments = []
+    for index in range(len(bounds) - 1):
+        start = bounds[index]
+        stop = bounds[index + 1]
+        if start >= stop:
+            raise ValueError("partition segments must be non-empty")
+        segment = AuditExtensionCheckpointChain(
+            proofs=expanded.proofs[start:stop],
+            signatures=expanded.signatures[start:stop + 1],
+        )
+        segments.append(
+            compact_audit_extension_delta_checkpoint_chain(segment)
+        )
+    return tuple(segments)
+
+
+def join_delta_chain_segments(
+    segments: tuple[AuditExtensionDeltaCheckpointChain, ...],
+) -> AuditExtensionDeltaCheckpointChain:
+    """Fold an ordered tuple of delta chain segments into one chain.
+
+    ``segments`` must be a non-empty tuple of
+    :class:`AuditExtensionDeltaCheckpointChain` values in chain order;
+    they are joined left to right by repeated
+    :func:`concatenate_audit_extension_delta_checkpoint_chains` calls,
+    so each seam must satisfy the same two link conditions as that
+    pairwise splice: the left segment's last expanded leaves must equal
+    the old prefix of the right segment's first expanded proof, and the
+    two shared checkpoint signatures at the seam must be identical by
+    value. A single segment is returned as the chain itself. In
+    particular, joining the tuple produced by
+    :func:`partition_delta_chain` for any legal cuts restores the
+    original chain value by value, and its canonical encoding matches
+    the original byte for byte. No signature is verified here and no
+    state is kept — verification stays with
+    :func:`verify_audit_extension_delta_checkpoint_chain` on the
+    result.
+
+    A non-tuple ``segments`` argument or a
+    non-:class:`AuditExtensionDeltaCheckpointChain` element raises
+    TypeError, as does any wrong field or element type inside a
+    segment, exactly as
+    :func:`expand_audit_extension_delta_checkpoint_chain` does. An
+    empty ``segments`` tuple raises ValueError, as does any leaf prefix
+    or shared signature mismatch at a seam and any structural error a
+    segment or its nested proofs or signatures would raise on its own.
+    """
+    if not isinstance(segments, tuple):
+        raise TypeError("segments must be a tuple")
+    for segment in segments:
+        if not isinstance(segment, AuditExtensionDeltaCheckpointChain):
+            raise TypeError(
+                "each segment must be an "
+                "AuditExtensionDeltaCheckpointChain instance"
+            )
+    if len(segments) == 0:
+        raise ValueError("segments must be a non-empty tuple")
+    for segment in segments:
+        _check_audit_extension_delta_checkpoint_chain_fields(segment)
+
+    joined = segments[0]
+    for segment in segments[1:]:
+        joined = concatenate_audit_extension_delta_checkpoint_chains(
+            joined, segment
+        )
+    return joined
 
 
 # ---------------------------------------------------------------------------

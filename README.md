@@ -723,6 +723,32 @@ restored = concatenate_audit_extension_delta_checkpoint_chains(head, tail)
 结构或签名数错、接缝叶前缀不一致（缺口/重叠）或共享签名不一致抛
 `ValueError`，不以 `False` 代替异常。
 
+在此之上还有一对批量入口，一次把长链分成多段、或把有序分段重新拼回：
+
+```python
+from thresholdsign import (
+    join_delta_chain_segments,
+    partition_delta_chain,
+)
+
+segments = partition_delta_chain(delta, (cut1, cut2, cut3))  # 按链序返回非空分段
+restored = join_delta_chain_segments(segments)               # 逐段拼接回单链
+assert restored == delta
+```
+
+`partition_delta_chain(chain, cuts)` 的 `cuts` 为整数元组，以展开后
+`proofs` 的边界编号计数，须严格递增、唯一且落在 `1..len(proofs)-1`；空元组
+返回整链单段，否则依次裁剪为 `[0, cuts[0])`、`[cuts[0], cuts[1])`、…、
+`[cuts[-1], len(proofs))` 各段，不留空段，等价于对同一链依次调用
+`slice_audit_extension_delta_checkpoint_chain`。
+`join_delta_chain_segments(segments)` 的 `segments` 须为非空保序元组，按输入
+顺序逐段调用 `concatenate_audit_extension_delta_checkpoint_chains`：每个接缝
+须同时满足叶前缀及共享签名相等。任意合法分区逐段规范编解码后重组，与原链
+逐值相等且编码逐字节一致。两入口不验签、不保存状态，既有裁剪、双链拼接、
+编码与验证接口行为不变；链、元组、元素或切点类型错误（含布尔切点）抛
+`TypeError`，空 `segments`、重复或越界切点、空段及接缝不一致抛
+`ValueError`。
+
 
 ## 命令行演示
 
