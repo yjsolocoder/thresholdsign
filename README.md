@@ -842,6 +842,51 @@ assert verify_delta_report_bundle_archive(restored, key)  # 逐项核验，全�
 `verify_delta_report_bundle`，全部为 `True` 才返回 `True`，任一包结构合法但
 核验不过则整体为 `False`；既有全部接口行为不变。
 
+整个归档还可由一个门限 Schnorr 签名整体密封：
+
+```python
+from thresholdsign import (
+    DeltaReportBundleArchiveSeal,
+    archive_seal_message,
+    decode_delta_report_bundle_archive_seal,
+    encode_delta_report_bundle_archive_seal,
+    verify_delta_report_bundle_archive_seal,
+)
+
+# message 即经两轮门限签名流程（create_signing_round /
+# aggregate_signature）由 key 签署的那条消息：
+message = archive_seal_message(archive, key.public_key)
+seal = DeltaReportBundleArchiveSeal(archive, signature)   # signature 为对应聚合签名
+blob = encode_delta_report_bundle_archive_seal(seal)      # 仅检查结构，不验签
+restored = decode_delta_report_bundle_archive_seal(blob)  # 仅恢复结构，不验签
+assert restored == seal
+assert verify_delta_report_bundle_archive_seal(restored, key)  # 归档核验且签名验过
+```
+
+`DeltaReportBundleArchiveSeal` 是冻结、可按位置构造、按值相等的数据类，字段
+依次为 `archive: DeltaReportBundleArchive` 与 `signature: AggregateSignature`，
+不含网络、存储或隐藏状态，构造时不校验。签名消息
+`archive_seal_message(archive, public_key)` 依次为标签 `b"ts/dra/v1"`、
+`SHA256(E)`（32 字节，`E = encode_delta_report_bundle_archive(archive)`）与
+`V(public_key)`，其中 `V` 为 4 字节无符号大端长度加最短无符号大端值
+（零为单字节 `00`，正值无前导零）；消息绑定归档字节与验证公钥，故增删、
+重排或替换任一包，以及换用另一把密钥呈现，签名均失效。传输编码依次为标签
+`b"ts/dra/w1"`、`U32(len(E))||E`（`E` 为归档编码，非空），随后接
+`AuditProofBundle` 同款签名帧：`V(R)`、`V(z)`、U32 签名者人数以及按严格
+升序排列的逐个 `V(id)`；`R` 必须为正、`z` 可为零。解码调用
+`decode_delta_report_bundle_archive` 恢复归档并按签名帧复原结构，成功后
+重编码须逐字节等于输入，不验签、不保存状态；归档或签名结构合法但核验不过
+照样正常返回，由核验入口判定。入参非 `DeltaReportBundleArchiveSeal`、
+`archive` 非归档、`signature` 非 `AggregateSignature` 或嵌套字段类型错误抛
+`TypeError`；空归档、非法签名结构、坏标签、零长或超长帧、计数错、截断、
+尾随或非规范编码抛 `ValueError`。
+`verify_delta_report_bundle_archive_seal(seal, key)` 先调用
+`verify_delta_report_bundle_archive`（归档内每个包都须核验通过），再用 `key`
+的群参数对 `archive_seal_message(seal.archive, key.public_key)` 验签，两者
+皆过才返回 `True`，结构合法但归档含坏包、签名被篡改、密封另一归档或另一把
+密钥均返回 `False`；增删、重排、替换由验证返回 `False` 而非抛错。既有全部
+接口行为不变。
+
 
 ## 命令行演示
 
@@ -1664,6 +1709,38 @@ python3 -m thresholdsign
   核验不过则整体为 `False`。非 `DeltaReportBundleArchive` 入参、`items` 非
   元组、元素非 `DeltaReportBundle` 或 `key` 类型错误抛 `TypeError`，空归档
   或嵌套结构非法抛 `ValueError`
+- `DeltaReportBundleArchiveSeal(archive, signature)` — 冻结数据类，字段依次
+  为 `archive: DeltaReportBundleArchive` 与
+  `signature: AggregateSignature`，把整个归档由一个门限 Schnorr 签名密封；
+  可按位置构造、按值相等，不含网络、存储或隐藏状态，构造时不校验字段类型
+- `archive_seal_message(archive, public_key) -> bytes` — 生成由门限密钥签署、
+  绑定归档与验证公钥的规范消息，依次为标签 `b"ts/dra/v1"`、
+  `SHA256(E)`（32 字节，`E = encode_delta_report_bundle_archive(archive)`）
+  及 `V(public_key)`，其中 `V` 为 U32 长度加最短无符号大端值（零为单字节
+  `00`）。非 `DeltaReportBundleArchive` 入参或公钥非整数（含布尔）抛
+  `TypeError`；归档结构非法、公钥为负或编码超长抛 `ValueError`
+- `encode_delta_report_bundle_archive_seal(seal) -> bytes` — 归档密封的规范
+  传输/持久化编码：标签 `b"ts/dra/w1"`、`U32(len(E))||E`（`E` 为归档编码），
+  随后接 `AuditProofBundle` 同款签名帧 `V(R)||V(z)||U32(k)||V(id_1)||…`，
+  签名者 id 严格升序、`R` 为正、`z` 可为零。仅检查结构，不验签，输出唯一且
+  无状态。非 `DeltaReportBundleArchiveSeal` 入参、`archive` 非归档、
+  `signature` 非 `AggregateSignature` 或嵌套字段类型错误抛 `TypeError`；
+  空归档、非法签名结构或帧超长抛 `ValueError`
+- `decode_delta_report_bundle_archive_seal(blob) -> DeltaReportBundleArchiveSeal`
+  — 恢复 `encode_delta_report_bundle_archive_seal` 的唯一规范形式：归档帧经
+  `decode_delta_report_bundle_archive` 按原序恢复，随后按签名帧还原
+  `R`、`z` 与严格升序的签名者 id；成功后重编码须逐字节等于输入，仅恢复结构，
+  不验签、不保存状态，归档或签名结构合法但核验不过照样正常返回。入参非
+  `bytes` 抛 `TypeError`；坏标签、零长/超长归档帧、非规范嵌套归档、`R` 为
+  零、签名者人数为零或不匹配、id 非正或非递增、非规范整数、截断或尾随抛
+  `ValueError`
+- `verify_delta_report_bundle_archive_seal(seal, key) -> bool` — 先调用
+  `verify_delta_report_bundle_archive` 核验密封归档（每个包皆须通过），再用
+  `key` 的群参数对 `archive_seal_message(seal.archive, key.public_key)` 验签；
+  两者皆过方为 `True`，结构合法但归档含坏包、签名被篡改、密封另一归档或另一
+  把密钥（含增删、重排、替换任一包）返回 `False`。非
+  `DeltaReportBundleArchiveSeal` 入参、字段类型错误或 `key` 类型错误抛
+  `TypeError`，空归档、嵌套结构非法或签名结构非法抛 `ValueError`
 
 ### 门限 Schnorr 群参数与边界
 
