@@ -664,6 +664,36 @@ assert compact_audit_extension_delta_checkpoint_chain(chain) == delta
 网络、存储或隐藏状态，展开后的链仍由既有
 `verify_audit_extension_checkpoint_chain` 核验，旧接口不变。
 
+增量链另有唯一规范传输编码，三个入口配套使用：
+
+```python
+from thresholdsign import (
+    AuditExtensionDeltaCheckpointChain,
+    encode_audit_extension_delta_checkpoint_chain,
+    decode_audit_extension_delta_checkpoint_chain,
+    verify_audit_extension_delta_checkpoint_chain,
+)
+
+blob = encode_audit_extension_delta_checkpoint_chain(delta)    # 仅接受现有增量链
+restored = decode_audit_extension_delta_checkpoint_chain(blob)  # 仅还原结构
+assert encode_audit_extension_delta_checkpoint_chain(restored) == blob
+assert verify_audit_extension_delta_checkpoint_chain(restored, key)  # 先展开再复用既有验证器
+```
+
+编码依次为标签 `b"ts/aepdcc/v1"`、首证明帧 `U32(len(P))||P`
+（`P = encode_extension(first)`，帧永不为空）、追加批数 `U32(b)`（可为
+零）、`b` 个追加批，最后为 `b + 2` 个签名帧。每个追加批编码为
+`U32(m)||m*32 字节摘要`，`m` 必须大于零且摘要保持原序；所有 `U32` 均为
+4 字节无符号大端。签名帧完全沿用 `AuditProofBundle` 的规范规则
+（`VARINT(R)`、`VARINT(z)`、U32 签名者数 `k` 及 `k` 个递增 `VARINT(id)`）。
+编解码只检查字段、计数与嵌套结构，不验签、不检查展开衔接：字段类型错误
+或解码入参非 `bytes` 抛 `TypeError`；零叶追加批、摘要非 32 字节、签名数
+不等于 `b + 2`、坏标签、非法嵌套证明或签名、计数溢出、截断或尾随字节抛
+`ValueError`；成功解码须逐字节往返。结构合法但签名错配或批次不衔接由
+`verify_audit_extension_delta_checkpoint_chain` 返回 `False`——该验证器先
+展开为普通检查点链，再复用 `verify_audit_extension_checkpoint_chain`，全真
+才返回 `True`，无状态、不引入网络或存储状态。
+
 
 ## 命令行演示
 
@@ -1395,6 +1425,24 @@ python3 -m thresholdsign
   签名原序保留；不验签、无状态。非 `AuditExtensionCheckpointChain` 入参或
   字段、元素类型错误抛 `TypeError`；空链、签名数不符、嵌套证明或签名非法、
   相邻前缀断裂抛 `ValueError`
+- `encode_audit_extension_delta_checkpoint_chain(chain) -> bytes` — 仅接受现有
+  增量链并输出唯一规范编码：标签 `b"ts/aepdcc/v1"`、`U32(len(P))||P`
+  （`P = encode_extension(first)`）、`U32(b)`、`b` 个追加批及 `b + 2` 个签名帧；
+  每批为 `U32(m)||m*32 字节摘要`，批非空、摘要保持原序；U32 均为 4 字节无符号
+  大端，签名帧沿用 `AuditProofBundle` 规范。非本类入参或字段类型错误抛
+  `TypeError`；空批、摘要非 32 字节、签名数不等于 `b + 2`、计数溢出、嵌套
+  非法、截断或尾随抛 `ValueError`
+- `decode_audit_extension_delta_checkpoint_chain(blob: bytes) -> AuditExtensionDeltaCheckpointChain`
+  — 恢复 `encode_audit_extension_delta_checkpoint_chain` 的唯一规范形式；仅
+  还原结构（首证明经 `decode_extension`、摘要不透明、不验签）。入参非
+  `bytes` 抛 `TypeError`；坏标签、零长首帧、零叶批、摘要宽度错误、签名帧数
+  不等于 `b + 2`、非法嵌套、截断或尾随抛 `ValueError`；成功解码须逐字节往返
+- `verify_audit_extension_delta_checkpoint_chain(chain, key) -> bool` — 先经
+  `expand_audit_extension_delta_checkpoint_chain` 展开为普通检查点链，再复用
+  既有 `verify_audit_extension_checkpoint_chain`；全真才返回 `True`，结构合法但
+  签名错配、叶/摘要被篡改、相邻缺口/重叠或换密钥核验返回 `False`。结构错误
+  （非本类入参、字段类型错误、空批、摘要非 32 字节、签名数不符、嵌套非法）
+  照样抛 `TypeError`/`ValueError`；无状态
 
 ### 门限 Schnorr 群参数与边界
 
