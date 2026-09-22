@@ -253,6 +253,10 @@ __all__ = [
     "encode_dr",
     "decode_dr",
     "verify_dr",
+    "DeltaReportBundle",
+    "encode_delta_report_bundle",
+    "decode_delta_report_bundle",
+    "verify_delta_report_bundle",
 ]
 
 # Mersenne prime 2**127 - 1: large enough for integer secrets, small enough that
@@ -8501,6 +8505,196 @@ def verify_dr(
         generator=generator,
         prime=field_prime,
     )
+
+
+# ---------------------------------------------------------------------------
+# Self-contained delta report bundle transport: the exact segment tuple a
+# DeltaReport diagnoses together with the report itself, as one canonical
+# byte string, so a verifier needs no separately stored segments. Decoding
+# restores structure only — the diagnosis, the segment summary and the
+# signature are checked solely by verify_delta_report_bundle, which reuses
+# verify_dr. No state is kept and the existing interfaces are unchanged.
+# ---------------------------------------------------------------------------
+
+DELTA_REPORT_BUNDLE_WIRE_TAG = b"thresholdsign/delta-report-bundle/v1"
+
+
+@dataclass(frozen=True)
+class DeltaReportBundle:
+    """A delta report together with the exact segment set it diagnoses.
+
+    The fields, in order, are ``segments`` (the non-empty,
+    order-preserving tuple of :class:`AuditExtensionDeltaCheckpointChain`
+    values the report was made over) and ``report`` (the
+    :class:`DeltaReport` sealing the diagnosis of exactly those
+    segments). The dataclass is frozen, positionally constructible and
+    compared by value, and carries no network, storage or hidden state.
+    The fields are not checked at construction time —
+    :func:`encode_delta_report_bundle` requires structural legality and
+    :func:`verify_delta_report_bundle` is the way to test a bundle
+    afterwards.
+    """
+
+    segments: tuple[AuditExtensionDeltaCheckpointChain, ...]
+    report: DeltaReport
+
+
+def _check_delta_report_bundle_fields(bundle: object) -> None:
+    """Type-check a DeltaReportBundle value's two top-level fields."""
+    if not isinstance(bundle, DeltaReportBundle):
+        raise TypeError("bundle must be a DeltaReportBundle instance")
+    if not isinstance(bundle.segments, tuple):
+        raise TypeError("bundle.segments must be a tuple")
+    for segment in bundle.segments:
+        if not isinstance(segment, AuditExtensionDeltaCheckpointChain):
+            raise TypeError(
+                "each segment must be an "
+                "AuditExtensionDeltaCheckpointChain instance"
+            )
+    if not isinstance(bundle.report, DeltaReport):
+        raise TypeError("bundle.report must be a DeltaReport instance")
+
+
+def encode_delta_report_bundle(bundle: DeltaReportBundle) -> bytes:
+    """Canonically encode a delta report bundle for transport or persistence.
+
+    The encoding is, in order, the tag
+    ``b"thresholdsign/delta-report-bundle/v1"``, the 4-byte unsigned
+    big-endian segment count (never zero), then one frame per segment in
+    tuple order — each the 4-byte unsigned big-endian byte length
+    followed by ``E``, the exact bytes of
+    :func:`encode_audit_extension_delta_checkpoint_chain` for that
+    segment — and finally the report frame: the 4-byte unsigned
+    big-endian byte length followed by ``R = encode_dr(bundle.report)``.
+
+    Only the bundle container and the structural legality of the nested
+    segments and report (via their own canonical encoders) are checked —
+    the diagnosis is not recomputed, the segments are not summarised and
+    no signature is checked: :func:`verify_delta_report_bundle` is the
+    way to test a bundle afterwards. A non-:class:`DeltaReportBundle`
+    argument, a non-tuple ``segments`` field, a
+    non-:class:`AuditExtensionDeltaCheckpointChain` element or a
+    non-:class:`DeltaReport` report raises TypeError, as does any wrong
+    field type inside a segment or the report, exactly as the nested
+    encoders raise it. An empty segment tuple, an over-long count or
+    frame, or any structural error a segment or the report would raise
+    on its own raises ValueError. The output for a given bundle is
+    unique and the encoding carries no network, storage or hidden state.
+    """
+    _check_delta_report_bundle_fields(bundle)
+    segment_count = len(bundle.segments)
+    if segment_count == 0:
+        raise ValueError("bundle.segments must be a non-empty tuple")
+    if segment_count > 0xFFFFFFFF:
+        raise ValueError("too many delta chain segments")
+
+    frames = []
+    for index, segment in enumerate(bundle.segments):
+        frame = encode_audit_extension_delta_checkpoint_chain(segment)
+        if len(frame) > 0xFFFFFFFF:
+            raise ValueError(f"delta chain segment {index + 1} too long")
+        frames.append(frame)
+    encoded_report = encode_dr(bundle.report)
+    if len(encoded_report) > 0xFFFFFFFF:
+        raise ValueError("delta report encoding too long")
+
+    buffer = bytearray(DELTA_REPORT_BUNDLE_WIRE_TAG)
+    buffer += segment_count.to_bytes(4, "big", signed=False)
+    for frame in frames:
+        buffer += len(frame).to_bytes(4, "big", signed=False)
+        buffer += frame
+    buffer += len(encoded_report).to_bytes(4, "big", signed=False)
+    buffer += encoded_report
+    return bytes(buffer)
+
+
+def decode_delta_report_bundle(blob: bytes) -> DeltaReportBundle:
+    """Decode the canonical encoding produced by
+    :func:`encode_delta_report_bundle`.
+
+    Accepts only the single canonical form: the tag
+    ``b"thresholdsign/delta-report-bundle/v1"``, a 4-byte unsigned
+    big-endian non-zero segment count, then exactly that many frames,
+    each a 4-byte unsigned big-endian non-zero byte length followed by
+    the exact canonical encoding of one
+    :class:`AuditExtensionDeltaCheckpointChain` accepted by
+    :func:`decode_audit_extension_delta_checkpoint_chain`, and finally
+    the report frame — a 4-byte unsigned big-endian non-zero byte length
+    followed by the exact canonical encoding of one :class:`DeltaReport`
+    accepted by :func:`decode_dr`. The segments are restored in their
+    original order. A non-bytes argument raises TypeError; a wrong or
+    missing tag, a zero segment count, a zero or over-long frame length,
+    a count mismatch, truncation, trailing bytes, or a frame whose
+    nested segment or report encoding is illegal or non-canonical
+    (including one that would not re-encode byte for byte) raises
+    ValueError. A successfully decoded bundle re-encodes to exactly the
+    input bytes.
+
+    Decoding only restores the structure: the diagnosis is not
+    recomputed, the segments are not summarised and no signature is
+    checked. A structurally legal bundle whose report does not match its
+    segments is returned normally, and
+    :func:`verify_delta_report_bundle` reports it as ``False``.
+    """
+    if not isinstance(blob, bytes):
+        raise TypeError("blob must be bytes")
+    if not blob.startswith(DELTA_REPORT_BUNDLE_WIRE_TAG):
+        raise ValueError("bad delta report bundle tag")
+    offset = len(DELTA_REPORT_BUNDLE_WIRE_TAG)
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated delta report bundle segment count")
+    segment_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    if segment_count == 0:
+        raise ValueError("delta report bundle segments must be non-empty")
+
+    segments = []
+    for index in range(segment_count):
+        frame, offset = _read_audit_proof_block(
+            blob,
+            offset,
+            what=f"delta report bundle segment {index + 1}",
+        )
+        segments.append(
+            decode_audit_extension_delta_checkpoint_chain(frame)
+        )
+
+    encoded_report, offset = _read_audit_proof_block(
+        blob, offset, what="delta report bundle report"
+    )
+    report = decode_dr(encoded_report)
+    if offset != len(blob):
+        raise ValueError("trailing bytes after delta report bundle")
+
+    bundle = DeltaReportBundle(segments=tuple(segments), report=report)
+    if encode_delta_report_bundle(bundle) != blob:
+        raise ValueError("non-canonical delta report bundle encoding")
+    return bundle
+
+
+def verify_delta_report_bundle(
+    bundle: DeltaReportBundle, key: SigningDKGResult
+) -> bool:
+    """Verify a delta report bundle against the threshold key.
+
+    This is a convenience wrapper over
+    ``verify_dr(bundle.report, bundle.segments, key)``: the diagnosis is
+    recomputed over the bundle's own segments, and the bundle verifies
+    only when the recomputed diagnosis equals the sealed one, the
+    report's ``public_key`` equals ``key.public_key`` and the signature
+    checks on :func:`dr_message` of the segments, the diagnosis and that
+    public key. Returns ``True`` only when all agree; a structurally
+    legal bundle whose diagnosis, segment summary or signature does not
+    match, or one presented under another key, returns ``False``.
+
+    A non-:class:`DeltaReportBundle` argument raises TypeError; illegal
+    nested segment, report or key structure raises TypeError/ValueError,
+    exactly as :func:`verify_dr` does. The function is stateless.
+    """
+    if not isinstance(bundle, DeltaReportBundle):
+        raise TypeError("bundle must be a DeltaReportBundle instance")
+    return verify_dr(bundle.report, bundle.segments, key)
 
 
 # ---------------------------------------------------------------------------
