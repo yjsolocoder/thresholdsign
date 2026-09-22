@@ -85,7 +85,9 @@ encode_delta_chain_segments / decode_delta_chain_segments for archiving
 or transferring several consecutive segments as one ordered object, and
 the stateless whole-set verifier verify_delta_chain_segments for
 confirming every segment's signatures and every seam between neighbours
-in one call.
+in one call, and its stateless failure diagnoser DeltaDiagnosis /
+diagnose_delta_chain_segments that locates the first failing segment,
+hop or seam in input order without guessing at the cryptographic cause.
 """
 
 from __future__ import annotations
@@ -240,6 +242,8 @@ __all__ = [
     "encode_delta_chain_segments",
     "decode_delta_chain_segments",
     "verify_delta_chain_segments",
+    "DeltaDiagnosis",
+    "diagnose_delta_chain_segments",
 ]
 
 # Mersenne prime 2**127 - 1: large enough for integer secrets, small enough that
@@ -7947,6 +7951,152 @@ def verify_delta_chain_segments(
     except ValueError:
         return False
     return verify_audit_extension_delta_checkpoint_chain(joined, key)
+
+
+# ---------------------------------------------------------------------------
+# Stateless failure diagnosis for delta chain segment sets: a companion to
+# verify_delta_chain_segments that reports where the first failure lies —
+# which segment, which hop inside it, or which seam between neighbours —
+# instead of a bare False. The diagnosis only locates the failing check; it
+# never guesses at the cryptographic cause behind a mismatch. No state is
+# kept and verify_delta_chain_segments is unchanged.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DeltaDiagnosis:
+    """The located first failure of a delta chain segment set diagnosis.
+
+    The fields, in order, are ``ok`` (the verdict, exactly the value
+    :func:`verify_delta_chain_segments` returns for the same segment tuple
+    and key), ``kind`` (one of ``"ok"``, ``"segment"``, ``"leaf"``,
+    ``"sig"`` or ``"proof"``), ``segment`` (the zero-based index of the
+    segment the first failure was found in, or ``None`` when ``ok`` is
+    ``True``) and ``proof`` (the zero-based index of the failing proof hop
+    within that segment, or ``None`` when the failure sits at a seam
+    between two segments or when ``ok`` is ``True``). A successful
+    diagnosis is always ``DeltaDiagnosis(True, "ok", None, None)``. The
+    dataclass is frozen, positionally constructible and compared by value,
+    and carries no network, storage or hidden state.
+    """
+
+    ok: bool
+    kind: str
+    segment: int | None
+    proof: int | None
+
+
+def diagnose_delta_chain_segments(
+    segments: tuple[AuditExtensionDeltaCheckpointChain, ...],
+    key: SigningDKGResult,
+) -> DeltaDiagnosis:
+    """Locate the first failure of a segment set, in input segment order.
+
+    ``segments`` must be a non-empty tuple of
+    :class:`AuditExtensionDeltaCheckpointChain` values in chain order,
+    checked exactly as it lies — the segments are never sorted or
+    otherwise reordered. The diagnosis is the stateless companion of
+    :func:`verify_delta_chain_segments`: the returned
+    :class:`DeltaDiagnosis`'s ``ok`` field is always exactly the boolean
+    that verifier returns for the same arguments, but a failing diagnosis
+    additionally pinpoints the first failing check instead of guessing at
+    the cryptographic cause behind the mismatch.
+
+    Every segment's structure is fully validated up front, exactly as
+    :func:`verify_delta_chain_segments` does — so the checks below only
+    ever run on structurally legal segments. The segments are then
+    scanned in input order; for each segment the checks run in a fixed
+    order: first the adjacent prefix links between the segment's expanded
+    proofs, then every proof hop with :func:`check_extension`, then the
+    seam to the next segment. The reported ``kind`` is:
+
+    - ``"segment"`` — an adjacent prefix link inside the segment is
+      broken: ``proof`` is the zero-based index of the right-hand proof
+      of the first broken pair within the segment.
+    - ``"proof"`` — :func:`check_extension` rejected a hop:
+      ``proof`` is the zero-based index of that hop within the segment.
+    - ``"leaf"`` — at the seam to the next segment the left segment's
+      last expanded leaves do not equal the old prefix of the right
+      segment's first expanded proof; ``proof`` is ``None``. The leaf
+      prefix is always checked before the shared signature.
+    - ``"sig"`` — the leaf prefix linked but the two shared checkpoint
+      signatures at the seam differ by value; ``proof`` is ``None``.
+
+    A fully verifying set returns ``DeltaDiagnosis(True, "ok", None,
+    None)``.
+
+    A non-tuple ``segments`` argument, a
+    non-:class:`AuditExtensionDeltaCheckpointChain` element, a
+    non-:class:`SigningDKGResult` ``key`` or any wrong field or element
+    type inside a segment raises TypeError, exactly as
+    :func:`verify_delta_chain_segments` does. An empty ``segments`` tuple
+    or any structural error a segment or its nested proofs or signatures
+    would raise on its own raises ValueError along the same boundary.
+    The function is stateless and keeps no hidden state.
+    """
+    if not isinstance(segments, tuple):
+        raise TypeError("segments must be a tuple")
+    for segment in segments:
+        if not isinstance(segment, AuditExtensionDeltaCheckpointChain):
+            raise TypeError(
+                "each segment must be an "
+                "AuditExtensionDeltaCheckpointChain instance"
+            )
+    if not isinstance(key, SigningDKGResult):
+        raise TypeError("key must be a SigningDKGResult instance")
+    if len(segments) == 0:
+        raise ValueError("segments must be a non-empty tuple")
+
+    # Full structural validation of every segment up front, along the
+    # existing single-chain boundary — exactly as
+    # verify_delta_chain_segments does — so the scan below only ever sees
+    # structurally legal segments.
+    expanded = tuple(
+        expand_audit_extension_delta_checkpoint_chain(segment)
+        for segment in segments
+    )
+
+    for index, chain in enumerate(expanded):
+        proofs = chain.proofs
+        signatures = chain.signatures
+
+        # Adjacent prefix links between the segment's own expanded proofs.
+        previous = proofs[0]
+        for proof_index in range(1, len(proofs)):
+            proof = proofs[proof_index]
+            old_n = proof.old_n
+            if (
+                len(previous.leaves) != old_n
+                or previous.leaves != proof.leaves[:old_n]
+            ):
+                return DeltaDiagnosis(False, "segment", index, proof_index)
+            previous = proof
+
+        # Every proof hop of the segment, bracketed by its signatures.
+        for proof_index, proof in enumerate(proofs):
+            if not check_extension(
+                proof,
+                signatures[proof_index],
+                signatures[proof_index + 1],
+                key,
+            ):
+                return DeltaDiagnosis(False, "proof", index, proof_index)
+
+        # The seam to the next segment: leaf prefix first, and only once
+        # it links the shared checkpoint signature.
+        if index + 1 < len(expanded):
+            right = expanded[index + 1].proofs[0]
+            left_last = proofs[-1]
+            old_n = right.old_n
+            if (
+                len(left_last.leaves) != old_n
+                or left_last.leaves != right.leaves[:old_n]
+            ):
+                return DeltaDiagnosis(False, "leaf", index, None)
+            if signatures[-1] != expanded[index + 1].signatures[0]:
+                return DeltaDiagnosis(False, "sig", index, None)
+
+    return DeltaDiagnosis(True, "ok", None, None)
 
 
 # ---------------------------------------------------------------------------
