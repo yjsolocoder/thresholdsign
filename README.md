@@ -775,6 +775,44 @@ chain = join_delta_chain_segments(restored)           # 段序与接缝仍由拼
 坏标签、零长或超长帧、计数错、截断、尾随或非规范嵌套编码抛 `ValueError`；
 既有全部接口行为不变。
 
+分段集合的诊断结论本身也可由门限密钥签名封存为一份自包含报告：
+
+```python
+from thresholdsign import (
+    DeltaReport,
+    decode_dr,
+    diagnose_delta_chain_segments,
+    dr_message,
+    encode_dr,
+    verify_dr,
+)
+
+diagnosis = diagnose_delta_chain_segments(segments, key)   # 复算集合诊断
+message = dr_message(segments, diagnosis, key.public_key)  # 待签名消息
+# ... 以 message 为 SigningRound.message 走两轮门限签名得到 signature ...
+report = DeltaReport(diagnosis, key.public_key, signature)
+blob = encode_dr(report)                # 规范传输编码
+assert decode_dr(blob) == report        # 逐字节往返
+assert verify_dr(report, segments, key) # 复算诊断并验签
+```
+
+`DeltaReport(diagnosis, public_key, signature)` 为冻结数据类，可位置构造、
+按值相等，构造时不校验字段。签名消息
+`dr_message(segments, diagnosis, public_key)` 依次为标签 `b"ts/dr/v1"`、
+`SHA256(S)`（`S = encode_delta_chain_segments(segments)` 的规范编码）、
+`V(public_key)` 与 `D(diagnosis)`；其中 `V` 为 4 字节大端长度加最短大端
+整数（零为单字节 `00`），`D` 为四个大端 U64：`ok` 取 0/1，`kind` 按
+ok、segment、leaf、sig、proof 取 0..4，`segment`/`proof` 的空位取
+`2**64 - 1`。`encode_dr(report)` 的线路格式为标签 `b"ts/dr/w1"` 后接
+`D`、`V(public_key)` 与既有签名帧（`VARINT(R)`、`VARINT(z)`、U32 签名者
+计数及逐个 `VARINT(id)`）；`decode_dr` 仅还原结构、成功解码须逐字节往返，
+不复算诊断也不验签。`verify_dr(report, segments, key)` 先用
+`diagnose_delta_chain_segments` 复算集合诊断，与报告陈述不一致或公钥不
+符返回 `False`，再经 `verify_signature` 核验签名，全真才返回 `True`；
+篡改结论、签名、分段或换密钥核验均返回 `False`。各入口类型错误抛
+`TypeError`，结构错误（空集合、非法诊断字段、负公钥、非法签名帧、坏
+标签、截断、尾随等）抛 `ValueError`；不保存任何状态，既有接口行为不变。
+
 
 ## 命令行演示
 
@@ -1549,6 +1587,29 @@ python3 -m thresholdsign
   输入；不排序、不检查接缝、不验签、不保存状态，段序与接缝由
   `join_delta_chain_segments` 判定。入参非 `bytes` 抛 `TypeError`；坏标签、
   零段数、零长/超长帧、计数错、截断、尾随或非规范嵌套编码抛 `ValueError`
+- `DeltaReport(diagnosis, public_key, signature)` — 冻结数据类；门限签名封存
+  的分段集合诊断报告：`diagnosis` 为所述 `DeltaDiagnosis`，`public_key` 为
+  非负整数验证公钥，`signature` 为对 `dr_message` 输出的门限 Schnorr
+  `AggregateSignature`；可位置构造、按值相等，构造时不校验字段，不保存状态
+- `dr_message(segments, diagnosis, public_key) -> bytes` — 报告签名消息：
+  标签 `b"ts/dr/v1"`、`SHA256(S)`（`S = encode_delta_chain_segments(segments)`）、
+  `V(public_key)`（4 字节大端长度加最短大端整数，零为 `00`）与
+  `D(diagnosis)`（四个大端 U64：`ok` 取 0/1，`kind` 按 ok/segment/leaf/
+  sig/proof 取 0..4，空位取 `2**64 - 1`）。类型错误抛 `TypeError`；空集合、
+  非法分段或诊断、负公钥抛 `ValueError`
+- `encode_dr(report) -> bytes` — 报告规范编码：标签 `b"ts/dr/w1"` 后接
+  `D`、`V(public_key)` 与既有签名帧（`VARINT(R)`、`VARINT(z)`、U32 签名者
+  计数及逐个 `VARINT(id)`）；仅验结构，不复算诊断、不验签。类型错误抛
+  `TypeError`；非法诊断、负公钥或非法签名结构抛 `ValueError`
+- `decode_dr(blob: bytes) -> DeltaReport` — 恢复 `encode_dr` 的唯一规范
+  形式；仅还原结构，成功解码须逐字节往返。入参非 `bytes` 抛 `TypeError`；
+  坏标签、`ok`/`kind` 字越界、非规范整数、零 `R`、签名者计数错、截断或
+  尾随抛 `ValueError`
+- `verify_dr(report, segments, key) -> bool` — 先以
+  `diagnose_delta_chain_segments` 复算 `segments` 的诊断，与报告陈述或
+  `key.public_key` 不符返回 `False`，再经 `verify_signature` 核验
+  `dr_message` 上的签名；全真才返回 `True`，篡改结论、签名、分段或换密钥
+  返回 `False`。类型错误抛 `TypeError`，结构错误抛 `ValueError`；无状态
 
 ### 门限 Schnorr 群参数与边界
 
