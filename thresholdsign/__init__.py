@@ -82,7 +82,10 @@ for splitting a long chain into several consecutive hop segments at
 once and folding an ordered tuple of segments back into one chain, and
 the self-delimiting segment-set transport encoding
 encode_delta_chain_segments / decode_delta_chain_segments for archiving
-or transferring several consecutive segments as one ordered object.
+or transferring several consecutive segments as one ordered object, and
+verify_delta_chain_segments for confirming a whole ordered segment set —
+every segment's signatures and every seam between neighbours — against a
+key in a single stateless call.
 """
 
 from __future__ import annotations
@@ -236,6 +239,7 @@ __all__ = [
     "verify_audit_extension_delta_checkpoint_chain",
     "encode_delta_chain_segments",
     "decode_delta_chain_segments",
+    "verify_delta_chain_segments",
 ]
 
 # Mersenne prime 2**127 - 1: large enough for integer secrets, small enough that
@@ -7870,6 +7874,66 @@ def decode_delta_chain_segments(
     if encode_delta_chain_segments(segments_tuple) != blob:
         raise ValueError("non-canonical delta chain segments encoding")
     return segments_tuple
+
+
+def verify_delta_chain_segments(
+    segments: tuple[AuditExtensionDeltaCheckpointChain, ...],
+    key: SigningDKGResult,
+) -> bool:
+    """Verify an ordered tuple of delta chain segments as one whole chain.
+
+    ``segments`` must be a non-empty tuple of
+    :class:`AuditExtensionDeltaCheckpointChain` values in chain order;
+    the tuple is used exactly as given and is never sorted. Each
+    segment's canonical structure is checked first, then the segments
+    are folded left to right by :func:`join_delta_chain_segments`, so
+    every seam must satisfy the same two link conditions as that join:
+    the left segment's last expanded leaves must equal the old prefix of
+    the right segment's first expanded proof, and the two shared
+    checkpoint signatures at the seam must be identical by value. The
+    joined chain is then verified by
+    :func:`verify_audit_extension_delta_checkpoint_chain` under ``key``,
+    so every hop of every segment is checked with
+    :func:`check_extension`. Returns ``True`` only when every segment's
+    signatures verify, every seam links and the key matches; a
+    structurally legal set presented out of order, with a leaf prefix
+    gap or overlap or a shared signature mismatch at a seam, with
+    tampered leaf digests or signatures, or verified under another key
+    returns ``False`` — such mismatches are reported by the return
+    value, never by an exception. A round-trip through
+    :func:`encode_delta_chain_segments` and
+    :func:`decode_delta_chain_segments` restores the segments value by
+    value and therefore cannot change the conclusion.
+
+    A non-tuple ``segments`` argument, a
+    non-:class:`AuditExtensionDeltaCheckpointChain` element, a
+    non-:class:`SigningDKGResult` key, or any wrong field or element
+    type inside a segment raises TypeError, exactly as
+    :func:`join_delta_chain_segments` and
+    :func:`verify_audit_extension_delta_checkpoint_chain` do. An empty
+    ``segments`` tuple or any structural error a segment or its nested
+    proofs or signatures would raise on its own raises ValueError, along
+    the same boundaries as the single-chain verifier. The function is
+    stateless: nothing is saved between calls.
+    """
+    if not isinstance(segments, tuple):
+        raise TypeError("segments must be a tuple")
+    for segment in segments:
+        if not isinstance(segment, AuditExtensionDeltaCheckpointChain):
+            raise TypeError(
+                "each segment must be an "
+                "AuditExtensionDeltaCheckpointChain instance"
+            )
+    if len(segments) == 0:
+        raise ValueError("segments must be a non-empty tuple")
+    for segment in segments:
+        expand_audit_extension_delta_checkpoint_chain(segment)
+
+    try:
+        joined = join_delta_chain_segments(segments)
+    except ValueError:
+        return False
+    return verify_audit_extension_delta_checkpoint_chain(joined, key)
 
 
 # ---------------------------------------------------------------------------
