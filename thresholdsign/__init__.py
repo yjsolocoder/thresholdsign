@@ -67,7 +67,13 @@ verify_audit_extension_proof_bundle_chain, and the flattened checkpoint
 chain AuditExtensionCheckpointChain /
 encode_audit_extension_checkpoint_chain /
 decode_audit_extension_checkpoint_chain /
-verify_audit_extension_checkpoint_chain.
+verify_audit_extension_checkpoint_chain, and the leaf-deduplicating
+incremental form AuditExtensionDeltaCheckpointChain /
+expand_audit_extension_delta_checkpoint_chain /
+compact_audit_extension_delta_checkpoint_chain /
+encode_audit_extension_delta_checkpoint_chain /
+decode_audit_extension_delta_checkpoint_chain /
+verify_audit_extension_delta_checkpoint_chain.
 """
 
 from __future__ import annotations
@@ -212,6 +218,9 @@ __all__ = [
     "AuditExtensionDeltaCheckpointChain",
     "expand_audit_extension_delta_checkpoint_chain",
     "compact_audit_extension_delta_checkpoint_chain",
+    "encode_audit_extension_delta_checkpoint_chain",
+    "decode_audit_extension_delta_checkpoint_chain",
+    "verify_audit_extension_delta_checkpoint_chain",
 ]
 
 # Mersenne prime 2**127 - 1: large enough for integer secrets, small enough that
@@ -7239,6 +7248,247 @@ def compact_audit_extension_delta_checkpoint_chain(
     return AuditExtensionDeltaCheckpointChain(
         first=proofs[0], additions=tuple(additions), signatures=signatures
     )
+
+
+# ---------------------------------------------------------------------------
+# Canonical transport for the incremental delta chain: a self-delimiting,
+# byte-for-byte reproducible encoding that carries the first hop's full
+# extension proof once, each appended leaf digest exactly once, and the
+# bracketing checkpoint signature frames. Decoding restores structure only —
+# the nested proof goes through decode_extension, its leaf digests stay
+# opaque and no signature or linkage is checked, so
+# verify_audit_extension_delta_checkpoint_chain (which expands back into a
+# plain checkpoint chain) remains the sole verifier afterwards.
+# ---------------------------------------------------------------------------
+
+AUDIT_EXTENSION_DELTA_CHECKPOINT_CHAIN_WIRE_TAG = b"ts/aepdcc/v1"
+
+
+def encode_audit_extension_delta_checkpoint_chain(
+    chain: AuditExtensionDeltaCheckpointChain,
+) -> bytes:
+    """Canonically encode an incremental delta checkpoint chain.
+
+    The encoding is, in order, the tag ``b"ts/aepdcc/v1"``, the first
+    proof frame — the 4-byte unsigned big-endian length ``len(P)``
+    followed by ``P = encode_extension(chain.first)`` (never empty) — the
+    batch count ``b = len(chain.additions)`` as a 4-byte unsigned
+    big-endian integer (possibly zero), then one frame per appended
+    batch in chain order, each the 4-byte unsigned big-endian non-zero
+    batch size ``m`` followed by exactly ``m`` raw 32-byte leaf digests
+    kept in their original order, and finally the ``b + 2`` checkpoint
+    signature frames in order: the first proof is bracketed by frames
+    ``0`` and ``1`` and batch ``i``'s successor checkpoint by frames
+    ``i + 1`` and ``i + 2``. Every signature frame is exactly the
+    signature frame of :func:`encode_audit_proof_bundle` —
+    ``VARINT(R)``, ``VARINT(z)``, the 4-byte unsigned big-endian signer
+    count ``k`` and one ``VARINT(id)`` per ascending signer id.
+
+    Only the chain container and the nested proof and signature
+    structures are checked — the expanded prefix linkage is not
+    reconstructed here and no signature is checked against any root:
+    :func:`verify_audit_extension_delta_checkpoint_chain` stays the way
+    to verify a chain afterwards. A non-chain argument or non-tuple
+    field raises TypeError, and a non-:class:`AuditExtensionProof`
+    first proof, a non-tuple batch, a non-``bytes`` digest or a
+    non-:class:`AggregateSignature` signature raises TypeError exactly
+    as :func:`encode_extension` and the bundle encoders do for their
+    fields. An empty addition batch, a digest that is not exactly 32
+    bytes, a signature count other than ``b + 2``, an over-long batch
+    count, batch size or proof frame, a cumulative leaf count above
+    ``2**64 - 1``, or an illegal nested proof or signature raises
+    ValueError. The output for a given chain is unique and the encoding
+    carries no network, storage or hidden state.
+    """
+    batch_count, first, additions, signatures = (
+        _check_audit_extension_delta_checkpoint_chain_fields(chain)
+    )
+    if batch_count > 0xFFFFFFFF:
+        raise ValueError("too many chain addition batches")
+
+    first_body = encode_extension(first)
+    if len(first_body) > 0xFFFFFFFF:
+        raise ValueError("audit extension proof encoding too long")
+
+    cumulative = len(first.leaves)
+    for index, batch in enumerate(additions):
+        if len(batch) > 0xFFFFFFFF:
+            raise ValueError(f"chain addition batch {index + 1} too large")
+        cumulative += len(batch)
+        if cumulative > 0xFFFFFFFFFFFFFFFF:
+            raise ValueError("too many leaves")
+
+    signer_counts = []
+    for index, signature in enumerate(signatures):
+        signer_count = _check_history_proof_bundle_signature(
+            signature, field=f"chain.signatures[{index}]"
+        )
+        if signer_count > 0xFFFFFFFF:
+            raise ValueError("too many signer ids")
+        signer_counts.append(signer_count)
+
+    buffer = bytearray(AUDIT_EXTENSION_DELTA_CHECKPOINT_CHAIN_WIRE_TAG)
+    buffer += len(first_body).to_bytes(4, "big", signed=False)
+    buffer += first_body
+    buffer += batch_count.to_bytes(4, "big", signed=False)
+    for batch in additions:
+        buffer += len(batch).to_bytes(4, "big", signed=False)
+        for digest in batch:
+            buffer += digest
+    for signature, signer_count in zip(signatures, signer_counts):
+        buffer += _encode_varint(signature.R)
+        buffer += _encode_varint(signature.z)
+        buffer += signer_count.to_bytes(4, "big", signed=False)
+        for signer_id in signature.signer_ids:
+            buffer += _encode_varint(signer_id)
+    return bytes(buffer)
+
+
+def decode_audit_extension_delta_checkpoint_chain(
+    blob: bytes,
+) -> AuditExtensionDeltaCheckpointChain:
+    """Decode the canonical encoding produced by :func:`encode_audit_extension_delta_checkpoint_chain`.
+
+    Accepts only the single canonical form: the tag
+    ``b"ts/aepdcc/v1"``, a 4-byte unsigned big-endian non-zero length
+    followed by bytes that :func:`decode_extension` accepts as the first
+    hop's proof, the 4-byte unsigned big-endian batch count ``b`` (which
+    may be zero), then exactly ``b`` addition batch frames — each a
+    4-byte unsigned big-endian non-zero size ``m`` followed by exactly
+    ``m`` raw 32-byte digests in order — and finally exactly ``b + 2``
+    signature frames, each the length-prefixed integers ``R`` and ``z``,
+    the 4-byte non-zero signer count ``k`` and exactly ``k`` strictly
+    increasing positive signer ids. A non-bytes argument raises
+    TypeError; a wrong or missing tag, a zero or over-long first proof
+    frame length, a non-canonical nested proof or signature integer, a
+    zero batch size, a digest that is not exactly 32 bytes, a zero
+    ``R``, a zero signer count, a non-positive or non-increasing signer
+    id, a signature count other than ``b + 2``, truncation, or trailing
+    bytes raises ValueError. A successfully decoded chain re-encodes to
+    exactly the input bytes.
+
+    Decoding only restores the structure: the nested proof goes through
+    :func:`decode_extension`, whose leaf digests stay opaque, no
+    signature frame is checked and the expanded prefix linkage is not
+    checked either. A structurally legal chain whose signatures do not
+    match or whose batches do not link is returned normally, and
+    :func:`verify_audit_extension_delta_checkpoint_chain` reports it as
+    ``False``.
+    """
+    if not isinstance(blob, bytes):
+        raise TypeError("blob must be bytes")
+    if not blob.startswith(AUDIT_EXTENSION_DELTA_CHECKPOINT_CHAIN_WIRE_TAG):
+        raise ValueError(
+            "bad audit extension delta checkpoint chain tag"
+        )
+    offset = len(AUDIT_EXTENSION_DELTA_CHECKPOINT_CHAIN_WIRE_TAG)
+
+    first_body, offset = _read_audit_proof_block(
+        blob,
+        offset,
+        what="audit extension delta checkpoint chain first proof",
+    )
+    first = decode_extension(first_body)
+
+    if offset + 4 > len(blob):
+        raise ValueError(
+            "truncated audit extension delta checkpoint chain batch count"
+        )
+    batch_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+
+    additions = []
+    for index in range(batch_count):
+        if offset + 4 > len(blob):
+            raise ValueError(
+                f"truncated audit extension delta checkpoint chain "
+                f"batch {index + 1} size"
+            )
+        batch_size = int.from_bytes(blob[offset:offset + 4], "big")
+        offset += 4
+        if batch_size == 0:
+            raise ValueError(
+                f"audit extension delta checkpoint chain batch "
+                f"{index + 1} must be non-empty"
+            )
+        batch_width = batch_size * AUDIT_PROOF_DIGEST_SIZE
+        if offset + batch_width > len(blob):
+            raise ValueError(
+                f"truncated audit extension delta checkpoint chain "
+                f"batch {index + 1}"
+            )
+        batch = tuple(
+            bytes(
+                blob[
+                    offset
+                    + digest_index * AUDIT_PROOF_DIGEST_SIZE:
+                    offset
+                    + (digest_index + 1) * AUDIT_PROOF_DIGEST_SIZE
+                ]
+            )
+            for digest_index in range(batch_size)
+        )
+        additions.append(batch)
+        offset += batch_width
+
+    signatures = []
+    for index in range(batch_count + 2):
+        signature, offset = _read_bundle_signature_frame(
+            blob,
+            offset,
+            what=(
+                "audit extension delta checkpoint chain "
+                f"signature {index + 1}"
+            ),
+        )
+        signatures.append(signature)
+    if offset != len(blob):
+        raise ValueError(
+            "trailing bytes after audit extension delta checkpoint chain"
+        )
+
+    chain = AuditExtensionDeltaCheckpointChain(
+        first=first,
+        additions=tuple(additions),
+        signatures=tuple(signatures),
+    )
+    if encode_audit_extension_delta_checkpoint_chain(chain) != blob:
+        raise ValueError(
+            "non-canonical audit extension delta checkpoint chain encoding"
+        )
+    return chain
+
+
+def verify_audit_extension_delta_checkpoint_chain(
+    chain: AuditExtensionDeltaCheckpointChain, key: SigningDKGResult
+) -> bool:
+    """Verify a delta checkpoint chain by expanding it and reusing the plain verifier.
+
+    The chain is first expanded with
+    :func:`expand_audit_extension_delta_checkpoint_chain` into an
+    :class:`AuditExtensionCheckpointChain` and then checked with the
+    existing :func:`verify_audit_extension_checkpoint_chain` against
+    ``key``: every hop's old and new root signature must verify and the
+    prefix carried by ``first`` together with the appended batches must
+    link hop to hop. Returns ``True`` only when every expanded hop
+    verifies and every linkage holds; a well-formed chain with a
+    mismatched signature, tampered leaves or digests, a gap or overlap
+    between hops, or one presented under another key returns ``False``.
+
+    A non-:class:`AuditExtensionDeltaCheckpointChain` argument raises
+    TypeError; a non-tuple field, a non-:class:`AuditExtensionProof`
+    first proof, a non-tuple batch, a non-``bytes`` digest or a
+    non-:class:`AggregateSignature` signature raises TypeError; an
+    empty addition batch, a digest that is not exactly 32 bytes, a
+    signature count other than ``len(additions) + 2``, an illegal
+    nested proof, signature or key, or a cumulative leaf count above
+    ``2**64 - 1`` raises ValueError, exactly as
+    :func:`expand_audit_extension_delta_checkpoint_chain` and
+    :func:`verify_audit_extension_checkpoint_chain` do. The function is
+    stateless.
+    """
+    expanded = expand_audit_extension_delta_checkpoint_chain(chain)
+    return verify_audit_extension_checkpoint_chain(expanded, key)
 
 
 # ---------------------------------------------------------------------------
