@@ -962,6 +962,57 @@ assert verify_dc(restored, key)  # 结构合法但签名错配仍正常返回对
 解码入参非 `bytes` 抛 `TypeError`。`drasc_message`、`verify_dc`、各嵌套封印
 及全部旧接口行为不变。
 
+封印链上的多个封印还可用一个根签名一并证明归属，而无需出示整条链：
+
+```python
+from thresholdsign import SMP, make_smp, check_smp
+
+# chain 为现有 DeltaReportBundleArchiveSealChain；i 为非空、严格递增的整数元组
+message, proof = make_smp(chain, (0, 2, 4))
+signature = sign_threshold(key, message)        # 一个根签名覆盖多个封印
+assert check_smp(proof, signature, key)
+```
+
+冻结数据类 `SMP(i, n, s, p)` 字段依次为待证叶下标元组 `tuple[int, ...]`（非空、
+严格递增、不含布尔）、链项总数 `int`、与下标逐项对应的归档封印元组
+`tuple[DeltaReportBundleArchiveSeal, ...]`（按 `i` 自取）与兄弟摘要元组
+`tuple[bytes, ...]`（每项恰为 32 字节），可按位置构造、按值相等且不可变，不带任何
+隐藏状态；构造时不校验。`make_smp(chain, i) -> tuple[bytes, SMP]` 要求 `chain`
+为现有 `DeltaReportBundleArchiveSealChain`、`i` 为非空严格递增且不含布尔的整数
+元组并满足 `0 <= i_j < n < 2^64`（`n = len(chain.items)`）；`s` 按 `i` 取链项。
+记第 `j` 项封印的既有规范编码
+`E_j = encode_delta_report_bundle_archive_seal(chain.items[j])`、`H` 为 SHA256、
+`U64` 为 8 字节无符号大端，树规则为
+
+```text
+叶   = H(b"ds/l1" || U64(j) || H(E_j))
+节点 = H(b"ds/n1" || left || right)
+根消息 = b"ds/r1" || U64(n) || root
+```
+
+奇数宽度的层把末节点复制后配对。自叶向根逐层、层内自左向右收集兄弟：同伴本身也是
+被披露节点（其封印已在 `s` 中）或当前节点是奇数尾（以自身配对）时不入 `p`，其余
+同伴恰好追加一次；故 `p` 的顺序与数量只由 `n` 与 `i` 唯一确定。`make_smp` 不校验
+链的外层签名（根消息由调用方自行签署），但每个链项都必须结构合法（能被
+`encode_delta_report_bundle_archive_seal` 编码）。非链入参、`items` 非元组、元素
+非 `DeltaReportBundleArchiveSeal`、`i` 非元组或下标非整数（含布尔）抛 `TypeError`；
+空链、空下标、`n >= 2^64`、下标越界或非严格递增、嵌套封印结构非法抛 `ValueError`。
+
+`check_smp(proof, signature, key) -> bool` 先查根签名与 `key` 的结构（坏封印不
+掩盖非法签名或密钥），再由各下标与 `s` 中封印的既有规范编码重算叶摘要，逐层按
+`p` 重建根：同伴本身在当前层则直接取其摘要，奇数尾无同伴则复制自身配对，否则消费
+下一个 32 字节条目；宽度按 `(width+1)//2` 上收，须恰好用尽 `p` 并唯一到达根。
+随后按 `i` 顺序对每个披露封印调用
+`verify_delta_report_bundle_archive_seal`（封印内每个包及封印自身签名都须核验
+通过），再用 `key` 的群参数对 `b"ds/r1"||U64(n)||root` 验证根签名；全部一致才返回
+`True`，结构合法但不匹配（封印互换或改动、下标改动、`p` 缺失/多余/错位、摘要或
+签名不符、换密钥核验等）返回 `False`。非 `SMP` 或非 `AggregateSignature` 入参、
+字段类型错误（`i`/`s`/`p` 非元组、`n` 或下标非整数含布尔、`s` 元素非封印、`p`
+元素非 bytes）或 `key` 类型错误抛 `TypeError`；`n` 非正或达到 `2^64`、空下标、
+下标越界或非严格递增、`s` 与 `i` 数量不同、嵌套封印结构非法、`p` 元素非恰 32
+字节、`p` 数量与 `n`/`i` 推导不符、签名或密钥结构非法抛 `ValueError`。SMP 不引入
+传输编码，也不引入任何网络、存储或隐藏状态；全部旧接口行为不变。
+
 
 ## 命令行演示
 
@@ -1853,6 +1904,29 @@ python3 -m thresholdsign
   非法嵌套、截断及尾随，成功须逐字节重编码等于输入；结构合法但签名错配仍
   返回对象（由 `verify_dc` 判定）。非 `bytes` 入参抛 `TypeError`，其余非法
   抛 `ValueError`；无状态
+- `SMP(i, n, s, p)` — 冻结数据类，字段依次为非空严格递增整数元组
+  `i: tuple[int, ...]`、链项总数 `n: int`、归档封印元组
+  `s: tuple[DeltaReportBundleArchiveSeal, ...]`（按 `i` 与链项一一对应）与
+  恰 32 字节兄弟摘要元组 `p: tuple[bytes, ...]`；可按位置构造、按值相等，不含
+  网络、存储或隐藏状态，构造时不校验字段类型与结构
+- `make_smp(chain, indices) -> tuple[bytes, SMP]` — 对现有
+  `DeltaReportBundleArchiveSealChain` 的多个封印生成紧凑多叶包含证明：
+  `n = len(chain.items)`，叶为 `H(b"ds/l1"||U64(j)||H(E_j))`、节点为
+  `H(b"ds/n1"||left||right)`（`E_j` 为第 `j` 项封印的既有规范编码、`H` 为
+  SHA256、`U64` 为 8 字节大端），奇数尾复制自身配对；返回待签根消息
+  `b"ds/r1"||U64(n)||root` 与 `SMP`。`p` 自叶向根逐层、层内左到右收集：已披露
+  同伴与奇数尾均不入 `p`，其余同伴恰好追加一次，顺序与数量由 `n`、`i` 唯一
+  确定。非链入参、`items` 非元组、元素非 `DeltaReportBundleArchiveSeal`、`i`
+  非元组或下标非整数（含布尔）抛 `TypeError`；空链、空下标、`n >= 2^64`、下标
+  越界或非严格递增、嵌套封印结构非法抛 `ValueError`
+- `check_smp(proof, signature, key) -> bool` — 先查根签名与 `key` 的结构，再由
+  `p` 逐层重建根（奇数尾复制自身配对，并须恰好用尽 `p`），随后对 `s` 中每个
+  封印调用 `verify_delta_report_bundle_archive_seal`，最后用 `key` 的群参数对
+  `b"ds/r1"||U64(n)||root` 验证根签名；全部为真才返回 `True`，结构合法但封印、
+  兄弟、根或签名不匹配（含互换、增删、重排、换密钥呈现）返回 `False`。非
+  `SMP`/`AggregateSignature` 入参或字段类型错误抛 `TypeError`；`n` 越界、空
+  下标、下标非严格递增或越界、`s` 数量不符、嵌套封印非法、`p` 元素非恰 32
+  字节、`p` 数量不符、签名或密钥结构非法抛 `ValueError`；无状态
 
 ### 门限 Schnorr 群参数与边界
 

@@ -112,7 +112,12 @@ verifier verify_dc that re-checks every seal before the outer
 signature, and the canonical chain transport encoding
 encode_delta_report_bundle_archive_seal_chain /
 decode_delta_report_bundle_archive_seal_chain for transferring or
-persisting a whole chain as one self-delimiting byte string.
+persisting a whole chain as one self-delimiting byte string, and the
+compact multi-seal inclusion proofs SMP / make_smp / check_smp that
+locate several archive seals at once in such a chain with one root
+signature over a SHA256 Merkle tree of the existing canonical seal
+encodings, carrying only the companion digests not themselves
+disclosed (and never an odd-tail self-pair).
 """
 
 from __future__ import annotations
@@ -292,6 +297,9 @@ __all__ = [
     "verify_dc",
     "encode_delta_report_bundle_archive_seal_chain",
     "decode_delta_report_bundle_archive_seal_chain",
+    "SMP",
+    "make_smp",
+    "check_smp",
 ]
 
 # Mersenne prime 2**127 - 1: large enough for integer secrets, small enough that
@@ -9542,6 +9550,417 @@ def decode_delta_report_bundle_archive_seal_chain(
             "non-canonical delta report bundle archive seal chain encoding"
         )
     return chain
+
+
+# ---------------------------------------------------------------------------
+# Compact multi-seal inclusion proofs over a chain of sealed archives: one
+# root signature certifies that several disclosed
+# DeltaReportBundleArchiveSeal values belong, at fixed positions, to the
+# exact non-empty seal sequence a DeltaReportBundleArchiveSealChain
+# carries. The tree is SHA256 with its own domain-separated leaf/node
+# prefixes over the existing canonical seal encodings; the root statement
+# to sign is ``b"ds/r1" || U64(n) || root``. Like the audit multi-proof,
+# an SMP carries only the companion digests that are not themselves
+# disclosed (and never the odd-tail self-pair), so the whole set can be
+# audited from one signature without hidden state, and check_smp re-runs
+# verify_delta_report_bundle_archive_seal on every disclosed seal and
+# verify_signature on the root signature afterwards.
+# ---------------------------------------------------------------------------
+
+SMP_LEAF_TAG = b"ds/l1"
+SMP_NODE_TAG = b"ds/n1"
+SMP_ROOT_TAG = b"ds/r1"
+
+SMP_DIGEST_SIZE = 32  # SHA256 output width; every tree node is this wide
+
+
+def _smp_u64(value: int) -> bytes:
+    """8-byte unsigned big-endian encoding of a non-negative integer < 2**64."""
+    return value.to_bytes(8, "big", signed=False)
+
+
+def _smp_leaf(index: int, encoded_seal: bytes) -> bytes:
+    """The index-bound leaf digest ``H(b"ds/l1" || U64(j) || H(E_j))``."""
+    return hashlib.sha256(
+        SMP_LEAF_TAG + _smp_u64(index) + hashlib.sha256(encoded_seal).digest()
+    ).digest()
+
+
+def _smp_node(left: bytes, right: bytes) -> bytes:
+    """The ordered internal digest ``H(b"ds/n1" || left || right)``."""
+    return hashlib.sha256(SMP_NODE_TAG + left + right).digest()
+
+
+def _smp_levels(encoded_seals: tuple[bytes, ...]) -> list[tuple[bytes, ...]]:
+    """Build the leaf level and every internal level up to the single root.
+
+    A level with an odd tail width is paired with its own last node
+    duplicated, so every level above the leaves has an even width.
+    """
+    levels: list[tuple[bytes, ...]] = [
+        tuple(
+            _smp_leaf(index, encoded_seal)
+            for index, encoded_seal in enumerate(encoded_seals)
+        )
+    ]
+    current = levels[0]
+    while len(current) > 1:
+        if len(current) % 2 == 1:
+            current = current + current[-1:]
+        current = tuple(
+            _smp_node(current[index], current[index + 1])
+            for index in range(0, len(current), 2)
+        )
+        levels.append(current)
+    return levels
+
+
+@dataclass(frozen=True)
+class SMP:
+    """A compact Merkle inclusion proof for several seals of a seal chain.
+
+    The fields, in order, are ``i`` (the proven leaf positions as a
+    non-empty tuple of strictly increasing, unique non-negative integers),
+    ``n`` (the total, non-empty chain item count), ``s`` (the proven
+    :class:`DeltaReportBundleArchiveSeal` values, one per entry of ``i``
+    in the same order) and ``p`` (the 32-byte companion digests consumed
+    from the leaf level up to the root, level by level from the leaves
+    upward and left to right within a level; the tuple is empty when no
+    companion digests are needed). A companion that is itself a disclosed
+    node, and an odd-width level's last node (which the tree pairs with
+    itself), are never put in ``p``; the order and number of entries are
+    therefore fixed uniquely by ``n`` and ``i``. The dataclass is frozen,
+    positionally constructible and compared by value, and carries no
+    network, storage or hidden state. Field types and bounds are not
+    checked at construction time — :func:`check_smp` is the way to test a
+    proof afterwards.
+    """
+
+    i: tuple[int, ...]
+    n: int
+    s: tuple[DeltaReportBundleArchiveSeal, ...]
+    p: tuple[bytes, ...]
+
+
+def _required_smp_siblings(count: int, indices: tuple[int, ...]) -> int:
+    """Number of 32-byte companion digests an SMP for ``count`` leaves must carry.
+
+    Replays :func:`make_smp`'s level walk structurally: at each level a
+    proven node needs a sibling unless it is the odd-width tail (paired
+    with itself) or its companion is itself a proven node at that level.
+    The answer depends only on ``n`` and the disclosed positions — never
+    on the seals or the digests — so it is the unique sibling count both
+    the prover and the verifier can demand.
+    """
+    required = 0
+    positions = set(indices)
+    width = count
+    while width > 1:
+        next_positions = set()
+        for position in sorted(positions):
+            if width % 2 == 1 and position == width - 1:
+                # Odd tail with no companion: the tree pairs it with itself.
+                pass
+            elif (position ^ 1) in positions:
+                # The companion is itself a disclosed node; nothing to send.
+                pass
+            else:
+                required += 1
+            next_positions.add(position // 2)
+        positions = next_positions
+        width = (width + 1) // 2
+    return required
+
+
+def make_smp(
+    chain: DeltaReportBundleArchiveSealChain,
+    indices: tuple[int, ...],
+) -> tuple[bytes, SMP]:
+    """Build the root statement and a compact inclusion proof for several seals.
+
+    ``chain`` must be an existing
+    :class:`DeltaReportBundleArchiveSealChain`, with ``n ==
+    len(chain.items)`` a non-empty chain below the 64-bit counter, and
+    ``indices`` a non-empty tuple of leaf positions to prove. Every chain
+    item is a structurally legal
+    :class:`DeltaReportBundleArchiveSeal`, exactly as
+    :func:`encode_delta_report_bundle_archive_seal` requires; its
+    canonical encoding ``E_j`` is the existing single-seal transport
+    encoding. The tree uses SHA256 with leaves
+    ``H(b"ds/l1" || U64(j) || H(E_j))`` and internal nodes
+    ``H(b"ds/n1" || left || right)``; a level with an odd tail width
+    duplicates its last node for pairing. Returns ``(message, proof)``
+    where ``message`` is ``b"ds/r1" || U64(n) || root`` (the 8-byte
+    unsigned big-endian item count followed by the 32-byte root) — the
+    bytes to be threshold-signed — and ``proof`` is the :class:`SMP`
+    whose ``n`` is the chain item count and whose ``s`` takes the chain
+    items at ``indices``, one to one. Its ``p`` is collected level by
+    level from the leaves upward, left to right within a level: when a
+    companion position is itself a disclosed node carried in the proof,
+    or the node is the last member of an odd-width level (which the tree
+    pairs with itself), no companion is appended, and each remaining
+    companion digest is appended exactly once. The order and number of
+    ``p`` entries are therefore fixed uniquely by ``n`` and ``indices``.
+
+    Wrong argument types raise TypeError: a
+    non-:class:`DeltaReportBundleArchiveSealChain` argument, a non-tuple
+    ``chain.items`` field, a non-:class:`DeltaReportBundleArchiveSeal`
+    element, a non-tuple index sequence or a non-integer (including
+    boolean) index. An empty chain or index tuple, a chain length at or
+    above ``2**64``, indices that are not strictly increasing and unique,
+    or an index outside ``0 <= i < n`` raises ValueError, as does any
+    structurally illegal nested seal, exactly as its encoder would.
+    """
+    if not isinstance(chain, DeltaReportBundleArchiveSealChain):
+        raise TypeError(
+            "chain must be a DeltaReportBundleArchiveSealChain instance"
+        )
+    items = chain.items
+    if not isinstance(items, tuple):
+        raise TypeError("chain.items must be a tuple")
+    for item in items:
+        if not isinstance(item, DeltaReportBundleArchiveSeal):
+            raise TypeError(
+                "each chain item must be a DeltaReportBundleArchiveSeal instance"
+            )
+    if not isinstance(indices, tuple):
+        raise TypeError("indices must be a tuple")
+
+    count = len(items)
+    if count == 0:
+        raise ValueError("chain items must be a non-empty tuple")
+    if count > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("too many delta report bundle archive seal chain items")
+    if len(indices) == 0:
+        raise ValueError("indices must be non-empty")
+    previous = -1
+    for index in indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("each index must be an integer")
+        if index <= previous:
+            raise ValueError("indices must be strictly increasing and unique")
+        if index < 0 or index >= count:
+            raise ValueError("index out of range")
+        previous = index
+
+    # Encode every seal first — each call raises TypeError/ValueError for
+    # an illegal seal exactly as the single-seal codec does — so the
+    # leaves commit to the existing canonical encodings of all items.
+    encoded_seals = tuple(
+        encode_delta_report_bundle_archive_seal(item) for item in items
+    )
+    levels = _smp_levels(encoded_seals)
+
+    siblings: list[bytes] = []
+    positions = set(indices)
+    for level in levels[:-1]:
+        width = len(level)
+        padded = level if width % 2 == 0 else level + level[-1:]
+        next_positions = set()
+        for position in sorted(positions):
+            if width % 2 == 1 and position == width - 1:
+                # Odd tail with no companion: the tree pairs it with itself.
+                pass
+            elif (position ^ 1) in positions:
+                # The companion is itself a disclosed node; nothing to send.
+                pass
+            else:
+                siblings.append(padded[position ^ 1])
+            next_positions.add(position // 2)
+        positions = next_positions
+
+    root = levels[-1][0]
+    proof = SMP(
+        i=tuple(indices),
+        n=count,
+        s=tuple(items[index] for index in indices),
+        p=tuple(siblings),
+    )
+    return SMP_ROOT_TAG + _smp_u64(count) + root, proof
+
+
+def _validate_smp_structure(
+    proof: object,
+) -> tuple[tuple[int, ...], int, tuple[DeltaReportBundleArchiveSeal, ...], tuple[bytes, ...]]:
+    """Type- and structure-check an :class:`SMP`, returning its fields.
+
+    Only the container structure is checked: the seals are neither
+    verified nor decoded here (that is
+    :func:`verify_delta_report_bundle_archive_seal`'s job during
+    verification) and the companions are kept opaque. The bounds are
+    ``0 < n < 2**64``, a non-empty ``i``/``s`` pair of equal length with
+    strictly increasing indices in ``0 <= i < n``, structurally legal
+    seals in ``s`` exactly as
+    :func:`encode_delta_report_bundle_archive_seal` requires, and a
+    ``p`` tuple whose entries are exactly 32 bytes. Wrong field types
+    raise TypeError; illegal bounds or shapes raise ValueError. The
+    number of companions is derived uniquely from ``n`` and ``i`` (the
+    compact walk sends one companion per proven node that is neither an
+    odd tail nor paired with another proven node), so a missing or extra
+    entry raises ValueError here — before any root is rebuilt.
+    """
+    if not isinstance(proof, SMP):
+        raise TypeError("proof must be an SMP instance")
+    indices = proof.i
+    count = proof.n
+    seals = proof.s
+    siblings = proof.p
+    if not isinstance(indices, tuple):
+        raise TypeError("proof.i must be a tuple")
+    if not isinstance(count, int) or isinstance(count, bool):
+        raise TypeError("proof.n must be an integer")
+    if not isinstance(seals, tuple):
+        raise TypeError("proof.s must be a tuple")
+    if not isinstance(siblings, tuple):
+        raise TypeError("proof.p must be a tuple")
+
+    if count <= 0:
+        raise ValueError("proof.n must be positive")
+    if count > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("too many records")
+    if len(indices) == 0:
+        raise ValueError("proof.i must be non-empty")
+    if len(indices) != len(seals):
+        raise ValueError("proof.s must pair one-to-one with proof.i")
+
+    previous = -1
+    for index in indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("proof.i entries must be integers")
+        if index <= previous:
+            raise ValueError("proof.i must be strictly increasing and unique")
+        if index < 0 or index >= count:
+            raise ValueError("proof.i entry out of range")
+        previous = index
+
+    for seal in seals:
+        if not isinstance(seal, DeltaReportBundleArchiveSeal):
+            raise TypeError(
+                "proof.s entries must be DeltaReportBundleArchiveSeal instances"
+            )
+    # Every disclosed seal must carry the existing canonical encoding, so
+    # an empty archive or an illegal signature frame is a structural
+    # ValueError rather than a failed verification.
+    for seal in seals:
+        encode_delta_report_bundle_archive_seal(seal)
+
+    for sibling in siblings:
+        if not isinstance(sibling, bytes):
+            raise TypeError("proof.p entries must be bytes")
+    for sibling in siblings:
+        if len(sibling) != SMP_DIGEST_SIZE:
+            raise ValueError("proof.p entries must be exactly 32 bytes")
+    required_siblings = _required_smp_siblings(count, indices)
+    if len(siblings) != required_siblings:
+        raise ValueError("proof.p count is not the one determined by n and i")
+    return indices, count, seals, siblings
+
+
+def check_smp(
+    proof: SMP,
+    signature: AggregateSignature,
+    key: SigningDKGResult,
+) -> bool:
+    """Rebuild an SMP's Merkle root and verify its seals and root signature.
+
+    Every disclosed seal's leaf digest is recomputed from its position
+    and the existing canonical encoding ``E`` of its seal exactly as in
+    :func:`make_smp`. The root is rebuilt level by level while consuming
+    ``proof.p`` in order — levels from the leaves upward, entries left to
+    right within a level: the current level holds the digests of the
+    proven nodes at their current positions, paired left to right; when
+    a companion is itself a current-level node its digest is used
+    directly, when the node is the last member of an odd-width level it
+    is paired with itself, and otherwise the next 32-byte entry of ``p``
+    is consumed. The current width contracts as ``(width + 1) // 2``.
+    Every disclosed seal is then re-checked with
+    :func:`verify_delta_report_bundle_archive_seal` against ``key`` (in
+    index order, so each sealed archive's bundles must themselves
+    verify), and the statement ``b"ds/r1" || U64(n) || root`` is checked
+    as ``signature``'s threshold Schnorr message via
+    :func:`verify_signature`. Returns ``True`` only when the rebuild
+    consumes every companion exactly and reaches the single signed root,
+    every seal verifies under ``key``, and the signature verifies; a
+    well-formed proof whose seals, indices, companions, root or
+    signature was tampered with — seals swapped or altered, a missing,
+    extra or misplaced companion — or which is presented under another
+    key, returns ``False``.
+
+    A non-:class:`SMP` or non-:class:`AggregateSignature` argument or any
+    wrong field type (non-tuple ``i``/``s``/``p``, a non-integer ``n`` or
+    index including booleans, a non-:class:`DeltaReportBundleArchiveSeal`
+    seal or a non-bytes companion) raises TypeError; a non-positive or
+    over-64-bit ``n``, empty indices, an index out of range or not
+    strictly increasing, an ``s`` tuple that does not pair one-to-one
+    with the indices, a structurally illegal seal, an illegal signature
+    or key structure, a companion that is not exactly 32 bytes, or too
+    few or too many companions for the indicated positions raises
+    ValueError, exactly as
+    :func:`verify_delta_report_bundle_archive_seal` and
+    :func:`verify_signature` would.
+    """
+    indices, count, seals, siblings = _validate_smp_structure(proof)
+    if not isinstance(signature, AggregateSignature):
+        raise TypeError("signature must be an AggregateSignature instance")
+
+    # Check the root signature and the key before any leaf is rebuilt, so
+    # a bad seal can never mask an illegal signature or key.
+    _check_history_proof_bundle_signature(signature)
+    _result, public_key, field_prime, group_prime, generator = _check_signing_setup(key)
+    _check_signing_dkg_structure(key)
+
+    nodes = {
+        index: _smp_leaf(
+            index, encode_delta_report_bundle_archive_seal(seal)
+        )
+        for index, seal in zip(indices, seals)
+    }
+    pending = iter(siblings)
+    width = count
+    while width > 1:
+        next_nodes = {}
+        for position in sorted(nodes):
+            parent = position // 2
+            if parent in next_nodes:
+                continue
+            if width % 2 == 1 and position == width - 1:
+                # Odd tail with no companion: pair the node with itself.
+                next_nodes[parent] = _smp_node(nodes[position], nodes[position])
+            elif (position ^ 1) in nodes:
+                left = position if position % 2 == 0 else position ^ 1
+                next_nodes[parent] = _smp_node(nodes[left], nodes[left ^ 1])
+            else:
+                try:
+                    sibling = next(pending)
+                except StopIteration:
+                    raise ValueError("proof.p is missing entries") from None
+                if position % 2 == 0:
+                    next_nodes[parent] = _smp_node(nodes[position], sibling)
+                else:
+                    next_nodes[parent] = _smp_node(sibling, nodes[position])
+        nodes = next_nodes
+        width = (width + 1) // 2
+
+    try:
+        next(pending)
+    except StopIteration:
+        pass
+    else:
+        raise ValueError("proof.p has extra entries")
+
+    signed_message = SMP_ROOT_TAG + _smp_u64(count) + nodes[0]
+    if not all(
+        verify_delta_report_bundle_archive_seal(seal, key) for seal in seals
+    ):
+        return False
+    return verify_signature(
+        signed_message,
+        signature,
+        public_key,
+        group_prime=group_prime,
+        generator=generator,
+        prime=field_prime,
+    )
 
 
 # ---------------------------------------------------------------------------
