@@ -749,6 +749,32 @@ assert restored == delta
 `TypeError`，空 `segments`、重复或越界切点、空段及接缝不一致抛
 `ValueError`。
 
+多个连续段还可作为一个自定界对象整体归档或跨实现传输：
+
+```python
+from thresholdsign import (
+    decode_delta_chain_segments,
+    encode_delta_chain_segments,
+)
+
+blob = encode_delta_chain_segments(segments)          # segments 为分段元组
+restored = decode_delta_chain_segments(blob)          # 按原序恢复分段元组
+assert restored == segments
+chain = join_delta_chain_segments(restored)           # 段序与接缝仍由拼接入口判定
+```
+
+编码依次为标签 `b"thresholdsign/delta-chain-segments/v1"`、U32 段数，随后
+按输入顺序写每段的 U32 字节长度与原始帧体；所有 U32 均为 4 字节无符号
+大端，段数为零非法，帧体须为
+`encode_audit_extension_delta_checkpoint_chain` 的现有增量链规范编码。解码
+逐帧调用 `decode_audit_extension_delta_checkpoint_chain` 还原，成功后重编码
+须逐字节等于输入，段按原序恢复、不排序，不验签、不检查接缝、不保存状态；
+各段自身合法但彼此不连续照样正常返回，段序与接缝留给
+`join_delta_chain_segments` 判定。入参非元组或元素非
+`AuditExtensionDeltaCheckpointChain`、嵌套字段类型错误抛 `TypeError`；空集合、
+坏标签、零长或超长帧、计数错、截断、尾随或非规范嵌套编码抛 `ValueError`；
+既有全部接口行为不变。
+
 
 ## 命令行演示
 
@@ -1510,6 +1536,19 @@ python3 -m thresholdsign
   签名错配、叶/摘要被篡改、相邻缺口/重叠或换密钥核验返回 `False`。结构错误
   （非本类入参、字段类型错误、空批、摘要非 32 字节、签名数不符、嵌套非法）
   照样抛 `TypeError`/`ValueError`；无状态
+- `encode_delta_chain_segments(segments) -> bytes` — 仅接受
+  `AuditExtensionDeltaCheckpointChain` 分段的非空元组，输出自定界集合编码：
+  标签 `b"thresholdsign/delta-chain-segments/v1"`、U32 段数，随后按输入顺序
+  为每段写 U32 字节长度与现有增量链规范帧体；U32 均为 4 字节无符号大端，
+  不排序、不检查接缝、不验签、不保存状态。入参非元组或元素非增量链、嵌套
+  字段类型错误抛 `TypeError`；空集合、计数或帧超长及嵌套结构错误抛
+  `ValueError`
+- `decode_delta_chain_segments(blob: bytes) -> tuple[AuditExtensionDeltaCheckpointChain, ...]`
+  — 按原序恢复分段元组：逐帧调用
+  `decode_audit_extension_delta_checkpoint_chain`，成功后重编码须逐字节等于
+  输入；不排序、不检查接缝、不验签、不保存状态，段序与接缝由
+  `join_delta_chain_segments` 判定。入参非 `bytes` 抛 `TypeError`；坏标签、
+  零段数、零长/超长帧、计数错、截断、尾随或非规范嵌套编码抛 `ValueError`
 
 ### 门限 Schnorr 群参数与边界
 

@@ -79,7 +79,10 @@ splicing concatenate_audit_extension_delta_checkpoint_chains for
 segmented transport and archive reassembly, and the multi-cut batch
 form of the same pair partition_delta_chain / join_delta_chain_segments
 for splitting a long chain into several consecutive hop segments at
-once and folding an ordered tuple of segments back into one chain.
+once and folding an ordered tuple of segments back into one chain, and
+the self-delimiting segment-set transport encoding
+encode_delta_chain_segments / decode_delta_chain_segments for archiving
+or transferring several consecutive segments as one ordered object.
 """
 
 from __future__ import annotations
@@ -231,6 +234,8 @@ __all__ = [
     "encode_audit_extension_delta_checkpoint_chain",
     "decode_audit_extension_delta_checkpoint_chain",
     "verify_audit_extension_delta_checkpoint_chain",
+    "encode_delta_chain_segments",
+    "decode_delta_chain_segments",
 ]
 
 # Mersenne prime 2**127 - 1: large enough for integer secrets, small enough that
@@ -7734,6 +7739,137 @@ def verify_audit_extension_delta_checkpoint_chain(
     """
     expanded = expand_audit_extension_delta_checkpoint_chain(chain)
     return verify_audit_extension_checkpoint_chain(expanded, key)
+
+
+# ---------------------------------------------------------------------------
+# Canonical delta-chain segment-set transport: a self-delimiting envelope
+# around one or more whole AuditExtensionDeltaCheckpointChain frames so that
+# several consecutive segments can be archived or cross-implementation
+# transferred as a single object. Like the single-chain codec this restores
+# structure only — no signature is checked, seams are not inspected and no
+# state is kept — and join_delta_chain_segments remains the sole place that
+# judges order continuity and the seams between neighbours.
+# ---------------------------------------------------------------------------
+
+DELTA_CHAIN_SEGMENTS_WIRE_TAG = b"thresholdsign/delta-chain-segments/v1"
+
+
+def encode_delta_chain_segments(
+    segments: tuple[AuditExtensionDeltaCheckpointChain, ...],
+) -> bytes:
+    """Canonically encode a non-empty ordered tuple of delta chain
+    segments as one self-delimiting object for archiving or transport.
+
+    The encoding is, in order, the tag
+    ``b"thresholdsign/delta-chain-segments/v1"``, the 4-byte unsigned
+    big-endian segment count (never zero), then one frame per segment in
+    tuple order — each the 4-byte unsigned big-endian byte length
+    followed by the exact bytes of
+    :func:`encode_audit_extension_delta_checkpoint_chain` for that
+    segment, with no further separators.
+
+    Only the tuple container and the structural legality of each
+    segment (via its own canonical encoder) are checked — the segments
+    are not sorted, no seam between neighbours is inspected and no
+    signature is checked: :func:`join_delta_chain_segments` stays the
+    way to judge order continuity and the seams, and
+    :func:`verify_audit_extension_delta_checkpoint_chain` the way to
+    verify the joined result afterwards. A non-tuple ``segments``
+    argument or a non-:class:`AuditExtensionDeltaCheckpointChain`
+    element raises TypeError, as does any wrong field or element type
+    inside a segment, exactly as
+    :func:`encode_audit_extension_delta_checkpoint_chain` does. An empty
+    tuple, an over-long count or frame, or any structural error a
+    segment or its nested proofs or signatures would raise on its own
+    raises ValueError. The output for a given tuple is unique and the
+    encoding carries no network, storage or hidden state.
+    """
+    if not isinstance(segments, tuple):
+        raise TypeError("segments must be a tuple")
+    for segment in segments:
+        if not isinstance(segment, AuditExtensionDeltaCheckpointChain):
+            raise TypeError(
+                "each segment must be an "
+                "AuditExtensionDeltaCheckpointChain instance"
+            )
+    segment_count = len(segments)
+    if segment_count == 0:
+        raise ValueError("segments must be a non-empty tuple")
+    if segment_count > 0xFFFFFFFF:
+        raise ValueError("too many delta chain segments")
+
+    frames = []
+    for index, segment in enumerate(segments):
+        frame = encode_audit_extension_delta_checkpoint_chain(segment)
+        if len(frame) > 0xFFFFFFFF:
+            raise ValueError(f"delta chain segment {index + 1} too long")
+        frames.append(frame)
+
+    buffer = bytearray(DELTA_CHAIN_SEGMENTS_WIRE_TAG)
+    buffer += segment_count.to_bytes(4, "big", signed=False)
+    for frame in frames:
+        buffer += len(frame).to_bytes(4, "big", signed=False)
+        buffer += frame
+    return bytes(buffer)
+
+
+def decode_delta_chain_segments(
+    blob: bytes,
+) -> tuple[AuditExtensionDeltaCheckpointChain, ...]:
+    """Decode the canonical segment set produced by
+    :func:`encode_delta_chain_segments`.
+
+    Accepts only the single canonical form: the tag
+    ``b"thresholdsign/delta-chain-segments/v1"``, a 4-byte unsigned
+    big-endian non-zero segment count, then exactly that many frames,
+    each a 4-byte unsigned big-endian non-zero byte length followed by
+    the exact canonical encoding of one
+    :class:`AuditExtensionDeltaCheckpointChain` accepted by
+    :func:`decode_audit_extension_delta_checkpoint_chain`. The segments
+    are restored in their original order as a tuple; they are not
+    sorted, no seam between neighbours is checked and no signature is
+    verified — :func:`join_delta_chain_segments` judges order and seams
+    afterwards. A non-bytes argument raises TypeError; a wrong or
+    missing tag, a zero segment count, a zero or over-long frame length,
+    a count mismatch, truncation, trailing bytes, or a frame whose
+    nested chain encoding is illegal or non-canonical (including a
+    frame that would not re-encode byte for byte) raises ValueError. A
+    successfully decoded tuple re-encodes to exactly the input bytes.
+
+    Decoding only restores structure: a set of individually legal but
+    mutually incompatible segments is returned normally, and
+    :func:`join_delta_chain_segments` reports the mismatch.
+    """
+    if not isinstance(blob, bytes):
+        raise TypeError("blob must be bytes")
+    if not blob.startswith(DELTA_CHAIN_SEGMENTS_WIRE_TAG):
+        raise ValueError("bad delta chain segments tag")
+    offset = len(DELTA_CHAIN_SEGMENTS_WIRE_TAG)
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated delta chain segments count")
+    segment_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    if segment_count == 0:
+        raise ValueError("delta chain segments must be non-empty")
+
+    segments = []
+    for index in range(segment_count):
+        frame, offset = _read_audit_proof_block(
+            blob,
+            offset,
+            what=f"delta chain segment {index + 1}",
+        )
+        segments.append(
+            decode_audit_extension_delta_checkpoint_chain(frame)
+        )
+    if offset != len(blob):
+        raise ValueError("trailing bytes after delta chain segments")
+
+    segments_tuple = tuple(segments)
+    if encode_delta_chain_segments(segments_tuple) != blob:
+        raise ValueError("non-canonical delta chain segments encoding")
+    return segments_tuple
 
 
 # ---------------------------------------------------------------------------
