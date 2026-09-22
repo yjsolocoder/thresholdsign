@@ -104,7 +104,12 @@ whole-archive threshold-Schnorr seal DeltaReportBundleArchiveSeal /
 archive_seal_message, with its transport encoding
 encode_delta_report_bundle_archive_seal /
 decode_delta_report_bundle_archive_seal and key-bound verifier
-verify_delta_report_bundle_archive_seal.
+verify_delta_report_bundle_archive_seal, and the non-empty
+order-preserving chain DeltaReportBundleArchiveSealChain of such seals,
+whose outer signature binds drasc_message over the existing canonical
+seal encodings and the verifying public key, with the key-bound
+verifier verify_dc that re-checks every seal before the outer
+signature.
 """
 
 from __future__ import annotations
@@ -279,6 +284,9 @@ __all__ = [
     "encode_delta_report_bundle_archive_seal",
     "decode_delta_report_bundle_archive_seal",
     "verify_delta_report_bundle_archive_seal",
+    "DeltaReportBundleArchiveSealChain",
+    "drasc_message",
+    "verify_dc",
 ]
 
 # Mersenne prime 2**127 - 1: large enough for integer secrets, small enough that
@@ -9181,6 +9189,179 @@ def verify_delta_report_bundle_archive_seal(
     return verify_signature(
         message,
         seal.signature,
+        public_key,
+        group_prime=group_prime,
+        generator=generator,
+        prime=field_prime,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Chains of sealed archives: a non-empty, order-preserving batch of whole
+# DeltaReportBundleArchiveSeal values authenticated by one more threshold
+# Schnorr signature. The outer signature binds the digest of a canonical
+# framing C over the existing per-seal transport encodings and the verifying
+# public key, so deleting, inserting, reordering or substituting a seal — or
+# presenting the chain under another key — invalidates it. The chain carries
+# no state of its own: every seal (and, through it, every bundle) is re-checked
+# on verification before the outer signature is examined.
+# ---------------------------------------------------------------------------
+
+DELTA_REPORT_BUNDLE_ARCHIVE_SEAL_CHAIN_TAG = b"dc/m1"
+
+
+@dataclass(frozen=True)
+class DeltaReportBundleArchiveSealChain:
+    """A non-empty ordered chain of sealed archives with one outer signature.
+
+    The fields, in order, are ``items`` — a non-empty tuple of
+    :class:`DeltaReportBundleArchiveSeal` values in chain order — and
+    ``signature`` — the threshold Schnorr :class:`AggregateSignature` on
+    :func:`drasc_message` of the items and the verifying public key. The
+    dataclass is frozen, positionally constructible and compared by
+    value; the items keep their order and the chain carries no network,
+    storage or hidden state. Neither field is checked at construction
+    time — :func:`drasc_message` requires structurally legal items and
+    :func:`verify_dc` is the way to test a chain against a key
+    afterwards.
+    """
+
+    items: tuple[DeltaReportBundleArchiveSeal, ...]
+    signature: AggregateSignature
+
+
+def drasc_message(
+    items: tuple[DeltaReportBundleArchiveSeal, ...], public_key: int
+) -> bytes:
+    """Encode the canonical message the threshold key signs for a seal chain.
+
+    The message is, in order, the tag ``b"dc/m1"``, the 32-byte
+    ``SHA256`` digest of the canonical framing ``C`` and
+    ``VARINT(public_key)`` — a 4-byte unsigned big-endian length followed
+    by the shortest unsigned big-endian value (zero is the single byte
+    ``00``, positive values carry no leading zero). ``C`` is, in order,
+    the 4-byte unsigned big-endian item count followed by, for every
+    seal in tuple order, the 4-byte unsigned big-endian byte length and
+    the exact bytes ``E`` of
+    :func:`encode_delta_report_bundle_archive_seal` for that seal; every
+    U32 is a 4-byte unsigned big-endian integer and ``E`` is the existing
+    canonical encoding of the archive seal. The message carries no
+    signature and keeps no state.
+
+    ``items`` must be a non-empty tuple of structurally legal
+    :class:`DeltaReportBundleArchiveSeal` values exactly as
+    :func:`encode_delta_report_bundle_archive_seal` requires and
+    ``public_key`` a non-boolean non-negative integer. Wrong field or
+    nested field types raise TypeError; an empty items tuple, an
+    illegal nested seal, a negative public key or an over-long encoding
+    raises ValueError.
+    """
+    if not isinstance(items, tuple):
+        raise TypeError("items must be a tuple")
+    for item in items:
+        if not isinstance(item, DeltaReportBundleArchiveSeal):
+            raise TypeError(
+                "each chain item must be a "
+                "DeltaReportBundleArchiveSeal instance"
+            )
+    if not isinstance(public_key, int) or isinstance(public_key, bool):
+        raise TypeError("public_key must be an integer")
+
+    item_count = len(items)
+    if item_count == 0:
+        raise ValueError("chain items must be a non-empty tuple")
+    if item_count > 0xFFFFFFFF:
+        raise ValueError("too many delta report bundle archive seal chain items")
+
+    # Encode every seal first — each call raises TypeError/ValueError
+    # for an illegal seal exactly as the single-seal codec does — and
+    # only then frame the results, so a single illegal item aborts the
+    # whole message.
+    frames = []
+    for index, item in enumerate(items):
+        encoded = encode_delta_report_bundle_archive_seal(item)
+        if len(encoded) > 0xFFFFFFFF:
+            raise ValueError(
+                f"delta report bundle archive seal chain item {index + 1} "
+                "encoding too long"
+            )
+        frames.append(encoded)
+
+    framing = bytearray(item_count.to_bytes(4, "big", signed=False))
+    for encoded in frames:
+        framing += len(encoded).to_bytes(4, "big", signed=False)
+        framing += encoded
+    return (
+        DELTA_REPORT_BUNDLE_ARCHIVE_SEAL_CHAIN_TAG
+        + hashlib.sha256(bytes(framing)).digest()
+        + _encode_varint(public_key)
+    )
+
+
+def verify_dc(
+    chain: DeltaReportBundleArchiveSealChain, key: SigningDKGResult
+) -> bool:
+    """Verify a chain of sealed archives against the threshold key.
+
+    ``chain`` must be a structurally legal
+    :class:`DeltaReportBundleArchiveSealChain` and ``key`` a legal
+    :class:`SigningDKGResult`. The outer signature and the key
+    structure are checked first, as is the structure of every item, so
+    an illegal outer signature or key is never masked by a bad nested
+    archive: a non-:class:`DeltaReportBundleArchiveSealChain` argument,
+    a non-tuple ``items`` field, a
+    non-:class:`DeltaReportBundleArchiveSeal` element or a
+    non-:class:`SigningDKGResult` ``key`` raises TypeError, and an empty
+    items tuple, an illegal outer signature structure, an illegal key
+    structure or any structurally illegal nested seal raises
+    ValueError.
+
+    Every seal is then passed to
+    :func:`verify_delta_report_bundle_archive_seal` in chain order, so
+    its archive bundles and its own seal signature must all verify
+    under ``key``; the canonical :func:`drasc_message` of the items and
+    ``key.public_key`` is finally checked as the outer signature's
+    threshold Schnorr message via :func:`verify_signature` with the
+    key's group parameters. Returns ``True`` only when every per-seal
+    check and the outer signature check pass; a structurally legal
+    chain whose nested archive, per-seal signature or outer signature
+    does not match — including deleting, inserting, reordering or
+    substituting a seal, or presenting the chain under another key —
+    returns ``False`` rather than raising. The function is stateless.
+    """
+    if not isinstance(chain, DeltaReportBundleArchiveSealChain):
+        raise TypeError(
+            "chain must be a DeltaReportBundleArchiveSealChain instance"
+        )
+    items = chain.items
+    if not isinstance(items, tuple):
+        raise TypeError("items must be a tuple")
+    for item in items:
+        if not isinstance(item, DeltaReportBundleArchiveSeal):
+            raise TypeError(
+                "each chain item must be a "
+                "DeltaReportBundleArchiveSeal instance"
+            )
+    # Check the outer signature and the key before any nested archive is
+    # examined, so a bad archive can never mask an illegal outer
+    # signature or key; structurally validate every nested seal too,
+    # exactly as the single-seal verifier validates its archive.
+    _check_history_proof_bundle_signature(chain.signature)
+    _result, public_key, field_prime, group_prime, generator = _check_signing_setup(key)
+    _check_signing_dkg_structure(key)
+    if len(items) == 0:
+        raise ValueError("chain items must be a non-empty tuple")
+    for item in items:
+        encode_delta_report_bundle_archive_seal(item)
+
+    if not all(
+        verify_delta_report_bundle_archive_seal(item, key) for item in items
+    ):
+        return False
+    message = drasc_message(items, public_key)
+    return verify_signature(
+        message,
+        chain.signature,
         public_key,
         group_prime=group_prime,
         generator=generator,

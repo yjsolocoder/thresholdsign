@@ -887,6 +887,51 @@ assert verify_delta_report_bundle_archive_seal(restored, key)  # 归档核验且
 密钥均返回 `False`；增删、重排、替换由验证返回 `False` 而非抛错。既有全部
 接口行为不变。
 
+多个归档封印还可按原序组成一个非空、保序的链，再由一个门限 Schnorr 签名
+整体认证：
+
+```python
+from thresholdsign import (
+    DeltaReportBundleArchiveSealChain,
+    drasc_message,
+    verify_dc,
+)
+
+# items 为非空保序的 DeltaReportBundleArchiveSeal 元组
+message = drasc_message(items, key.public_key)
+outer_signature = sign_threshold(key, message)   # 门限 quorum 两轮签署该 message
+chain = DeltaReportBundleArchiveSealChain(items, outer_signature)
+assert verify_dc(chain, key)                      # 逐项复核封印，再验外层签名
+```
+
+`DeltaReportBundleArchiveSealChain` 是冻结、可按位置构造、按值相等的数据类，
+字段依次为 `items: tuple[DeltaReportBundleArchiveSeal, ...]`（非空且保序）与
+`signature: AggregateSignature`，均无默认，不含网络、存储或隐藏状态，构造时
+不校验。链消息 `drasc_message(items, public_key) -> bytes` 为
+
+```text
+b"dc/m1" || SHA256(C) || V(public_key)
+C = U32(len(items)) || Σ_i ( U32(len(E_i)) || E_i )
+```
+
+其中 `U32` 为 4 字节无符号大端，`E_i` 为第 `i` 项归档封印的既有规范编码
+`encode_delta_report_bundle_archive_seal`，`V` 为 4 字节无符号大端长度加最短
+无符号大端值（零为单字节 `00`，正值无前导零）；消息绑定全部封印字节的摘要
+与验证公钥，故增删、重排或替换任一封印以及换用另一把密钥呈现，外层签名均
+失效。旧接口行为不变。
+
+`verify_dc(chain, key: SigningDKGResult) -> bool` 先查外层签名与 `key` 的结构
+（以及每项封印的结构），因此坏归档不会掩盖非法的外层签名或密钥；随后按链序
+对每个封印调用 `verify_delta_report_bundle_archive_seal`（封印内每个包及封印
+自身签名都须核验通过），再用 `key` 的群参数对
+`drasc_message(chain.items, key.public_key)` 验证外层签名。全部为真才返回
+`True`，结构合法但任一封印不匹配、外层签名被篡改、密封另一组封印或另一把
+密钥均返回 `False`；增删、重排、替换由验证返回 `False` 而非抛错。非
+`DeltaReportBundleArchiveSealChain` 入参、`items` 非元组、元素非
+`DeltaReportBundleArchiveSeal`、`key` 非 `SigningDKGResult` 或嵌套字段类型
+错误抛 `TypeError`；空链、外层签名结构非法、密钥结构非法或嵌套封印结构非法
+抛 `ValueError`。链不含传输编码，也不引入任何网络、存储或隐藏状态。
+
 
 ## 命令行演示
 
@@ -1741,6 +1786,29 @@ python3 -m thresholdsign
   把密钥（含增删、重排、替换任一包）返回 `False`。非
   `DeltaReportBundleArchiveSeal` 入参、字段类型错误或 `key` 类型错误抛
   `TypeError`，空归档、嵌套结构非法或签名结构非法抛 `ValueError`
+- `DeltaReportBundleArchiveSealChain(items, signature)` — 冻结数据类，字段依次
+  为非空保序的 `items: tuple[DeltaReportBundleArchiveSeal, ...]` 与
+  `signature: AggregateSignature`（对
+  `drasc_message(items, public_key)` 的门限 Schnorr 聚合签名），两字段均无
+  默认；可按位置构造、按值相等，不含网络、存储或隐藏状态，构造时不校验字段
+  类型与非空约束
+- `drasc_message(items, public_key) -> bytes` — 生成由门限密钥签署、绑定全部
+  封印与验证公钥的规范消息（作为 `SigningRound.message`）：记各项既有封印
+  规范编码为 `E_i = encode_delta_report_bundle_archive_seal(items[i])`，依次为
+  标签 `b"dc/m1"`、`SHA256(C)`（32 字节）及 `V(public_key)`，其中
+  `C = U32(len(items)) || Σ_i (U32(len(E_i)) || E_i)`，`U32` 为 4 字节无符号
+  大端，`V` 为 U32 长度加最短无符号大端值（零为单字节 `00`）；消息不含签名。
+  `items` 非元组或元素非 `DeltaReportBundleArchiveSeal`、公钥非整数（含布尔）
+  抛 `TypeError`；空链、嵌套封印结构非法、公钥为负或编码超长抛 `ValueError`
+- `verify_dc(chain, key) -> bool` — 先查外层签名与 `key` 的结构（并逐项查封印
+  结构），坏归档不掩盖非法签名或密钥；再按链序逐项调用
+  `verify_delta_report_bundle_archive_seal`，最后用 `key` 的群参数对
+  `drasc_message(chain.items, key.public_key)` 验证外层签名；全部为真才返回
+  `True`，结构合法但任一封印不匹配、外层签名被篡改、密封另一组封印或另一把
+  密钥（含增删、重排、替换任一封印）返回 `False`。非
+  `DeltaReportBundleArchiveSealChain` 入参、`items` 非元组、元素非
+  `DeltaReportBundleArchiveSeal` 或 `key` 类型错误抛 `TypeError`；空链、嵌套
+  封印结构非法、外层签名或密钥结构非法抛 `ValueError`；无状态
 
 ### 门限 Schnorr 群参数与边界
 
