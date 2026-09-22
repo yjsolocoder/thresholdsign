@@ -87,7 +87,11 @@ the stateless whole-set verifier verify_delta_chain_segments for
 confirming every segment's signatures and every seam between neighbours
 in one call, and its stateless failure diagnoser DeltaDiagnosis /
 diagnose_delta_chain_segments that locates the first failing segment,
-hop or seam in input order without guessing at the cryptographic cause.
+hop or seam in input order without guessing at the cryptographic cause,
+and the frozen DeltaReport / dr_message that binds a diagnosis, the
+canonical segment-set encoding and a verifying public key into one
+threshold-Schnorr-signed message, with its transport encoding
+encode_dr / decode_dr and key-bound verifier verify_dr.
 """
 
 from __future__ import annotations
@@ -244,6 +248,11 @@ __all__ = [
     "verify_delta_chain_segments",
     "DeltaDiagnosis",
     "diagnose_delta_chain_segments",
+    "DeltaReport",
+    "dr_message",
+    "encode_dr",
+    "decode_dr",
+    "verify_dr",
 ]
 
 # Mersenne prime 2**127 - 1: large enough for integer secrets, small enough that
@@ -8097,6 +8106,401 @@ def diagnose_delta_chain_segments(
                 return DeltaDiagnosis(False, "sig", index, None)
 
     return DeltaDiagnosis(True, "ok", None, None)
+
+
+# ---------------------------------------------------------------------------
+# Frozen delta reports: a threshold Schnorr AggregateSignature over a
+# canonical message that binds a DeltaDiagnosis, the SHA256 digest of the
+# exact canonical encoding of the diagnosed segment set and the verifying
+# public key. DeltaReport is a plain value with no network, storage or
+# hidden state; dr_message builds the signed message, encode_dr / decode_dr
+# move it over the wire, and verify_dr recomputes the diagnosis and checks
+# the signature.
+# ---------------------------------------------------------------------------
+
+DELTA_REPORT_TAG = b"ts/dr/v1"
+DELTA_REPORT_WIRE_TAG = b"ts/dr/w1"
+
+# Fixed-width big-endian encoding of a DeltaDiagnosis: the verdict first
+# (ok -> 1, failure -> 0), then the kind (ok, segment, leaf, sig, proof),
+# then the two zero-based indices, each as an unsigned 64-bit big-endian
+# integer; an absent index (None) is the all-ones sentinel 2**64 - 1.
+_DELTA_REPORT_OK = (0, 1)
+_DELTA_REPORT_KINDS = ("ok", "segment", "leaf", "sig", "proof")
+_DELTA_REPORT_ABSENT = (1 << 64) - 1
+
+
+@dataclass(frozen=True)
+class DeltaReport:
+    """A delta-chain segment diagnosis sealed by one threshold signature.
+
+    ``diagnosis`` is the sealed :class:`DeltaDiagnosis`, ``public_key``
+    the verifying public key the report is presented under and
+    ``signature`` the threshold Schnorr :class:`AggregateSignature` on
+    :func:`dr_message` of the diagnosed segment set, the diagnosis and
+    the public key. The dataclass is frozen, positionally constructible
+    and compared by value; it carries no network, storage or hidden
+    state. Neither field is checked at construction time —
+    :func:`encode_dr` requires structural legality and
+    :func:`verify_dr` is the way to test a report against a segment set
+    afterwards.
+    """
+
+    diagnosis: DeltaDiagnosis
+    public_key: int
+    signature: AggregateSignature
+
+
+def _encode_delta_diagnosis(diagnosis: DeltaDiagnosis) -> bytes:
+    """Encode a DeltaDiagnosis as four unsigned big-endian 64-bit integers.
+
+    In order: the verdict (``1`` for ``ok=True``, ``0`` otherwise), the
+    kind index (``"ok"``, ``"segment"``, ``"leaf"``, ``"sig"``,
+    ``"proof"`` -> ``0``..``4``), the zero-based segment index and the
+    zero-based proof index; an absent index (``None``) is the all-ones
+    sentinel ``2**64 - 1``.
+    """
+    if not isinstance(diagnosis, DeltaDiagnosis):
+        raise TypeError("diagnosis must be a DeltaDiagnosis instance")
+    if not isinstance(diagnosis.ok, bool):
+        raise TypeError("diagnosis.ok must be a boolean")
+    if not isinstance(diagnosis.kind, str):
+        raise TypeError("diagnosis.kind must be a string")
+    if diagnosis.kind not in _DELTA_REPORT_KINDS:
+        raise ValueError("diagnosis.kind must be one of ok, segment, leaf, sig, proof")
+    kind_code = _DELTA_REPORT_KINDS.index(diagnosis.kind)
+
+    fields = []
+    for name, value in (
+        ("segment", diagnosis.segment),
+        ("proof", diagnosis.proof),
+    ):
+        if value is None:
+            fields.append(_DELTA_REPORT_ABSENT)
+        else:
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"diagnosis.{name} must be an integer or None")
+            if not 0 <= value < _DELTA_REPORT_ABSENT:
+                raise ValueError(
+                    f"diagnosis.{name} must fit in an unsigned 64-bit integer"
+                )
+            fields.append(value)
+    segment_code, proof_code = fields
+
+    # The kind fixes which slots must be empty: "ok" carries neither
+    # index, "leaf" and "sig" carry only the segment index, and
+    # "segment" and "proof" carry both.
+    if diagnosis.kind == "ok":
+        expected_ok = True
+        expected_present = (False, False)
+    elif diagnosis.kind in ("leaf", "sig"):
+        expected_ok = False
+        expected_present = (True, False)
+    else:
+        expected_ok = False
+        expected_present = (True, True)
+    if diagnosis.ok is not expected_ok:
+        raise ValueError(
+            f"diagnosis kind {diagnosis.kind!r} requires ok={expected_ok}"
+        )
+    if (diagnosis.segment is not None) is not expected_present[0]:
+        raise ValueError(
+            f"diagnosis kind {diagnosis.kind!r} fixes the segment slot"
+        )
+    if (diagnosis.proof is not None) is not expected_present[1]:
+        raise ValueError(
+            f"diagnosis kind {diagnosis.kind!r} fixes the proof slot"
+        )
+
+    return b"".join(
+        value.to_bytes(8, "big", signed=False)
+        for value in (
+            _DELTA_REPORT_OK[diagnosis.ok],
+            kind_code,
+            segment_code,
+            proof_code,
+        )
+    )
+
+
+def _decode_delta_diagnosis(blob: bytes) -> DeltaDiagnosis:
+    """Invert :func:`_encode_delta_diagnosis` on exactly 32 canonical bytes."""
+    if len(blob) != 32:
+        raise ValueError("delta diagnosis must be exactly 32 bytes")
+    ok_code = int.from_bytes(blob[0:8], "big")
+    kind_code = int.from_bytes(blob[8:16], "big")
+    segment_code = int.from_bytes(blob[16:24], "big")
+    proof_code = int.from_bytes(blob[24:32], "big")
+    if ok_code not in _DELTA_REPORT_OK:
+        raise ValueError("bad delta diagnosis verdict")
+    if kind_code >= len(_DELTA_REPORT_KINDS):
+        raise ValueError("bad delta diagnosis kind")
+    kind = _DELTA_REPORT_KINDS[kind_code]
+    ok = ok_code == 1
+
+    segment = None if segment_code == _DELTA_REPORT_ABSENT else segment_code
+    proof = None if proof_code == _DELTA_REPORT_ABSENT else proof_code
+
+    if kind == "ok":
+        expected = (True, False, False)
+    elif kind in ("leaf", "sig"):
+        expected = (False, True, False)
+    else:
+        expected = (False, True, True)
+    expected_ok, segment_present, proof_present = expected
+    if ok is not expected_ok:
+        raise ValueError("delta diagnosis verdict/kind mismatch")
+    if (segment is not None) is not segment_present:
+        raise ValueError("delta diagnosis segment slot mismatch")
+    if (proof is not None) is not proof_present:
+        raise ValueError("delta diagnosis proof slot mismatch")
+
+    return DeltaDiagnosis(ok, kind, segment, proof)
+
+
+def dr_message(
+    segments: tuple[AuditExtensionDeltaCheckpointChain, ...],
+    diagnosis: DeltaDiagnosis,
+    public_key: int,
+) -> bytes:
+    """Encode the canonical message the threshold key signs for a delta report.
+
+    The message is, in order, the tag ``b"ts/dr/v1"``, the 32-byte
+    ``SHA256`` digest of :func:`encode_delta_chain_segments` output ``S``
+    for ``segments``, ``VARINT(public_key)`` and the fixed-width
+    diagnosis block ``D`` — four unsigned big-endian 64-bit integers:
+    the verdict (``ok`` -> ``1``, failure -> ``0``), the kind index
+    (``"ok"``, ``"segment"``, ``"leaf"``, ``"sig"``, ``"proof"`` ->
+    ``0``..``4``), the segment index and the proof index, with an absent
+    index encoded as the all-ones sentinel ``2**64 - 1``. ``VARINT`` is
+    the same 4-byte unsigned big-endian length followed by the shortest
+    unsigned big-endian value used throughout the canonical transport
+    encodings (zero is the single body byte ``00``). The message carries
+    no signature and keeps no state.
+
+    ``segments`` must be a non-empty tuple of
+    :class:`AuditExtensionDeltaCheckpointChain` values exactly as
+    :func:`encode_delta_chain_segments` requires, ``diagnosis`` a
+    structurally legal :class:`DeltaDiagnosis` whose kind agrees with its
+    verdict and index slots, and ``public_key`` a non-boolean
+    non-negative integer. Wrong field types raise TypeError; an empty
+    segment tuple, an illegal segment or diagnosis, a negative or
+    boolean public key, or an over-long encoding raises ValueError.
+    """
+    if not isinstance(segments, tuple):
+        raise TypeError("segments must be a tuple")
+    for segment in segments:
+        if not isinstance(segment, AuditExtensionDeltaCheckpointChain):
+            raise TypeError(
+                "each segment must be an "
+                "AuditExtensionDeltaCheckpointChain instance"
+            )
+    if not isinstance(diagnosis, DeltaDiagnosis):
+        raise TypeError("diagnosis must be a DeltaDiagnosis instance")
+    if not isinstance(public_key, int) or isinstance(public_key, bool):
+        raise TypeError("public_key must be an integer")
+
+    # Raises TypeError/ValueError for an illegal segment set, exactly as
+    # the encoder itself; the diagnosis block is validated the same way.
+    encoded_segments = encode_delta_chain_segments(segments)
+    encoded_diagnosis = _encode_delta_diagnosis(diagnosis)
+    encoded_key = _encode_varint(public_key)
+    return (
+        DELTA_REPORT_TAG
+        + hashlib.sha256(encoded_segments).digest()
+        + encoded_key
+        + encoded_diagnosis
+    )
+
+
+def _check_delta_report_fields(report: object) -> None:
+    """Type- and structure-check a DeltaReport value's non-signature fields."""
+    if not isinstance(report, DeltaReport):
+        raise TypeError("report must be a DeltaReport instance")
+    # Validates the whole diagnosis block, including the kind/verdict and
+    # kind/index-slot agreement.
+    _encode_delta_diagnosis(report.diagnosis)
+    if not isinstance(report.public_key, int) or isinstance(report.public_key, bool):
+        raise TypeError("public_key must be an integer")
+    if report.public_key < 0:
+        raise ValueError("public_key must be non-negative")
+    _check_history_proof_bundle_signature(
+        report.signature, field="report.signature"
+    )
+
+
+def encode_dr(report: DeltaReport) -> bytes:
+    """Canonically encode a delta report for transport or persistence.
+
+    The encoding is, in order, the tag ``b"ts/dr/w1"``, the fixed-width
+    diagnosis block ``D`` (four unsigned big-endian 64-bit integers,
+    exactly as :func:`dr_message` writes it), ``VARINT(public_key)`` —
+    the 4-byte unsigned big-endian length followed by the shortest
+    unsigned big-endian value (zero is the single body byte ``00``) —
+    and then the signature frame: ``VARINT(R)``, ``VARINT(z)``, the
+    4-byte unsigned big-endian signer count ``k`` and one ``VARINT(id)``
+    per ascending signer id, exactly the signature frame of
+    :func:`encode_audit_extension_delta_checkpoint_chain` and
+    :func:`encode_seal`.
+
+    Only the structure of the report is checked — the diagnosis is not
+    recomputed over any segment set and the signature is not checked:
+    :func:`verify_dr` is the way to test a report afterwards. A
+    non-:class:`DeltaReport` argument or a wrong field type raises
+    TypeError; an illegal diagnosis or public key, an illegal signature
+    structure, or an over-long frame raises ValueError. The output for a
+    given report is unique and the encoding carries no network, storage
+    or hidden state.
+    """
+    _check_delta_report_fields(report)
+    encoded_diagnosis = _encode_delta_diagnosis(report.diagnosis)
+    encoded_key = _encode_varint(report.public_key)
+    signature = report.signature
+    signer_count = len(signature.signer_ids)
+    if signer_count > 0xFFFFFFFF:
+        raise ValueError("too many signer ids")
+
+    buffer = bytearray(DELTA_REPORT_WIRE_TAG)
+    buffer += encoded_diagnosis
+    buffer += encoded_key
+    buffer += _encode_varint(signature.R)
+    buffer += _encode_varint(signature.z)
+    buffer += signer_count.to_bytes(4, "big", signed=False)
+    for signer_id in signature.signer_ids:
+        buffer += _encode_varint(signer_id)
+    return bytes(buffer)
+
+
+def decode_dr(blob: bytes) -> DeltaReport:
+    """Decode the canonical encoding produced by :func:`encode_dr`.
+
+    Accepts only the single canonical form: the tag ``b"ts/dr/w1"``, the
+    32-byte diagnosis block ``D`` (four unsigned big-endian 64-bit
+    integers whose verdict, kind and index slots all agree, with absent
+    indices the all-ones sentinel ``2**64 - 1``), the length-prefixed
+    public key (zero is the single body byte ``00``), and then the
+    signature frame: the length-prefixed integers ``R`` and ``z``, the
+    4-byte non-zero signer count ``k`` and exactly ``k`` strictly
+    increasing positive signer ids. A non-bytes argument raises
+    TypeError; a wrong or missing tag, truncation, a bad verdict or kind,
+    a verdict/kind or index-slot mismatch, a non-canonical integer
+    (leading zero or over-long length), a zero ``R``, a zero or
+    mismatched signer count, or trailing bytes raises ValueError. A
+    successfully decoded report re-encodes to exactly the input bytes.
+
+    Decoding only restores the structure: the diagnosis is not
+    recomputed and the signature is not checked. A structurally legal
+    report whose diagnosis does not match a segment set or whose
+    signature does not seal it is returned normally, and
+    :func:`verify_dr` reports it as ``False``.
+    """
+    if not isinstance(blob, bytes):
+        raise TypeError("blob must be bytes")
+    if not blob.startswith(DELTA_REPORT_WIRE_TAG):
+        raise ValueError("bad delta report tag")
+    offset = len(DELTA_REPORT_WIRE_TAG)
+
+    if offset + 32 > len(blob):
+        raise ValueError("truncated delta report diagnosis")
+    diagnosis = _decode_delta_diagnosis(blob[offset:offset + 32])
+    offset += 32
+
+    public_key, offset = _read_varint(
+        blob, offset, what="delta report public key"
+    )
+
+    R, offset = _read_varint(blob, offset, what="delta report signature R")
+    z, offset = _read_varint(blob, offset, what="delta report signature z")
+    if R == 0:
+        raise ValueError("delta report signature R must be positive")
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated delta report signer count")
+    signer_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    if signer_count == 0:
+        raise ValueError("delta report must name at least one signer")
+
+    signer_ids = []
+    for _ in range(signer_count):
+        signer_id, offset = _read_varint(
+            blob, offset, what="delta report signer id"
+        )
+        if signer_id == 0:
+            raise ValueError("delta report signer ids must be positive")
+        if signer_ids and signer_id <= signer_ids[-1]:
+            raise ValueError(
+                "delta report signer ids must be strictly increasing and unique"
+            )
+        signer_ids.append(signer_id)
+    if offset != len(blob):
+        raise ValueError("trailing bytes after delta report")
+
+    report = DeltaReport(
+        diagnosis=diagnosis,
+        public_key=public_key,
+        signature=AggregateSignature(
+            R=R, z=z, signer_ids=tuple(signer_ids)
+        ),
+    )
+    if encode_dr(report) != blob:
+        raise ValueError("non-canonical delta report encoding")
+    return report
+
+
+def verify_dr(
+    report: DeltaReport,
+    segments: tuple[AuditExtensionDeltaCheckpointChain, ...],
+    key: SigningDKGResult,
+) -> bool:
+    """Verify a delta report against a segment set and the threshold key.
+
+    ``report`` must be a structurally legal :class:`DeltaReport` exactly
+    as :func:`encode_dr` requires, ``segments`` a non-empty tuple of
+    :class:`AuditExtensionDeltaCheckpointChain` values exactly as
+    :func:`diagnose_delta_chain_segments` requires, and ``key`` a legal
+    :class:`SigningDKGResult`. Wrong field types raise TypeError; an
+    illegal report, an empty or structurally illegal segment set or an
+    illegal key structure raises ValueError.
+
+    The diagnosis is recomputed with
+    :func:`diagnose_delta_chain_segments` over the exact ``segments``
+    and ``key``; the report verifies only when the recomputed diagnosis
+    equals the sealed one by value, the report's ``public_key`` equals
+    ``key.public_key``, and the signature checks on
+    :func:`dr_message` of the segments, the diagnosis and that public
+    key via :func:`verify_signature` with the key's group parameters.
+    A structurally legal report whose diagnosis does not match, which
+    names another public key, whose signature was tampered with, or
+    which seals another segment set returns ``False``. The function is
+    stateless.
+    """
+    _check_delta_report_fields(report)
+    if not isinstance(segments, tuple):
+        raise TypeError("segments must be a tuple")
+    for segment in segments:
+        if not isinstance(segment, AuditExtensionDeltaCheckpointChain):
+            raise TypeError(
+                "each segment must be an "
+                "AuditExtensionDeltaCheckpointChain instance"
+            )
+    _result, public_key, field_prime, group_prime, generator = _check_signing_setup(key)
+    _check_signing_dkg_structure(key)
+
+    diagnosis = diagnose_delta_chain_segments(segments, key)
+    if report.diagnosis != diagnosis:
+        return False
+    if report.public_key != public_key:
+        return False
+    message = dr_message(segments, report.diagnosis, public_key)
+    return verify_signature(
+        message,
+        report.signature,
+        public_key,
+        group_prime=group_prime,
+        generator=generator,
+        prime=field_prime,
+    )
 
 
 # ---------------------------------------------------------------------------
