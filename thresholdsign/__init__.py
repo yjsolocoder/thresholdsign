@@ -85,7 +85,10 @@ encode_delta_chain_segments / decode_delta_chain_segments for archiving
 or transferring several consecutive segments as one ordered object, and
 the stateless whole-set verifier verify_delta_chain_segments for
 confirming every segment's signatures and every seam between neighbours
-in one call.
+in one call, and the stateless failure locator
+diagnose_delta_chain_segments, returning a frozen DeltaDiagnosis that
+names the first failing segment and hop without guessing at the
+cryptographic reason for a mismatch.
 """
 
 from __future__ import annotations
@@ -240,6 +243,8 @@ __all__ = [
     "encode_delta_chain_segments",
     "decode_delta_chain_segments",
     "verify_delta_chain_segments",
+    "DeltaDiagnosis",
+    "diagnose_delta_chain_segments",
 ]
 
 # Mersenne prime 2**127 - 1: large enough for integer secrets, small enough that
@@ -7876,35 +7881,192 @@ def decode_delta_chain_segments(
     return segments_tuple
 
 
+@dataclass(frozen=True)
+class DeltaDiagnosis:
+    """The outcome of statelessly diagnosing a delta chain segment set.
+
+    The fields, in order, are ``ok`` (the plain ``bool``
+    :func:`verify_delta_chain_segments` returns for the very same
+    arguments — ``True`` if and only if every segment verifies and every
+    seam links), ``kind`` (one of the strings ``"ok"``, ``"segment"``,
+    ``"leaf"``, ``"sig"`` or ``"proof"``), ``segment`` (the zero-based
+    index of the segment the first failure was found in, or ``None`` on
+    success) and ``proof`` (the zero-based index of the hop within that
+    segment for an intra-segment failure, or ``None`` on success and for
+    a seam failure). The dataclass is frozen, positionally constructible
+    and compared by value, and carries no network, storage or hidden
+    state.
+
+    The failure kinds locate without explaining: a broken prefix between
+    two adjacent hops inside one segment is ``"segment"`` with the
+    right-hand hop's index, a hop whose :func:`check_extension` verdicts
+    fail is ``"proof"`` with that hop's index, a leaf prefix mismatch at
+    the seam between two segments is ``"leaf"`` and a mismatch of the
+    shared checkpoint signature at a seam is ``"sig"``; the two seam
+    kinds carry ``proof=None``. A diagnosis never guesses which
+    cryptographic mismatch made a signature fail — a wrong key and a
+    tampered signature are both simply ``"proof"``.
+    """
+
+    ok: bool
+    kind: str
+    segment: "int | None"
+    proof: "int | None"
+
+
+def _diagnose_delta_chain_segments(
+    segments: tuple[AuditExtensionDeltaCheckpointChain, ...],
+    key: SigningDKGResult,
+) -> DeltaDiagnosis:
+    """Locate the first failing check of an ordered delta segment set.
+
+    Shared implementation behind :func:`diagnose_delta_chain_segments`
+    and :func:`verify_delta_chain_segments`; the arguments are only
+    reached after both entry points' own boundary checks, and the tuple
+    is known to be non-empty with every element a delta chain.
+    """
+    # Phase 1: validate the structure of every segment completely, in
+    # tuple order, before inspecting any relationship between them — the
+    # same single-chain boundary expand_audit_extension_delta_checkpoint_
+    # chain enforces: illegal structure raises and is never a located
+    # failure. Each expansion also validates its nested first proof and
+    # every checkpoint signature structurally.
+    expanded_segments = [
+        expand_audit_extension_delta_checkpoint_chain(segment)
+        for segment in segments
+    ]
+
+    # Phase 2: walk the segments in input order. Within each segment the
+    # checks run in a fixed order — adjacent-hop prefix linkage, then the
+    # hop's check_extension verdict, then the seam to the next segment —
+    # so the first failure returned is the first one that scan reaches.
+    for segment_index, expanded in enumerate(expanded_segments):
+        proofs = expanded.proofs
+        signatures = expanded.signatures
+        previous_hop_leaves = None
+        for hop_index, proof in enumerate(proofs):
+            if previous_hop_leaves is not None:
+                old_n = proof.old_n
+                if (
+                    len(previous_hop_leaves) != old_n
+                    or previous_hop_leaves != proof.leaves[:old_n]
+                ):
+                    return DeltaDiagnosis(
+                        False, "segment", segment_index, hop_index
+                    )
+            # check_extension performs the key-structure checks itself,
+            # raising TypeError/ValueError on an illegal key exactly as
+            # the single-chain verifier would; it never explains which
+            # of the two signatures (or the leaves or the key) failed.
+            if not check_extension(
+                proof,
+                signatures[hop_index],
+                signatures[hop_index + 1],
+                key,
+            ):
+                return DeltaDiagnosis(
+                    False, "proof", segment_index, hop_index
+                )
+            previous_hop_leaves = proof.leaves
+
+        # Seam to the next segment, if any: the leaf prefix is checked
+        # first — a gap, overlap or differing leaf is "leaf" — and only
+        # after the leaves agree is the shared checkpoint signature
+        # compared by value as "sig". A seam failure belongs to neither
+        # hop, so proof stays None.
+        if segment_index + 1 < len(expanded_segments):
+            next_first = expanded_segments[segment_index + 1].proofs[0]
+            old_n = next_first.old_n
+            if (
+                len(proofs[-1].leaves) != old_n
+                or proofs[-1].leaves != next_first.leaves[:old_n]
+            ):
+                return DeltaDiagnosis(False, "leaf", segment_index, None)
+            if signatures[-1] != expanded_segments[
+                segment_index + 1
+            ].signatures[0]:
+                return DeltaDiagnosis(False, "sig", segment_index, None)
+
+    return DeltaDiagnosis(True, "ok", None, None)
+
+
+def diagnose_delta_chain_segments(
+    segments: tuple[AuditExtensionDeltaCheckpointChain, ...],
+    key: SigningDKGResult,
+) -> DeltaDiagnosis:
+    """Statelessly locate the first failure of an ordered segment set.
+
+    ``segments`` must be a non-empty tuple of
+    :class:`AuditExtensionDeltaCheckpointChain` values in chain order and
+    ``key`` a :class:`SigningDKGResult`; the tuple is checked exactly as
+    it lies — the segments are never sorted or otherwise reordered. A
+    successful diagnosis is fixed at ``DeltaDiagnosis(True, "ok", None,
+    None)`` and its ``ok`` is identical in value to what
+    :func:`verify_delta_chain_segments` returns for the same arguments.
+
+    Every segment's structure is validated completely first, in tuple
+    order, before any relationship is inspected. The segments are then
+    scanned in input order, and within each segment checks run in this
+    order: the prefix linkage between adjacent hops of the segment, each
+    hop's two :func:`check_extension` signature verdicts, and finally the
+    seam to the next segment. At a seam the leaf prefix — the last left
+    segment leaves against the right segment's first proof old prefix —
+    is checked first and any mismatch is reported as
+    ``DeltaDiagnosis(False, "leaf", segment, None)``; only after the
+    leaves agree is the shared checkpoint signature compared by value and
+    a mismatch reported as ``DeltaDiagnosis(False, "sig", segment,
+    None)``. ``segment`` is always zero-based and, for the intra-segment
+    kinds, ``proof`` is the zero-based hop index inside that segment:
+    the right-hand hop of a broken prefix for ``"segment"`` and the hop
+    whose extension check fails for ``"proof"``. The diagnosis locates
+    failures but never guesses the internal cryptographic reason for a
+    signature mismatch, so a wrong key, a tampered signature and tampered
+    leaf digests that break a root are all located the same way.
+
+    A non-tuple ``segments`` argument, a
+    non-:class:`AuditExtensionDeltaCheckpointChain` element, a
+    non-:class:`SigningDKGResult` ``key`` or any wrong field or element
+    type inside a segment raises TypeError, exactly as
+    :func:`verify_delta_chain_segments` does. An empty ``segments``
+    tuple or any structurally illegal segment or nested proof or
+    signature — an empty addition batch, a digest that is not exactly 32
+    bytes, a signature count other than ``len(additions) + 2``, an
+    illegal nested proof or signature — raises ValueError along the same
+    single-chain boundary, and so does an illegal ``key`` structure. The
+    function is stateless and keeps no hidden state.
+    """
+    if not isinstance(segments, tuple):
+        raise TypeError("segments must be a tuple")
+    for segment in segments:
+        if not isinstance(segment, AuditExtensionDeltaCheckpointChain):
+            raise TypeError(
+                "each segment must be an "
+                "AuditExtensionDeltaCheckpointChain instance"
+            )
+    if not isinstance(key, SigningDKGResult):
+        raise TypeError("key must be a SigningDKGResult instance")
+    if len(segments) == 0:
+        raise ValueError("segments must be a non-empty tuple")
+    return _diagnose_delta_chain_segments(segments, key)
+
+
 def verify_delta_chain_segments(
     segments: tuple[AuditExtensionDeltaCheckpointChain, ...],
     key: SigningDKGResult,
 ) -> bool:
     """Verify an ordered tuple of delta chain segments as one whole chain.
 
-    ``segments`` must be a non-empty tuple of
-    :class:`AuditExtensionDeltaCheckpointChain` values in chain order;
-    the tuple is checked exactly as it lies — the segments are never
-    sorted or otherwise reordered. Each segment is first checked against
-    the existing single-chain structural boundary (the same checks
-    :func:`expand_audit_extension_delta_checkpoint_chain` performs), the
-    segments are then folded left to right with
-    :func:`join_delta_chain_segments` — so every seam must satisfy that
-    splice's two link conditions: the left segment's last expanded
-    leaves must equal the old prefix of the right segment's first
-    expanded proof, and the two shared checkpoint signatures at the seam
-    must be identical by value — and the joined chain is verified with
-    :func:`verify_audit_extension_delta_checkpoint_chain` under ``key``.
-    Returns ``True`` only when every segment is structurally legal,
-    every seam links and every hop signature of the joined chain
-    verifies under ``key``; a structurally legal set presented in the
-    wrong order, with a leaf prefix gap or overlap at a seam, with a
-    mismatched shared checkpoint signature, with tampered leaf digests
-    or checkpoint signatures, or one presented under another key returns
-    ``False`` instead of raising. Because the verdict depends only on
-    the segment values, round-tripping the tuple through
-    :func:`encode_delta_chain_segments` and
-    :func:`decode_delta_chain_segments` never changes it.
+    This is the plain-bool entry point of
+    :func:`diagnose_delta_chain_segments`: it returns that diagnosis's
+    ``ok`` and raises on exactly the same TypeError/ValueError boundary
+    cases, so its behavior is unchanged from the boolean form — a
+    structurally legal set presented in the wrong order, with a leaf
+    prefix gap or overlap at a seam, with a mismatched shared checkpoint
+    signature, with tampered leaf digests or checkpoint signatures, or
+    one presented under another key returns ``False`` instead of raising.
+    Callers that only need the verdict use this function; callers that
+    also need the first failing segment and hop located use
+    :func:`diagnose_delta_chain_segments`.
 
     A non-tuple ``segments`` argument, a
     non-:class:`AuditExtensionDeltaCheckpointChain` element, a
@@ -7921,32 +8083,7 @@ def verify_delta_chain_segments(
     are reported as ``False``. The function is stateless and keeps no
     hidden state.
     """
-    if not isinstance(segments, tuple):
-        raise TypeError("segments must be a tuple")
-    for segment in segments:
-        if not isinstance(segment, AuditExtensionDeltaCheckpointChain):
-            raise TypeError(
-                "each segment must be an "
-                "AuditExtensionDeltaCheckpointChain instance"
-            )
-    if not isinstance(key, SigningDKGResult):
-        raise TypeError("key must be a SigningDKGResult instance")
-    if len(segments) == 0:
-        raise ValueError("segments must be a non-empty tuple")
-
-    # Structural validation of each segment up front, along the existing
-    # single-chain boundary: expansion raises TypeError/ValueError for
-    # any illegal nested proof, batch, digest or signature, so the join
-    # below can only fail on the seam link conditions of an otherwise
-    # legal set — exactly the failures that must surface as False.
-    for segment in segments:
-        expand_audit_extension_delta_checkpoint_chain(segment)
-
-    try:
-        joined = join_delta_chain_segments(segments)
-    except ValueError:
-        return False
-    return verify_audit_extension_delta_checkpoint_chain(joined, key)
+    return diagnose_delta_chain_segments(segments, key).ok
 
 
 # ---------------------------------------------------------------------------
