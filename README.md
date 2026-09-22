@@ -775,6 +775,41 @@ chain = join_delta_chain_segments(restored)           # 段序与接缝仍由拼
 坏标签、零长或超长帧、计数错、截断、尾随或非规范嵌套编码抛 `ValueError`；
 既有全部接口行为不变。
 
+为让核验方无需另行保存原始分段，`DeltaReport` 可与其诊断的那组分段打包成
+一个自包含对象整体传输：
+
+```python
+from thresholdsign import (
+    DeltaReportBundle,
+    decode_delta_report_bundle,
+    encode_delta_report_bundle,
+    verify_delta_report_bundle,
+)
+
+bundle = DeltaReportBundle(segments, report)       # 字段依次为 segments、report
+blob = encode_delta_report_bundle(bundle)          # 仅检查容器及嵌套结构
+restored = decode_delta_report_bundle(blob)        # 仅按原序还原结构
+assert restored == bundle
+assert verify_delta_report_bundle(restored, key)   # 直接复用 verify_dr
+```
+
+`DeltaReportBundle` 是冻结、可按位置构造、按值相等的数据类，字段依次为
+非空保序的 `segments: tuple[AuditExtensionDeltaCheckpointChain, ...]` 与
+`report: DeltaReport`，不含网络、存储或隐藏状态，构造时不校验。编码依次为
+标签 `b"thresholdsign/delta-report-bundle/v1"`、U32 段数和原序
+`U32(len(E))||E` 段帧（`E` 为该段的现有增量链规范编码），末尾为
+`U32(len(R))||R`，其中 `R = encode_dr(report)`；所有 U32 均为 4 字节无符号
+大端。解码逐帧还原分段并以 `decode_dr` 还原报告，成功后重编码须逐字节等于
+输入，不重算诊断、不检查接缝、不验签、不保存状态；结构合法但诊断、分段摘要
+或签名不匹配照样正常返回，由核验入口判定。入参非
+`DeltaReportBundle`、`segments` 非元组、元素非增量链、`report` 非
+`DeltaReport` 或嵌套字段类型错误抛 `TypeError`；空集合、坏标签、零长或
+超长帧、计数错、截断、尾随或非规范嵌套编码抛 `ValueError`。
+`verify_delta_report_bundle(bundle, key)` 直接复用
+`verify_dr(bundle.report, bundle.segments, key)`：诊断、分段摘要、公钥与签名
+全部一致才返回 `True`，结构合法但诊断不符、报告密封的是另一组分段、签名被
+篡改或密钥不匹配返回 `False`；既有全部接口行为不变。
+
 
 ## 命令行演示
 
@@ -1549,6 +1584,31 @@ python3 -m thresholdsign
   输入；不排序、不检查接缝、不验签、不保存状态，段序与接缝由
   `join_delta_chain_segments` 判定。入参非 `bytes` 抛 `TypeError`；坏标签、
   零段数、零长/超长帧、计数错、截断、尾随或非规范嵌套编码抛 `ValueError`
+- `DeltaReportBundle(segments, report)` — 冻结数据类，字段依次为非空保序的
+  `segments: tuple[AuditExtensionDeltaCheckpointChain, ...]` 与
+  `report: DeltaReport`，使核验方无需另存原始分段；可按位置构造、按值相等，
+  不含网络、存储或隐藏状态，构造时不校验字段类型与非空约束
+- `encode_delta_report_bundle(bundle) -> bytes` — 自包含诊断报告包的规范
+  传输/持久化编码：标签 `b"thresholdsign/delta-report-bundle/v1"`、U32 段数，
+  随后按原序写每段的 `U32(len(E))||E` 帧（`E` 为
+  `encode_audit_extension_delta_checkpoint_chain` 的现有增量链规范编码），末尾
+  为 `U32(len(R))||R`，`R = encode_dr(report)`；U32 均为 4 字节无符号大端。
+  仅检查容器及嵌套结构，不重算诊断、不检查接缝、不验签、不保存状态。入参非
+  `DeltaReportBundle`、`segments` 非元组、元素非增量链、`report` 非
+  `DeltaReport` 或嵌套字段类型错误抛 `TypeError`；空集合、计数或帧超长及嵌套
+  结构错误抛 `ValueError`
+- `decode_delta_report_bundle(blob: bytes) -> DeltaReportBundle` — 恢复
+  `encode_delta_report_bundle` 的唯一规范形式：逐帧调用
+  `decode_audit_extension_delta_checkpoint_chain` 按原序还原分段，末帧经
+  `decode_dr` 还原报告；成功后重编码须逐字节等于输入，仅恢复结构，不重算
+  诊断、不检查接缝、不验签、不保存状态，结构合法但诊断或签名不匹配照样正常
+  返回。入参非 `bytes` 抛 `TypeError`；坏标签、零段数、零长/超长帧、计数错、
+  截断、尾随或非规范嵌套编码抛 `ValueError`
+- `verify_delta_report_bundle(bundle, key) -> bool` — 直接复用
+  `verify_dr(bundle.report, bundle.segments, key)`：重算的诊断与密封诊断一致、
+  报告公钥等于 `key.public_key` 且签名验过方为 `True`；结构合法但诊断、分段
+  摘要、签名或密钥不匹配返回 `False`。非 `DeltaReportBundle` 入参或
+  `key` 类型错误抛 `TypeError`，空分段元组或嵌套结构非法抛 `ValueError`
 
 ### 门限 Schnorr 群参数与边界
 
