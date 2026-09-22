@@ -930,7 +930,35 @@ C = U32(len(items)) || Σ_i ( U32(len(E_i)) || E_i )
 `DeltaReportBundleArchiveSealChain` 入参、`items` 非元组、元素非
 `DeltaReportBundleArchiveSeal`、`key` 非 `SigningDKGResult` 或嵌套字段类型
 错误抛 `TypeError`；空链、外层签名结构非法、密钥结构非法或嵌套封印结构非法
-抛 `ValueError`。链不含传输编码，也不引入任何网络、存储或隐藏状态。
+抛 `ValueError`。链不引入任何网络、存储或隐藏状态。
+
+链还有唯一、无状态的规范传输/持久化编解码，整条链可跨实现传输：
+
+```python
+from thresholdsign import (
+    encode_delta_report_bundle_archive_seal_chain,
+    decode_delta_report_bundle_archive_seal_chain,
+)
+
+blob = encode_delta_report_bundle_archive_seal_chain(chain)      # 仅检查结构，不验签
+restored = decode_delta_report_bundle_archive_seal_chain(blob)  # 仅恢复结构，不验签
+assert restored == chain
+assert verify_dc(restored, key)                                  # 逐项复核封印，再验外层签名
+```
+
+编码按原序写出，依次为标签 `b"ts/drasc/w1"`、U32 项数（非零）、按原序排列的
+逐个封印帧 `U32(len(E))||E`（`E` 为每项既有规范编码
+`encode_delta_report_bundle_archive_seal`，非空），最后是一个外层签名帧；
+所有 U32 均为 4 字节无符号大端。外层签名帧沿用 `AuditProofBundle`：
+`V(R)||V(z)||U32(k)||ΣV(id)`，`V` 为 U32 长度加最短无符号大端值（零为单字节
+`00`，正值无前导零），`R > 0`、`z ≥ 0`，签名者编号为非空严格递增正整数，
+`k` 为其数量。编码只检查字段与嵌套结构、不验签，同一链输出唯一字节串。解码
+仅恢复结构：嵌套封印经 `decode_delta_report_bundle_archive_seal` 恢复，外层
+签名不校验；结构合法但签名错配（任一封印不匹配或外层签名不密封该链）照样
+正常返回对象，由 `verify_dc` 判定。解码拒绝空链、坏标签、零长或超长帧、计数
+不符、非规范整数（前导零或超长）、非法嵌套、截断及尾随字节，成功后重编码须
+逐字节等于输入。非链入参、`items` 非元组、元素非封印或签名字段类型错误抛
+`TypeError`，其余非法抛 `ValueError`。既有全部接口行为不变。
 
 
 ## 命令行演示
@@ -1809,6 +1837,22 @@ python3 -m thresholdsign
   `DeltaReportBundleArchiveSealChain` 入参、`items` 非元组、元素非
   `DeltaReportBundleArchiveSeal` 或 `key` 类型错误抛 `TypeError`；空链、嵌套
   封印结构非法、外层签名或密钥结构非法抛 `ValueError`；无状态
+- `encode_delta_report_bundle_archive_seal_chain(chain) -> bytes` — 链的唯一
+  无状态规范传输/持久化编码：依次为标签 `b"ts/drasc/w1"`、U32 项数（非零）、
+  按原序排列的逐个封印帧 `U32(len(E))||E`（`E` 为
+  `encode_delta_report_bundle_archive_seal` 的既有规范编码，非空），最后是
+  沿用 `AuditProofBundle` 的外层签名帧 `V(R)||V(z)||U32(k)||ΣV(id)`；所有
+  U32 为 4 字节无符号大端，`V` 为 U32 长度加最短无符号大端值（零为单字节
+  `00`），`R > 0`、`z ≥ 0`，签名者编号为非空严格递增正整数。仅检查字段与
+  嵌套结构，不验签，输出唯一字节串。非链入参、`items` 非元组、元素非封印或
+  签名字段类型错误抛 `TypeError`；空链、嵌套或签名结构非法、计数或帧超长抛
+  `ValueError`
+- `decode_delta_report_bundle_archive_seal_chain(blob: bytes) -> DeltaReportBundleArchiveSealChain`
+  — 仅恢复结构：嵌套封印经 `decode_delta_report_bundle_archive_seal` 恢复，
+  外层签名不校验。拒绝空链、坏标签、零长或超长帧、计数不符、非规范整数、
+  非法嵌套、截断及尾随字节，成功后重编码须逐字节等于输入；结构合法但签名
+  错配仍返回对象，由 `verify_dc` 判定。非 `bytes` 入参抛 `TypeError`，其余
+  非法抛 `ValueError`
 
 ### 门限 Schnorr 群参数与边界
 
