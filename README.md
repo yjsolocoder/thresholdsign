@@ -545,6 +545,32 @@ assert encode_extension(restored) == blob  # 成功解码必可逐字节复现
 拒绝非 `bytes` 入参（`TypeError`）与坏标签、截断、尾随字节、计数不符、空叶、
 越界或叶宽错误（`ValueError`）。
 
+若要把一致性证明连同旧、新两个根签名一起传输或落盘，用冻结数据类
+`AuditExtensionProofBundle(proof, old_signature, new_signature)`（字段依次为
+`AuditExtensionProof`、旧根签名与新根签名，可按位置构造、按值相等）及其规范编码：
+
+```python
+from thresholdsign import (
+    AuditExtensionProofBundle,
+    encode_audit_extension_proof_bundle,
+    decode_audit_extension_proof_bundle,
+    verify_audit_extension_proof_bundle,
+)
+
+bundle = AuditExtensionProofBundle(proof, old_sig, new_sig)
+blob = encode_audit_extension_proof_bundle(bundle)        # bytes，输出唯一、无状态
+restored = decode_audit_extension_proof_bundle(blob)      # 仅还原结构
+assert encode_audit_extension_proof_bundle(restored) == blob  # 成功解码必逐字节往返
+assert verify_audit_extension_proof_bundle(restored, key)     # 委托 check_extension
+```
+
+编码依次为标签 `b"ts/aepb/v1"`、`P = encode_extension(proof)` 的 U32 长度帧
+（4 字节无符号大端长度 + `P`），再依次直拼旧、新两个签名帧；签名帧完全沿用
+`AuditProofBundle` 的规范规则（`VARINT(R)`、`VARINT(z)`、U32 签名者数 `k` 及
+`k` 个递增 `VARINT(id)`）。编码与解码仅校验字段与嵌套结构，不验证前缀关系或
+签名真伪：类型错误抛 `TypeError`，结构非法抛 `ValueError`，结构合法但签名与
+根不匹配由 `verify_audit_extension_proof_bundle` 返回 `False`。
+
 
 ## 命令行演示
 
@@ -1177,6 +1203,30 @@ python3 -m thresholdsign
   空叶、越界、截断、尾随字节及计数不符；成功后重编码必逐字节等于输入。非
   `bytes` 入参抛 `TypeError`，其余非法情形抛 `ValueError`；结构合法但签名不匹配
   由 `check_extension` 返回 `False`
+- `AuditExtensionProofBundle(proof, old_signature, new_signature)` — 冻结数据类，
+  字段依次为一致性证明、旧根签名与新根签名，可按位置构造、按值相等；构造时不
+  校验，结构由 `encode_audit_extension_proof_bundle` 检查、真伪由
+  `verify_audit_extension_proof_bundle` 核验；不含网络、存储或隐藏状态
+- `encode_audit_extension_proof_bundle(bundle) -> bytes` — 一致性证明连同双根
+  签名的规范传输/持久化编码：依次直拼标签 `b"ts/aepb/v1"`、
+  `P = encode_extension(bundle.proof)` 的 U32 长度帧（4 字节无符号大端长度 +
+  `P`），再依次直拼旧、新签名帧；签名帧完全沿用 `AuditProofBundle` 的规范规则
+  （`VARINT(R)`、`VARINT(z)`、U32 签名者数 `k` 及 `k` 个递增 `VARINT(id)`）。
+  仅校验字段与嵌套结构，不验证前缀关系或签名真伪；输出唯一、无状态。非
+  `AuditExtensionProofBundle`/`AuditExtensionProof` 入参或字段类型错误抛
+  `TypeError`，证明或签名结构非法、帧超长抛 `ValueError`
+- `decode_audit_extension_proof_bundle(blob) -> AuditExtensionProofBundle` —
+  `encode_audit_extension_proof_bundle` 的逆操作，
+  仅还原结构、不验证前缀关系、不验签、不留状态：拒绝非 `bytes`、坏/缺标签、
+  零或超长证明帧、非规范嵌套证明、零 `R`、非规范整数、零签名者数、非正或非
+  递增签名者编号、截断及尾随字节；成功后重编码必逐字节等于输入。非 `bytes`
+  入参抛 `TypeError`，其余非法情形抛 `ValueError`；结构合法但签名与根不匹配由
+  `verify_audit_extension_proof_bundle` 返回 `False`
+- `verify_audit_extension_proof_bundle(bundle, key) -> bool` —
+  `check_extension(bundle.proof, bundle.old_signature, bundle.new_signature, key)`
+  的便捷封装；两个签名皆验返回 `True`，篡改叶或 `old_n`、签名对调或错配、
+  换密钥核验等返回 `False`。非 `AuditExtensionProofBundle` 入参抛 `TypeError`，
+  嵌套证明、签名或密钥结构非法抛 `TypeError`/`ValueError`
 
 ### 门限 Schnorr 群参数与边界
 

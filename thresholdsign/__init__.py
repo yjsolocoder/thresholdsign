@@ -56,7 +56,10 @@ decode_audit_multi_proof_bundle / verify_audit_multi_proof_bundle. Append-only c
 AuditExtensionProof / make_extension / check_extension, letting an observer
 verify — from two threshold signatures alone — that an old record sequence
 is a prefix of a new one, without seeing any message or receipt, plus their
-canonical transport encoding encode_extension / decode_extension.
+canonical transport encoding encode_extension / decode_extension, and the
+dual-signature consistency bundle AuditExtensionProofBundle /
+encode_audit_extension_proof_bundle / decode_audit_extension_proof_bundle /
+verify_audit_extension_proof_bundle.
 """
 
 from __future__ import annotations
@@ -186,6 +189,10 @@ __all__ = [
     "check_extension",
     "encode_extension",
     "decode_extension",
+    "AuditExtensionProofBundle",
+    "encode_audit_extension_proof_bundle",
+    "decode_audit_extension_proof_bundle",
+    "verify_audit_extension_proof_bundle",
 ]
 
 # Mersenne prime 2**127 - 1: large enough for integer secrets, small enough that
@@ -6309,6 +6316,221 @@ def decode_extension(payload: bytes) -> AuditExtensionProof:
 
 
 # ---------------------------------------------------------------------------
+# Canonical audit-extension bundle transport: a self-delimiting,
+# byte-for-byte reproducible encoding of an AuditExtensionProof together
+# with the old- and new-root AggregateSignature pair, for
+# cross-implementation exchange and persistence. Decoding restores
+# structure only — the nested proof goes through decode_extension, its
+# leaf digests stay opaque and no signature is checked, so
+# verify_audit_extension_proof_bundle remains the sole verifier
+# afterwards.
+# ---------------------------------------------------------------------------
+
+AUDIT_EXTENSION_PROOF_BUNDLE_WIRE_TAG = b"ts/aepb/v1"
+
+
+@dataclass(frozen=True)
+class AuditExtensionProofBundle:
+    """A consistency proof together with its two root signatures.
+
+    The fields, in order, are ``proof`` (an :class:`AuditExtensionProof`),
+    ``old_signature`` (the :class:`AggregateSignature` on the old
+    ``b"am/r" || U64(old_n) || old_root`` statement) and ``new_signature``
+    (the :class:`AggregateSignature` on the new
+    ``b"am/r" || U64(n) || new_root`` statement). The dataclass is frozen,
+    positionally constructible and compared by value, and carries no
+    network, storage or hidden state. Field types and bounds are not
+    checked at construction time — :func:`encode_audit_extension_proof_bundle`
+    checks the structure and :func:`verify_audit_extension_proof_bundle`
+    is the way to test a bundle afterwards.
+    """
+
+    proof: AuditExtensionProof
+    old_signature: AggregateSignature
+    new_signature: AggregateSignature
+
+
+def encode_audit_extension_proof_bundle(
+    bundle: AuditExtensionProofBundle,
+) -> bytes:
+    """Canonically encode a consistency-proof bundle for transport or persistence.
+
+    The encoding is, in order, the tag ``b"ts/aepb/v1"``, the 4-byte
+    unsigned big-endian length ``len(P)`` followed by
+    ``P = encode_extension(bundle.proof)`` (never empty), and then the old
+    and new signature frames, each exactly the signature frame of
+    :func:`encode_audit_proof_bundle`: ``VARINT(R)``, ``VARINT(z)``, the
+    4-byte unsigned big-endian signer count ``k`` and one ``VARINT(id)``
+    per ascending signer id. A ``VARINT`` is a 4-byte unsigned big-endian
+    body length followed by the shortest unsigned big-endian value (zero
+    is the single byte ``00``, positive values carry no leading zero);
+    ``R`` must be positive and ``z`` may be zero.
+
+    Only a structurally legal :class:`AuditExtensionProofBundle` is
+    accepted — a non-bundle or non-:class:`AuditExtensionProof` proof
+    argument, or wrong proof/signature field types, raise TypeError and
+    illegal proof or signature structure (the exact bounds of
+    :func:`encode_extension`, a non-positive ``R``, a negative ``z``, an
+    empty or non-strictly-increasing signer id tuple) or an over-long
+    frame raises ValueError, exactly as :func:`check_extension`'s
+    structural checks do — but the prefix relation is not verified and
+    neither signature is checked against the roots:
+    :func:`verify_audit_extension_proof_bundle` stays the way to verify a
+    bundle afterwards. The output for a given bundle is unique and the
+    encoding carries no network, storage or hidden state.
+    """
+    if not isinstance(bundle, AuditExtensionProofBundle):
+        raise TypeError("bundle must be an AuditExtensionProofBundle instance")
+    if not isinstance(bundle.proof, AuditExtensionProof):
+        raise TypeError("bundle.proof must be an AuditExtensionProof instance")
+    encoded_proof = encode_extension(bundle.proof)
+    old_signer_count = _check_history_proof_bundle_signature(
+        bundle.old_signature, field="bundle.old_signature"
+    )
+    new_signer_count = _check_history_proof_bundle_signature(
+        bundle.new_signature, field="bundle.new_signature"
+    )
+    if len(encoded_proof) > 0xFFFFFFFF:
+        raise ValueError("audit extension proof encoding too long")
+    if old_signer_count > 0xFFFFFFFF or new_signer_count > 0xFFFFFFFF:
+        raise ValueError("too many signer ids")
+
+    buffer = bytearray(AUDIT_EXTENSION_PROOF_BUNDLE_WIRE_TAG)
+    buffer += len(encoded_proof).to_bytes(4, "big", signed=False)
+    buffer += encoded_proof
+    for signature, signer_count in (
+        (bundle.old_signature, old_signer_count),
+        (bundle.new_signature, new_signer_count),
+    ):
+        buffer += _encode_varint(signature.R)
+        buffer += _encode_varint(signature.z)
+        buffer += signer_count.to_bytes(4, "big", signed=False)
+        for signer_id in signature.signer_ids:
+            buffer += _encode_varint(signer_id)
+    return bytes(buffer)
+
+
+def _read_bundle_signature_frame(
+    stream: bytes, offset: int, *, what: str
+) -> tuple[AggregateSignature, int]:
+    """Read one canonical bundle signature frame at ``offset``.
+
+    The frame is ``VARINT(R)``, ``VARINT(z)``, the 4-byte non-zero signer
+    count and then exactly that many strictly increasing positive
+    ``VARINT(id)`` entries — the same rules
+    :func:`decode_audit_proof_bundle` applies to its single signature.
+    """
+    R, offset = _read_varint(stream, offset, what=f"{what} signature R")
+    z, offset = _read_varint(stream, offset, what=f"{what} signature z")
+    if R == 0:
+        raise ValueError(f"{what} signature R must be positive")
+
+    if offset + 4 > len(stream):
+        raise ValueError(f"truncated {what} signer count")
+    signer_count = int.from_bytes(stream[offset:offset + 4], "big")
+    offset += 4
+    if signer_count == 0:
+        raise ValueError(f"{what} must name at least one signer")
+
+    signer_ids = []
+    for _ in range(signer_count):
+        signer_id, offset = _read_varint(
+            stream, offset, what=f"{what} signer id"
+        )
+        if signer_id == 0:
+            raise ValueError(f"{what} signer ids must be positive")
+        if signer_ids and signer_id <= signer_ids[-1]:
+            raise ValueError(
+                f"{what} signer ids must be strictly increasing and unique"
+            )
+        signer_ids.append(signer_id)
+    return (
+        AggregateSignature(R=R, z=z, signer_ids=tuple(signer_ids)),
+        offset,
+    )
+
+
+def decode_audit_extension_proof_bundle(
+    blob: bytes,
+) -> AuditExtensionProofBundle:
+    """Decode the canonical encoding produced by :func:`encode_audit_extension_proof_bundle`.
+
+    Accepts only the single canonical form: the tag ``b"ts/aepb/v1"``, a
+    4-byte non-zero frame length followed by bytes that
+    :func:`decode_extension` accepts, and then the old and new signature
+    frames, each the length-prefixed integers ``R`` and ``z``, the 4-byte
+    non-zero signer count ``k`` and exactly ``k`` strictly increasing
+    positive signer ids. A non-bytes argument raises TypeError; a wrong or
+    missing tag, a zero or over-long proof frame length, a non-canonical
+    nested proof, a zero ``R``, a non-canonical integer (leading zero or
+    over-long length), a zero signer count, a non-positive or
+    non-increasing signer id, truncation, or trailing bytes raises
+    ValueError. A successfully decoded bundle re-encodes to exactly the
+    input bytes.
+
+    Decoding only restores the structure: the nested proof is decoded
+    with :func:`decode_extension` (which keeps the leaf digests opaque
+    and verifies nothing) and neither signature is checked. A
+    structurally legal bundle whose signatures do not match its roots is
+    returned normally, and
+    :func:`verify_audit_extension_proof_bundle` reports it as ``False``.
+    """
+    if not isinstance(blob, bytes):
+        raise TypeError("blob must be bytes")
+    if not blob.startswith(AUDIT_EXTENSION_PROOF_BUNDLE_WIRE_TAG):
+        raise ValueError("bad audit extension proof bundle tag")
+    offset = len(AUDIT_EXTENSION_PROOF_BUNDLE_WIRE_TAG)
+
+    encoded_proof, offset = _read_audit_proof_block(
+        blob, offset, what="audit extension proof bundle proof"
+    )
+    proof = decode_extension(encoded_proof)
+
+    old_signature, offset = _read_bundle_signature_frame(
+        blob, offset, what="audit extension proof bundle old"
+    )
+    new_signature, offset = _read_bundle_signature_frame(
+        blob, offset, what="audit extension proof bundle new"
+    )
+    if offset != len(blob):
+        raise ValueError("trailing bytes after audit extension proof bundle")
+
+    bundle = AuditExtensionProofBundle(
+        proof=proof,
+        old_signature=old_signature,
+        new_signature=new_signature,
+    )
+    if encode_audit_extension_proof_bundle(bundle) != blob:
+        raise ValueError("non-canonical audit extension proof bundle encoding")
+    return bundle
+
+
+def verify_audit_extension_proof_bundle(
+    bundle: AuditExtensionProofBundle, key: SigningDKGResult
+) -> bool:
+    """Verify a bundle exactly as :func:`check_extension` would.
+
+    This is a convenience wrapper over
+    ``check_extension(bundle.proof, bundle.old_signature,
+    bundle.new_signature, key)``: the old and new roots are rebuilt from
+    the proof's leaves and each signature verified on its
+    ``b"am/r" || U64(n) || root`` statement. Returns ``True`` only when
+    both hold; a well-formed bundle with tampered leaves or ``old_n``, a
+    swapped or mismatched signature pair, or one presented under another
+    key, returns ``False``.
+
+    A non-:class:`AuditExtensionProofBundle` argument raises TypeError;
+    illegal nested proof, signature or key structure raises
+    TypeError/ValueError, exactly as :func:`check_extension` does.
+    """
+    if not isinstance(bundle, AuditExtensionProofBundle):
+        raise TypeError("bundle must be an AuditExtensionProofBundle instance")
+    return check_extension(
+        bundle.proof, bundle.old_signature, bundle.new_signature, key
+    )
+
+
+# ---------------------------------------------------------------------------
 # Seal histories: a non-empty, order-preserving batch of whole-report seals
 # authenticated by one threshold Schnorr signature. The signed history
 # message commits to the verifying public key and to the digest of the exact
@@ -7358,22 +7580,23 @@ class SealHistoryMultiProofBundle:
     signature: AggregateSignature
 
 
-def _check_history_proof_bundle_signature(signature: object) -> int:
+def _check_history_proof_bundle_signature(
+    signature: object, *, field: str = "bundle.signature"
+) -> int:
     """Type- and structure-check a proof bundle's root signature, returning its id count.
 
-    Shared by the single- and multi-proof bundles: the integers and signer
-    set are checked only as the unsigned, ordered structures the wire
-    framing needs; nothing here places ``R``/``z`` in a group (that takes
-    group parameters and is :func:`verify_signature`'s job during
-    :func:`check_history_proof`). ``R`` must be strictly positive (a real
-    commitment is never the identity, and the same value is illegal under
-    :func:`verify_signature`), while ``z`` may be zero and then encodes as
-    the single body byte ``00``.
+    Shared by the single-, multi- and extension-proof bundles: the
+    integers and signer set are checked only as the unsigned, ordered
+    structures the wire framing needs; nothing here places ``R``/``z`` in
+    a group (that takes group parameters and is
+    :func:`verify_signature`'s job during verification). ``R`` must be
+    strictly positive (a real commitment is never the identity, and the
+    same value is illegal under :func:`verify_signature`), while ``z``
+    may be zero and then encodes as the single body byte ``00``.
+    ``field`` names the offending attribute in the TypeError message.
     """
     if not isinstance(signature, AggregateSignature):
-        raise TypeError(
-            "bundle.signature must be an AggregateSignature instance"
-        )
+        raise TypeError(f"{field} must be an AggregateSignature instance")
     if not isinstance(signature.R, int) or isinstance(signature.R, bool):
         raise TypeError("signature.R must be an integer")
     if not isinstance(signature.z, int) or isinstance(signature.z, bool):
