@@ -965,12 +965,20 @@ assert verify_dc(restored, key)  # 结构合法但签名错配仍正常返回对
 封印链上的多个封印还可用一个根签名一并证明归属，而无需出示整条链：
 
 ```python
-from thresholdsign import SMP, make_smp, check_smp
+from thresholdsign import (
+    SMP, SMPBundle, make_smp, check_smp,
+    encode_smp_bundle, decode_smp_bundle, verify_smp_bundle,
+)
 
 # chain 为现有 DeltaReportBundleArchiveSealChain；i 为非空、严格递增的整数元组
 message, proof = make_smp(chain, (0, 2, 4))
 signature = sign_threshold(key, message)        # 一个根签名覆盖多个封印
 assert check_smp(proof, signature, key)
+
+# 证明与根签名可作为一个自界定字节串整体传输，旧接口保持不变
+blob = encode_smp_bundle(SMPBundle(proof, signature))
+bundle = decode_smp_bundle(blob)                # 只复原结构，不验真伪
+assert verify_smp_bundle(bundle, key)
 ```
 
 冻结数据类 `SMP(i, n, s, p)` 字段依次为待证叶下标元组 `tuple[int, ...]`（非空、
@@ -1010,8 +1018,33 @@ assert check_smp(proof, signature, key)
 字段类型错误（`i`/`s`/`p` 非元组、`n` 或下标非整数含布尔、`s` 元素非封印、`p`
 元素非 bytes）或 `key` 类型错误抛 `TypeError`；`n` 非正或达到 `2^64`、空下标、
 下标越界或非严格递增、`s` 与 `i` 数量不同、嵌套封印结构非法、`p` 元素非恰 32
-字节、`p` 数量与 `n`/`i` 推导不符、签名或密钥结构非法抛 `ValueError`。SMP 不引入
-传输编码，也不引入任何网络、存储或隐藏状态；全部旧接口行为不变。
+字节、`p` 数量与 `n`/`i` 推导不符、签名或密钥结构非法抛 `ValueError`。SMP 自身
+不带传输编码，也不引入任何网络、存储或隐藏状态。
+
+SMP 与其根签名可作为一个自界定字节串整体传输：冻结数据类
+`SMPBundle(proof: SMP, signature: AggregateSignature)` 可按位置构造、按值相等，
+构造时不校验字段；`encode_smp_bundle(bundle) -> bytes` 输出
+`b"ts/smpb/v1"||V(n)||U32(k)||ΣV(i)`，其中 `V` 沿用既有 `VARINT`（4 字节无符号
+大端长度 + 最短无符号大端值体，零为单字节 `00`），`U32` 为 4 字节无符号大端，
+`k = |i|`；随后写 `U32` 封印数（等于 `k`）与每帧 `U32(len(E))||E`，`E` 对 `s`
+中对应封印调用既有 `encode_delta_report_bundle_archive_seal` 得到，顺序与 `i`
+一致；再写 `p` 的 `U32` 项数及原序（自叶向根、层内自左向右）的 32 字节摘要，项数
+由 `n`、`i` 唯一推导；末尾签名帧完全沿用 `AuditProofBundle` 规范：
+`V(R)||V(z)||U32(k_s)||ΣV(id)`，`R > 0`、`z >= 0`，`signer_ids` 为非空严格递增
+正整数元组。编码只检查结构（`0 < n < 2^64`、非空严格递增下标且
+`0 <= i < n`、`s` 与 `i` 等数、嵌套封印可被既有编码器编码、`p` 项恰 32 字节且
+数量与推导一致、签名帧结构合法），不核验封印与根签名，同一束的输出唯一。
+
+`decode_smp_bundle(blob: bytes) -> SMPBundle` 仅复原结构、不验真伪，成功须逐字节
+重编码等于输入；非 `bytes` 入参抛 `TypeError`，坏标签、`n` 非正或达到 `2^64`、
+空/越界/非严格递增下标、封印数与下标数不符、空或非规范嵌套封印帧、`p` 项非恰 32
+字节或数量与 `n`/`i` 推导不符、零 `R`、空或非递增签名者集合、非规范整数（前导零
+或超长）、截断及尾随字节抛 `ValueError`。结构合法但封印或根签名错配仍正常返回
+对象。`verify_smp_bundle(bundle, key) -> bool` 是
+`check_smp(bundle.proof, bundle.signature, key)` 的便捷委托：重建根、逐个重验
+披露封印并验证根签名，全部一致才返回 `True`，错配（封印/下标/同伴/签名被改、
+换密钥呈现等）返回 `False`；非 `SMPBundle` 入参抛 `TypeError`，嵌套证明、签名或
+密钥结构非法抛 `ValueError`，边界与 `check_smp` 完全一致。全部旧接口行为不变。
 
 
 ## 命令行演示
@@ -1927,6 +1960,29 @@ python3 -m thresholdsign
   `SMP`/`AggregateSignature` 入参或字段类型错误抛 `TypeError`；`n` 越界、空
   下标、下标非严格递增或越界、`s` 数量不符、嵌套封印非法、`p` 元素非恰 32
   字节、`p` 数量不符、签名或密钥结构非法抛 `ValueError`；无状态
+- `SMPBundle(proof, signature)` — 冻结数据类，字段依次为 `proof: SMP` 与
+  `signature: AggregateSignature`（对 `b"ds/r1"||U64(n)||root` 的门限 Schnorr
+  根签名）；可按位置构造、按值相等，不含网络、存储或隐藏状态，构造时不校验
+- `encode_smp_bundle(bundle) -> bytes` — 输出
+  `b"ts/smpb/v1"||V(n)||U32(k)||ΣV(i)||U32(k)||[U32(len(E))||E]^k||U32(|p|)||p||sig`
+  （`V` 沿用既有 VARINT、`U32` 为 4 字节无符号大端；各封印帧
+  `E = encode_delta_report_bundle_archive_seal(s)`，`p` 为原序 32 字节摘要，
+  项数由 `n`、`i` 唯一推导；末尾 `sig` 为 AuditProofBundle 同款签名帧
+  `V(R)||V(z)||U32(k_s)||ΣV(id)`，`R>0`、`z>=0`、非空严格递增正整数 id）。
+  只检查结构、不验封印与根签名；非 `SMPBundle`/`SMP` 入参或字段类型错误抛
+  `TypeError`；`n` 越界、空/越界/非严格递增下标、`s` 等数不符、嵌套封印非法、
+  `p` 数量不符、签名结构非法、帧超长抛 `ValueError`；输出唯一、无状态
+- `decode_smp_bundle(blob) -> SMPBundle` — 仅恢复结构、不验真伪：拒绝坏标签、
+  `n` 非正或达到 `2^64`、空/越界/非严格递增下标、封印数与下标数不符、空或非
+  规范嵌套封印帧、`p` 项非恰 32 字节或数量与 `n`/`i` 推导不符、零 `R`、空或
+  非递增签名者、非规范整数、截断及尾随，成功须逐字节重编码等于输入；结构合法但
+  封印或签名错配仍返回对象（由 `verify_smp_bundle` 判定）。非 `bytes` 入参抛
+  `TypeError`，其余非法抛 `ValueError`；无状态
+- `verify_smp_bundle(bundle, key) -> bool` —
+  `check_smp(bundle.proof, bundle.signature, key)` 的便捷委托；重建 Merkle 根、
+  逐个重验披露封印、验证根签名，全部为真才 `True`，结构合法但错配（改动封印、
+  下标、同伴、签名或换密钥呈现）返 `False`。非 `SMPBundle` 入参抛 `TypeError`，
+  嵌套结构/签名/密钥非法抛 `ValueError`，边界与 `check_smp` 一致；无状态
 
 ### 门限 Schnorr 群参数与边界
 
