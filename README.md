@@ -1124,6 +1124,53 @@ C = U32(n) || Σ_i ( U32(len(E_i)) || E_i )
 `ValueError`。归档不引入传输编解码，也不引入任何网络、存储或隐藏状态；
 全部旧接口行为不变。
 
+整份归档另有唯一、无状态的规范传输与持久化编码，可作为一条自定界字节串
+跨实现交换：
+
+```python
+from thresholdsign import (
+    SMPBundleArchive,
+    decode_smp_bundle_archive,
+    encode_smp_bundle_archive,
+)
+
+blob = encode_smp_bundle_archive(archive)   # 仅查结构，不排序、不验签
+restored = decode_smp_bundle_archive(blob)  # 仅恢复结构，规范往返
+assert encode_smp_bundle_archive(restored) == blob
+```
+
+`encode_smp_bundle_archive(archive) -> bytes` 依次编码为
+
+```text
+b"thresholdsign/smp-bundle-archive/v1"
+|| U32(n) || Σ_i ( U32(len(E_i)) || E_i )
+|| V(R) || V(z) || U32(k) || Σ V(id)
+```
+
+其中 `n = len(items)` 为项数 U32（归档非空，故不可为零），每包帧按归档原序
+写入且**不排序**：U32 长度后跟
+`E_i = encode_smp_bundle(items[i])`，`E_i` 非空；末尾为外层签名帧
+`V(R)||V(z)||U32(k)||ΣV(id)`，`k = len(signer_ids)`。`V` 为 4 字节无符号
+大端长度加最短无符号大端整数（零为单字节 `00`，正数禁前导零），所有 `U32`
+均为 4 字节无符号大端；`R > 0`、`z ≥ 0`，`signer_ids` 为非空严格递增正整数。
+编码只接受结构合法归档（非空 `SMPBundle` 元组、每包可被 `encode_smp_bundle`
+接受、外层签名帧结构合法），不验任何包或外层签名——结构合法但错配（外签
+密封另一组项、包不核验通过）亦可编码。非 `SMPBundleArchive` 入参、`items`
+非元组、元素非 `SMPBundle` 或任何嵌套字段类型错误抛 `TypeError`；空归档、
+嵌套包结构非法、外层签名结构非法或帧/计数超长抛 `ValueError`。同一归档的
+输出唯一，编码无状态。
+
+`decode_smp_bundle_archive(blob: bytes) -> SMPBundleArchive` 仅恢复结构、
+不验真伪：标签须为 `b"thresholdsign/smp-bundle-archive/v1"`，随后读 U32 非零
+项数与恰好该数个包帧（每帧为 U32 非零长度加 `decode_smp_bundle` 接受的
+字节），末尾签名帧满足 `R > 0`、`z ≥ 0` 且 `signer_ids` 为非空严格递增正整数。
+非 `bytes` 入参抛 `TypeError`；坏标签、零项数、零长或超长帧、计数与帧数
+不符、截断、尾随字节、非规范整数（前导零或超长长度）、非法嵌套包、零 `R`、
+空或非递增签名者集合均抛 `ValueError`；成功解码须逐字节重编码等于输入。
+结构合法但包或外层签名错配的归档仍正常返回，由
+`verify_smp_bundle_archive` 判定。解码不引入任何网络、存储或隐藏状态；
+消息构造、核验及全部旧接口行为不变。
+
 
 ## 命令行演示
 
@@ -2081,6 +2128,20 @@ python3 -m thresholdsign
   签名返 `False`。非 `SMPBundleArchive` 入参、`items` 非元组、元素非
   `SMPBundle`、`key` 类型错误或嵌套字段类型错误抛 `TypeError`；空归档、外签
   结构非法、密钥结构非法或嵌套束结构非法抛 `ValueError`；无状态
+- `encode_smp_bundle_archive(archive) -> bytes` — 整份归档的唯一、无状态
+  规范传输/持久化编码：标签
+  `b"thresholdsign/smp-bundle-archive/v1"`，随后 U32 项数与原序各包帧
+  `U32(len(E_i))||E_i`（`E_i = encode_smp_bundle(items[i])`，非空，不排序），
+  末尾外层签名帧 `V(R)||V(z)||U32(k)||ΣV(id)`；`R > 0`、`z ≥ 0`、ids 非空
+  正递增。仅接受结构合法归档、不验签，错配亦可编码。非
+  `SMPBundleArchive` 入参、`items` 非元组、元素非 `SMPBundle` 或嵌套字段
+  类型错误抛 `TypeError`；空归档、嵌套包或外签结构非法、帧/计数超长抛
+  `ValueError`
+- `decode_smp_bundle_archive(blob) -> SMPBundleArchive` — 仅恢复结构：拒绝
+  坏标签、零项数、零长/超长帧、计数与帧数不符、截断、尾随、非规范整数、
+  非法嵌套包、零 `R`、空或非递增签名者集合；非 `bytes` 抛 `TypeError`，
+  其余格式非法抛 `ValueError`；错配可返回，成功重编码逐字节等于输入，无
+  状态
 
 ### 门限 Schnorr 群参数与边界
 

@@ -314,6 +314,8 @@ __all__ = [
     "verify_smp_bundle",
     "SMPBundleArchive",
     "smp_bundle_archive_message",
+    "encode_smp_bundle_archive",
+    "decode_smp_bundle_archive",
     "verify_smp_bundle_archive",
 ]
 
@@ -10263,6 +10265,7 @@ def verify_smp_bundle(bundle: SMPBundle, key: SigningDKGResult) -> bool:
 # ---------------------------------------------------------------------------
 
 SMP_BUNDLE_ARCHIVE_TAG = b"ts/smpba/m1"
+SMP_BUNDLE_ARCHIVE_WIRE_TAG = b"thresholdsign/smp-bundle-archive/v1"
 
 
 @dataclass(frozen=True)
@@ -10409,6 +10412,195 @@ def verify_smp_bundle_archive(
         generator=generator,
         prime=field_prime,
     )
+
+
+def encode_smp_bundle_archive(archive: SMPBundleArchive) -> bytes:
+    """Canonically encode a whole SMP bundle archive for transport or
+    persistence, so the archive can be exchanged between
+    implementations.
+
+    The encoding is, in order, the tag
+    ``b"thresholdsign/smp-bundle-archive/v1"``, the 4-byte unsigned
+    big-endian item count (never zero), then one frame per bundle in the
+    archive's tuple order — each the 4-byte unsigned big-endian byte
+    length followed by the exact bytes of
+    :func:`encode_smp_bundle` for that item, with no further
+    separators — and finally the outer signature frame:
+    ``V(R)``, ``V(z)``, the 4-byte unsigned big-endian signer count
+    ``k`` and one ``V(id)`` per ascending signer id, the same frame
+    layout an :class:`AuditProofBundle` uses. Every ``U32`` is a 4-byte
+    unsigned big-endian integer. A ``V`` value is a 4-byte unsigned
+    big-endian body length followed by the shortest unsigned big-endian
+    integer (zero is the single byte ``00``, positive values carry no
+    leading zero); ``R`` must be positive and ``z`` may be zero.
+
+    Only a structurally legal :class:`SMPBundleArchive` is accepted — a
+    non-empty tuple of :class:`SMPBundle` values each encodable by
+    :func:`encode_smp_bundle`, and an :class:`AggregateSignature` with
+    a positive ``R``, a non-negative ``z`` and a non-empty tuple of
+    strictly increasing positive ids — but the bundles are neither
+    sorted nor matched against one another and neither they nor the
+    outer signature are verified:
+    :func:`verify_smp_bundle_archive` stays the way to test an archive
+    afterwards, and a structurally legal archive whose bundles do not
+    verify or whose outer signature does not match the items encodes
+    normally. A non-:class:`SMPBundleArchive` argument, a non-tuple
+    ``items`` field, a non-:class:`SMPBundle` element, or any wrong
+    field or element type nested inside a bundle or the outer
+    signature raises TypeError; an empty items tuple, a structurally
+    illegal nested bundle, an illegal outer signature structure, or an
+    over-long count or frame raises ValueError. The output for a given
+    archive is unique — items keep their exact order, nothing is
+    sorted or canonicalized beyond the existing per-bundle encoding —
+    and the encoding carries no network, storage or hidden state.
+    """
+    if not isinstance(archive, SMPBundleArchive):
+        raise TypeError(
+            "archive must be an SMPBundleArchive instance"
+        )
+    items = archive.items
+    if not isinstance(items, tuple):
+        raise TypeError("items must be a tuple")
+    for item in items:
+        if not isinstance(item, SMPBundle):
+            raise TypeError("each archive item must be an SMPBundle instance")
+    item_count = len(items)
+    if item_count == 0:
+        raise ValueError("archive items must be a non-empty tuple")
+    if item_count > 0xFFFFFFFF:
+        raise ValueError("too many SMP bundle archive items")
+
+    # Encode every bundle first — each call raises TypeError/ValueError
+    # for an illegal bundle exactly as the single-bundle codec does —
+    # check the outer signature structure alongside, and only then
+    # frame the results, so any illegal part aborts the whole archive.
+    frames = []
+    for index, item in enumerate(items):
+        encoded = encode_smp_bundle(item)
+        if len(encoded) == 0:
+            raise ValueError(
+                f"SMP bundle archive item {index + 1} encoding is empty"
+            )
+        if len(encoded) > 0xFFFFFFFF:
+            raise ValueError(
+                f"SMP bundle archive item {index + 1} encoding too long"
+            )
+        frames.append(encoded)
+    signer_count = _check_history_proof_bundle_signature(
+        archive.signature, field="archive.signature"
+    )
+    if signer_count > 0xFFFFFFFF:
+        raise ValueError("too many signer ids")
+
+    buffer = bytearray(SMP_BUNDLE_ARCHIVE_WIRE_TAG)
+    buffer += item_count.to_bytes(4, "big", signed=False)
+    for encoded in frames:
+        buffer += len(encoded).to_bytes(4, "big", signed=False)
+        buffer += encoded
+    buffer += _encode_varint(archive.signature.R)
+    buffer += _encode_varint(archive.signature.z)
+    buffer += signer_count.to_bytes(4, "big", signed=False)
+    for signer_id in archive.signature.signer_ids:
+        buffer += _encode_varint(signer_id)
+    return bytes(buffer)
+
+
+def decode_smp_bundle_archive(blob: bytes) -> SMPBundleArchive:
+    """Decode the canonical encoding produced by
+    :func:`encode_smp_bundle_archive`.
+
+    Accepts only the single canonical form: the tag
+    ``b"thresholdsign/smp-bundle-archive/v1"``, a 4-byte unsigned
+    big-endian non-zero item count, then exactly that many frames in
+    order — each a 4-byte unsigned big-endian non-zero byte length
+    followed by the exact canonical encoding of one
+    :class:`SMPBundle` that :func:`decode_smp_bundle` accepts — and
+    finally the outer signature frame an :class:`AuditProofBundle`
+    uses: the length-prefixed integers ``R`` and ``z`` with ``R``
+    positive, the 4-byte non-zero signer count ``k`` and then exactly
+    ``k`` strictly increasing positive signer ids. A non-bytes
+    argument raises TypeError; a wrong or missing tag, a zero item
+    count, a zero or over-long frame length, a count that does not
+    match the number of frames, truncation, trailing bytes, a frame
+    whose nested bundle encoding is illegal or non-canonical
+    (including a frame that would not re-encode byte for byte), a
+    zero ``R``, a non-canonical integer (a leading zero or an
+    over-long length), a zero signer count, or a non-positive or
+    non-increasing signer id raises ValueError. A successfully
+    decoded archive re-encodes to exactly the input bytes.
+
+    Decoding only restores structure: each nested bundle is decoded
+    with :func:`decode_smp_bundle` (which verifies no seal and checks
+    no signature) and the outer signature is not checked. A
+    structurally legal archive whose bundles do not verify or whose
+    outer signature does not match the items is returned normally,
+    and :func:`verify_smp_bundle_archive` reports it as ``False``.
+    """
+    if not isinstance(blob, bytes):
+        raise TypeError("blob must be bytes")
+    if not blob.startswith(SMP_BUNDLE_ARCHIVE_WIRE_TAG):
+        raise ValueError("bad SMP bundle archive tag")
+    offset = len(SMP_BUNDLE_ARCHIVE_WIRE_TAG)
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated SMP bundle archive item count")
+    item_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    if item_count == 0:
+        raise ValueError("SMP bundle archive items must be non-empty")
+
+    items = []
+    for index in range(item_count):
+        frame, offset = _read_audit_proof_block(
+            blob,
+            offset,
+            what=f"SMP bundle archive item {index + 1}",
+        )
+        items.append(decode_smp_bundle(frame))
+
+    R, offset = _read_varint(
+        blob, offset, what="SMP bundle archive signature R"
+    )
+    z, offset = _read_varint(
+        blob, offset, what="SMP bundle archive signature z"
+    )
+    if R == 0:
+        raise ValueError("SMP bundle archive signature R must be positive")
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated SMP bundle archive signer count")
+    signer_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    if signer_count == 0:
+        raise ValueError("SMP bundle archive must name at least one signer")
+
+    signer_ids = []
+    for _ in range(signer_count):
+        signer_id, offset = _read_varint(
+            blob,
+            offset,
+            what="SMP bundle archive signer id",
+        )
+        if signer_id == 0:
+            raise ValueError("SMP bundle archive signer ids must be positive")
+        if signer_ids and signer_id <= signer_ids[-1]:
+            raise ValueError(
+                "SMP bundle archive signer ids must be "
+                "strictly increasing and unique"
+            )
+        signer_ids.append(signer_id)
+    if offset != len(blob):
+        raise ValueError("trailing bytes after SMP bundle archive")
+
+    archive = SMPBundleArchive(
+        items=tuple(items),
+        signature=AggregateSignature(
+            R=R, z=z, signer_ids=tuple(signer_ids)
+        ),
+    )
+    if encode_smp_bundle_archive(archive) != blob:
+        raise ValueError("non-canonical SMP bundle archive encoding")
+    return archive
 
 
 # ---------------------------------------------------------------------------
