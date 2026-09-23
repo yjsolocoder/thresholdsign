@@ -37,7 +37,10 @@ one root signature, plus their canonical transport encoding
 encode_history_multi_proof / decode_history_multi_proof and the
 proof-plus-signature bundle SealHistoryMultiProofBundle /
 encode_history_multi_proof_bundle / decode_history_multi_proof_bundle /
-verify_history_multi_proof_bundle, publicly
+verify_history_multi_proof_bundle, and the append-only consistency proofs
+SealHistoryExtension / make_history_extension / check_history_extension
+that confirm an old sealed item sequence is a prefix of a new one from
+the two root signatures alone without disclosing any seal, publicly
 verifiable key-rotation authorization: Rotation / rotation_payload /
 verify_rotation, the persistent, multi-hop authorization chain
 RotationChain / verify_rotation_chain / encode_rotation_chain /
@@ -221,6 +224,9 @@ __all__ = [
     "encode_history_multi_proof_bundle",
     "decode_history_multi_proof_bundle",
     "verify_history_multi_proof_bundle",
+    "SealHistoryExtension",
+    "make_history_extension",
+    "check_history_extension",
     "Rotation",
     "rotation_payload",
     "verify_rotation",
@@ -12152,3 +12158,217 @@ def verify_history_proof_bundle(
     if not isinstance(bundle, SealHistoryProofBundle):
         raise TypeError("bundle must be a SealHistoryProofBundle instance")
     return check_history_proof(bundle.proof, bundle.signature, key)
+
+
+# ---------------------------------------------------------------------------
+# Append-only consistency (extension) proofs over the same seal-history
+# Merkle tree: a compact statement that the first ``old_total`` items of a
+# seal history are exactly the items of an older, shorter history. The proof
+# carries only the leaf digests — never a ReportSeal — and both the old and
+# the new statement are the ordinary root messages
+# ``b"sh/r" || U64(total) || root`` of the shared SealHistoryProof tree
+# rules, so an observer needs nothing but the two threshold signatures to
+# check the prefix relation. No state is kept.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SealHistoryExtension:
+    """An append-only consistency proof between two seal-history roots.
+
+    The fields, in order, are ``old_total`` (the non-empty old item count,
+    strictly smaller than the new total) and ``leaves`` (the 32-byte leaf
+    digests of the full new history item sequence, in order, each exactly
+    ``H(b"sh/l" || U64(i) || H(encode_seal(item)))`` as in
+    :func:`make_history_proof`; the tuple is non-empty). The first
+    ``old_total`` leaves rebuild the old root and all of them rebuild the
+    new root, so the proof discloses no seal — only its digest. The
+    dataclass is frozen, positionally constructible and compared by value,
+    and carries no network, storage or hidden state. Field types and
+    bounds are not checked at construction time —
+    :func:`check_history_extension` is the way to test a proof afterwards.
+    """
+
+    old_total: int
+    leaves: tuple[bytes, ...]
+
+
+def _history_extension_root(leaves: tuple[bytes, ...]) -> bytes:
+    """Root digest of the SealHistoryProof tree rebuilt from leaf digests.
+
+    The pairing rules are exactly those of :func:`_history_proof_levels`:
+    a level with an odd tail width duplicates its last node, and internal
+    nodes are ``H(b"sh/n" || left || right)``.
+    """
+    current = leaves
+    while len(current) > 1:
+        if len(current) % 2 == 1:
+            current = current + current[-1:]
+        current = tuple(
+            _history_proof_node(current[index], current[index + 1])
+            for index in range(0, len(current), 2)
+        )
+    return current[0]
+
+
+def make_history_extension(
+    history: SealHistory, old_total: int
+) -> tuple[bytes, bytes, SealHistoryExtension]:
+    """Build the old and new root statements and a consistency proof.
+
+    ``history`` must be a structurally legal :class:`SealHistory` — a
+    non-empty tuple of :class:`ReportSeal` values each encodable by
+    :func:`encode_seal` — and ``old_total`` the old item count, which must
+    be non-zero and strictly smaller than the total item count ``n``; both
+    counts fit ``0 < old_total < n < 2**64``. The tree rules are exactly
+    those of :func:`make_history_proof`: leaves are
+    ``H(b"sh/l" || U64(i) || H(encode_seal(item)))`` and internal nodes
+    ``H(b"sh/n" || left || right)``; a level with an odd tail width
+    duplicates its last node for pairing. The first ``old_total`` leaves
+    give the old root and all leaves give the new root. Returns
+    ``(old_message, new_message, proof)`` where both messages are
+    ``b"sh/r" || U64(total) || root`` with ``total`` the old count and the
+    total count respectively — the bytes to be threshold-signed — and
+    ``proof`` is the :class:`SealHistoryExtension` carrying every leaf
+    digest and disclosing no seal.
+
+    Wrong argument types raise TypeError: a non-:class:`SealHistory`
+    history or a non-integer (including boolean) ``old_total``. An empty
+    history, a structurally illegal item seal, a count that does not fit
+    the 8-byte counter, or an ``old_total`` outside
+    ``0 < old_total < n`` raises ValueError.
+    """
+    if not isinstance(history, SealHistory):
+        raise TypeError("history must be a SealHistory instance")
+    if not isinstance(old_total, int) or isinstance(old_total, bool):
+        raise TypeError("old_total must be an integer")
+    total = _check_seal_history_items(history.items)
+    if total > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("too many history items")
+    if old_total <= 0 or old_total >= total:
+        raise ValueError("old_total out of range")
+
+    leaves = tuple(
+        _history_proof_leaf(index, seal)
+        for index, seal in enumerate(history.items)
+    )
+    old_root = _history_extension_root(leaves[:old_total])
+    new_root = _history_extension_root(leaves)
+    old_message = (
+        SEAL_HISTORY_PROOF_ROOT_TAG + _history_proof_u64(old_total) + old_root
+    )
+    new_message = (
+        SEAL_HISTORY_PROOF_ROOT_TAG + _history_proof_u64(total) + new_root
+    )
+    proof = SealHistoryExtension(old_total=old_total, leaves=leaves)
+    return old_message, new_message, proof
+
+
+def _validate_history_extension_structure(
+    proof: object,
+) -> tuple[int, tuple[bytes, ...]]:
+    """Type- and structure-check a SealHistoryExtension, returning its fields.
+
+    Only the container structure is checked: nothing is encoded or
+    verified against a key here. The bounds are
+    ``0 < old_total < len(leaves)`` and ``len(leaves) <= 2**64 - 1``; the
+    leaf tuple must be non-empty and every entry exactly 32 bytes. Wrong
+    field types raise TypeError; illegal bounds, an empty leaf tuple or a
+    leaf of the wrong width raise ValueError.
+    """
+    if not isinstance(proof, SealHistoryExtension):
+        raise TypeError("proof must be a SealHistoryExtension instance")
+    old_total = proof.old_total
+    leaves = proof.leaves
+    if not isinstance(old_total, int) or isinstance(old_total, bool):
+        raise TypeError("proof.old_total must be an integer")
+    if not isinstance(leaves, tuple):
+        raise TypeError("proof.leaves must be a tuple")
+    for leaf in leaves:
+        if not isinstance(leaf, bytes):
+            raise TypeError("proof.leaves entries must be bytes")
+
+    try:
+        count = len(leaves)
+    except OverflowError:
+        raise ValueError("too many leaves") from None
+    if count == 0:
+        raise ValueError("proof.leaves must be non-empty")
+    if count > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("too many leaves")
+    if old_total <= 0 or old_total >= count:
+        raise ValueError("proof.old_total out of range")
+    for leaf in leaves:
+        if len(leaf) != SEAL_HISTORY_PROOF_DIGEST_SIZE:
+            raise ValueError("proof.leaves entries must be exactly 32 bytes")
+    return old_total, leaves
+
+
+def check_history_extension(
+    proof: SealHistoryExtension,
+    old_sig: AggregateSignature,
+    new_sig: AggregateSignature,
+    key: SigningDKGResult,
+) -> bool:
+    """Verify a consistency proof against its two threshold signatures.
+
+    The old root is rebuilt from the first ``proof.old_total`` leaves of
+    ``proof.leaves`` and the new root from all of them, exactly as in
+    :func:`make_history_extension` with the :func:`make_history_proof`
+    tree rules (odd tails pair with themselves); the statements
+    ``b"sh/r" || U64(old_total) || old_root`` and
+    ``b"sh/r" || U64(n) || new_root`` are then checked as ``old_sig``'s
+    and ``new_sig``'s threshold Schnorr messages via
+    :func:`verify_signature` under ``key``. Returns ``True`` only when both
+    signatures verify: an observer learns nothing but the two signatures
+    and the leaf digests — no seal is disclosed — yet is convinced the old
+    sealed item sequence is a prefix of the new one. A well-formed proof
+    whose leaves or ``old_total`` were tampered with, a swapped or
+    mismatched signature pair, or a proof presented under another key
+    returns ``False``.
+
+    A non-:class:`SealHistoryExtension` proof, a
+    non-:class:`AggregateSignature` signature or any wrong field type
+    (non-integer ``old_total`` including booleans, a non-tuple leaf
+    sequence or non-bytes leaf) raises TypeError; an empty leaf tuple, a
+    leaf that is not exactly 32 bytes, a total over ``2**64 - 1``, an
+    ``old_total`` outside ``0 < old_total < n``, or a structurally illegal
+    signature or ``key`` raises ValueError, exactly as
+    :func:`verify_signature` would.
+    """
+    old_total, leaves = _validate_history_extension_structure(proof)
+    if not isinstance(old_sig, AggregateSignature):
+        raise TypeError("old_sig must be an AggregateSignature instance")
+    if not isinstance(new_sig, AggregateSignature):
+        raise TypeError("new_sig must be an AggregateSignature instance")
+
+    _result, public_key, field_prime, group_prime, generator = _check_signing_setup(key)
+    _check_signing_dkg_structure(key)
+
+    old_root = _history_extension_root(leaves[:old_total])
+    new_root = _history_extension_root(leaves)
+    old_message = (
+        SEAL_HISTORY_PROOF_ROOT_TAG + _history_proof_u64(old_total) + old_root
+    )
+    new_message = (
+        SEAL_HISTORY_PROOF_ROOT_TAG
+        + _history_proof_u64(len(leaves))
+        + new_root
+    )
+    if not verify_signature(
+        old_message,
+        old_sig,
+        public_key,
+        group_prime=group_prime,
+        generator=generator,
+        prime=field_prime,
+    ):
+        return False
+    return verify_signature(
+        new_message,
+        new_sig,
+        public_key,
+        group_prime=group_prime,
+        generator=generator,
+        prime=field_prime,
+    )

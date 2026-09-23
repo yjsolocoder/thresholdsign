@@ -1605,6 +1605,38 @@ python3 -m thresholdsign
   便捷包装，结果完全等同：逐项复核封印、按多证明重建根并验证根签名；
   非 `SealHistoryMultiProofBundle` 入参抛 `TypeError`，嵌套证明、
   签名或密钥结构非法抛 `ValueError`，合法但不匹配返回 `False`；无状态
+- `SealHistoryExtension(old_total, leaves)` — 冻结数据类，字段依次为
+  `old_total`（非空旧序列项数，严格小于新项数）与 `leaves`（新历史
+  全部叶摘要的非空元组，按序排列，每项恰 32 字节，即
+  `H(b"sh/l" || U64(i) || H(encode_seal(item)))`）；可按位置构造、
+  按值相等与哈希，构造时不校验，结构由
+  `check_history_extension` 检查；不公开任何封印，只携带摘要，不含
+  网络、存储或隐藏状态
+- `make_history_extension(history, old_total) -> tuple[bytes, bytes, SealHistoryExtension]`
+  — 由一个 `SealHistory` 构造追加一致性证明，两参数均无默认。
+  `history` 须为结构合法的非空封印历史，`old_total` 为非布尔整数且
+  满足 `0 < old_total < n < 2^64`，`n` 为新历史项数。树规则与
+  `make_history_proof` 完全一致（叶标签 `b"sh/l"`、节点标签
+  `b"sh/n"`、根标签 `b"sh/r"`，`U64` 为 8 字节无符号大端，奇数尾
+  复制自身配对）：前 `old_total` 个叶重建旧根、全部叶重建新根，
+  返回 `(old_message, new_message, proof)`，两条根消息均为
+  `b"sh/r" || U64(total) || root`（分别绑定旧项数与新项数），即待
+  门限签署的字节；证明只含叶摘要、无状态。非 `SealHistory` 入参或
+  `old_total` 非整数（含布尔）抛 `TypeError`；空历史、嵌套封印结构
+  非法、项数不小于 `2^64` 或 `old_total` 越界抛 `ValueError`
+- `check_history_extension(proof, old_sig, new_sig, key) -> bool` —
+  仅凭旧、新两个门限根签名核验前缀关系：由 `proof.leaves` 前
+  `old_total` 个叶重建旧根、全部叶重建新根（奇数尾自配），分别对
+  `b"sh/r" || U64(old_total) || root` 与
+  `b"sh/r" || U64(n) || root` 调用 `verify_signature`，两者皆验证
+  通过才返回 `True`；观察者无需任何封印本体即可确认旧序列是新序列
+  前缀。叶或 `old_total` 被篡改、叶序调换、叶截断、签名互换或不
+  匹配、换用其他密钥，对合法输入均返回 `False`。非
+  `SealHistoryExtension`/`AggregateSignature` 入参，或字段类型错误
+  （`old_total` 非整数含布尔、`leaves` 非元组、叶非 `bytes`）抛
+  `TypeError`；空历史/空叶、叶非恰 32 字节、总叶数不小于 `2^64`、
+  `old_total` 不在 `0 < old_total < n`、嵌套签名或密钥结构非法抛
+  `ValueError`；无状态
 - `Rotation(old, new, ids, t, q, p, g, sig)` — 冻结数据类，可按位置构造、按值
   相等；公开可验证的密钥轮换授权证书：`old`/`new` 为新旧联合公钥，`ids` 为严格
   递增的新成员编号元组，`t` 为新 threshold，`q`/`p`/`g` 为域素数、群素数与
