@@ -1683,6 +1683,36 @@ python3 -m thresholdsign
   非规范 anchor、帧内非法证书、计数不符、溢出、截断、尾随字节，成功后重编码
   必得到原字节；签名不匹配或衔接断裂由 `verify_rotation_chain` 返回 `False`。
   非 `bytes` 入参抛 `TypeError`，其余非法情形抛 `ValueError`
+- `RHE(extension, rotations, old_sig, new_sig)` — 冻结数据类，四字段无默认，
+  可按位置构造、按值相等与哈希，不含网络、存储或隐藏状态；跨密钥的封印历史
+  追加证明：`extension` 为 `SealHistoryExtension`，`rotations` 为非空且保序
+  的 `RotationChain`（构造时不强制，由 `check_rhe` 核验），`old_sig`/
+  `new_sig` 分别为旧、新密钥对各自
+  `b"sh/r" || U64(total) || root` 根语句的 `AggregateSignature`；构造时不
+  校验字段类型与边界
+- `check_rhe(x) -> bool` — 仅凭证明自身内容完成跨密钥核验：先按既有树规则
+  由 `x.extension` 重建旧、新双根（前 `old_total` 个叶为旧根、全部叶为新根，
+  奇数尾自配），再先验 `verify_rotation_chain(x.rotations)`，通过后以首张
+  证书的群参数与公钥 `(certificates[0].q, .p, .g, .old)` 对
+  `b"sh/r" || U64(old_total) || old_root` 验 `old_sig`，以末张证书的
+  `(.q, .p, .g, .new)` 对 `b"sh/r" || U64(n) || new_root` 验 `new_sig`；
+  三者全真返回 `True`，链断裂/证书签名不合法、任一签名错配或属于错误端点
+  群/密钥、签名对调、叶或 `old_total` 被篡改均返回 `False`。非 `RHE` 入参或
+  字段类型错误抛 `TypeError`；空轮换链、空叶/叶宽错误、`old_total` 越界、
+  证书或签名结构非法抛 `ValueError`；无状态
+- `encode_rhe(x) -> bytes` — 跨密钥追加证明的规范编码，输出唯一、不验签：
+  依次为标签 `b"ts/rhe/v1"`、扩展体
+  `E = U64(old_total) || U64(n) || leaf_1 || ... || leaf_n`（`U64` 为八字节
+  无符号大端，叶按序各 32 字节）的 U32 长度帧（4 字节无符号大端长度 + `E`）、
+  `C = encode_rotation_chain(x.rotations)` 的 U32 长度帧，再依次直拼旧、新
+  两个既有规范签名帧（`VARINT(R)`、`VARINT(z)`、U32 签名者数 `k` 及
+  `k` 个递增 `VARINT(id)`）。只校验结构：扩展/链结构非法或签名结构非法抛
+  `ValueError`，类型错误抛 `TypeError`；不验证轮换链或根签名
+- `decode_rhe(b) -> RHE` — `encode_rhe` 的逆操作，不验签：只接受唯一规范
+  形式，拒绝非 `bytes` 入参（`TypeError`）与坏标签、零长/超长帧、计数与叶
+  宽不符、非 32 字节叶、空轮换链或坏嵌套链、非规范整数、空签名者集、截断或
+  尾随字节（`ValueError`）；成功后重编码必逐字节等于输入，链或签名不匹配由
+  `check_rhe` 返回 `False`
 - `AuditChain(records, signature)` — 冻结数据类，可按位置构造、按值相等；
   由门限 Schnorr 签名认证的无状态审计链：`records` 为非空且保序的
   `(message, SigningAudit)` 元组，链序即回执封装顺序，`signature` 为对

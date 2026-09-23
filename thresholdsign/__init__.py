@@ -40,7 +40,10 @@ encode_history_multi_proof_bundle / decode_history_multi_proof_bundle /
 verify_history_multi_proof_bundle, and the append-only consistency proofs
 SealHistoryExtension / make_history_extension / check_history_extension
 that confirm an old sealed item sequence is a prefix of a new one from
-the two root signatures alone without disclosing any seal, publicly
+the two root signatures alone without disclosing any seal, and the
+cross-key form RHE / encode_rhe / decode_rhe / check_rhe that ties the
+two root signatures to a non-empty RotationChain so the old and new
+roots may be signed by different threshold keys, publicly
 verifiable key-rotation authorization: Rotation / rotation_payload /
 verify_rotation, the persistent, multi-hop authorization chain
 RotationChain / verify_rotation_chain / encode_rotation_chain /
@@ -227,6 +230,10 @@ __all__ = [
     "SealHistoryExtension",
     "make_history_extension",
     "check_history_extension",
+    "RHE",
+    "encode_rhe",
+    "decode_rhe",
+    "check_rhe",
     "Rotation",
     "rotation_payload",
     "verify_rotation",
@@ -12372,3 +12379,294 @@ def check_history_extension(
         generator=generator,
         prime=field_prime,
     )
+
+
+# ---------------------------------------------------------------------------
+# Cross-key append-only proofs: a seal-history consistency statement whose
+# old and new root signatures come from different threshold keys, linked by a
+# non-empty RotationChain proving the path from the old key to the new one.
+# The extension body E carries only the fixed-width tree statement
+# ``U64(old_total) || U64(n) || leaves`` and C is the existing canonical
+# rotation-chain encoding; both root signatures are the existing canonical
+# bundle signature frames. The value is frozen and keeps no state —
+# verify_rotation_chain authorizes the key path and the two root checks
+# certify the prefix relation under each endpoint's own group parameters.
+# ---------------------------------------------------------------------------
+
+RHE_WIRE_TAG = b"ts/rhe/v1"
+
+
+@dataclass(frozen=True)
+class RHE:
+    """A cross-key seal-history append proof.
+
+    The fields, in order, are ``extension`` (a :class:`SealHistoryExtension`
+    carrying the full new history's leaf digests), ``rotations`` (a
+    non-empty, order-preserving :class:`RotationChain` from the old signing
+    key to the new one), ``old_sig`` (the old key's
+    :class:`AggregateSignature` on the old
+    ``b"sh/r" || U64(old_total) || old_root`` statement) and ``new_sig``
+    (the new key's :class:`AggregateSignature` on the new
+    ``b"sh/r" || U64(n) || new_root`` statement). The dataclass is frozen,
+    positionally constructible and compared by value, has no field
+    defaults, and carries no network, storage or hidden state. Field types
+    and bounds are not checked at construction time —
+    :func:`encode_rhe` checks the structure and :func:`check_rhe` is the
+    way to test a proof afterwards.
+    """
+
+    extension: SealHistoryExtension
+    rotations: RotationChain
+    old_sig: AggregateSignature
+    new_sig: AggregateSignature
+
+
+def _rhe_extension_body(
+    old_total: int, leaves: tuple[bytes, ...]
+) -> bytes:
+    """The fixed-width extension body ``E = U64(old_total) || U64(n) || leaves``."""
+    buffer = bytearray(_history_proof_u64(old_total))
+    buffer += _history_proof_u64(len(leaves))
+    for leaf in leaves:
+        buffer += leaf
+    return bytes(buffer)
+
+
+def _check_rhe_fields(
+    x: object,
+) -> tuple[
+    SealHistoryExtension,
+    RotationChain,
+    AggregateSignature,
+    AggregateSignature,
+    int,
+    tuple[bytes, ...],
+]:
+    """Type- and structure-check an :class:`RHE`, returning its parts.
+
+    The extension goes through the same structural checks as
+    :func:`check_history_extension`, the chain through those of
+    :func:`verify_rotation_chain` (without verifying any certificate), and
+    both signatures through the bundle signature structure checks. Nothing
+    here verifies a signature or a linkage.
+    """
+    if not isinstance(x, RHE):
+        raise TypeError("x must be an RHE instance")
+    old_total, leaves = _validate_history_extension_structure(x.extension)
+    if not isinstance(x.rotations, RotationChain):
+        raise TypeError("x.rotations must be a RotationChain instance")
+    _check_rotation_chain_fields(x.rotations.anchor, x.rotations.certificates)
+    _check_history_proof_bundle_signature(x.old_sig, field="x.old_sig")
+    _check_history_proof_bundle_signature(x.new_sig, field="x.new_sig")
+    return x.extension, x.rotations, x.old_sig, x.new_sig, old_total, leaves
+
+
+def encode_rhe(x: RHE) -> bytes:
+    """Canonically encode a cross-key append proof for transport or persistence.
+
+    The encoding is, in order, the tag ``b"ts/rhe/v1"``, the 4-byte unsigned
+    big-endian length ``len(E)`` followed by the fixed-width extension body
+    ``E = U64(old_total) || U64(n) || leaf_1 || ... || leaf_n`` where both
+    counts are 8-byte unsigned big-endian and the leaves are the extension's
+    32-byte digests in order, the 4-byte unsigned big-endian length
+    ``len(C)`` followed by ``C = encode_rotation_chain(x.rotations)``, and
+    then the old and new signature frames, each exactly the canonical
+    signature frame of :func:`encode_history_proof_bundle`:
+    ``VARINT(R)``, ``VARINT(z)``, the 4-byte unsigned big-endian signer
+    count and one ``VARINT(id)`` per ascending signer id.
+
+    Only structure is checked: the extension and chain must be well formed
+    (the exact bounds of :func:`check_history_extension` and
+    :func:`encode_rotation_chain`) and both signatures structurally legal,
+    but the rotation chain is not verified, neither signature is checked
+    against a root and the two signatures may belong to unrelated groups —
+    :func:`check_rhe` stays the way to verify a proof afterwards. Wrong
+    argument or field types raise TypeError; an empty rotation chain, an
+    empty or mis-sized leaf set, an out-of-range ``old_total``, a leaf that
+    is not exactly 32 bytes, a negative chain anchor, an illegal chain
+    certificate, an illegal signature, or an over-long frame raises
+    ValueError. The output for a given proof is unique and the encoding
+    carries no network, storage or hidden state.
+    """
+    extension, rotations, old_sig, new_sig, old_total, leaves = (
+        _check_rhe_fields(x)
+    )
+
+    extension_body = _rhe_extension_body(old_total, leaves)
+    chain_body = encode_rotation_chain(rotations)
+    old_signer_count = _check_history_proof_bundle_signature(
+        old_sig, field="x.old_sig"
+    )
+    new_signer_count = _check_history_proof_bundle_signature(
+        new_sig, field="x.new_sig"
+    )
+    if len(extension_body) > 0xFFFFFFFF:
+        raise ValueError("rhe extension encoding too long")
+    if len(chain_body) > 0xFFFFFFFF:
+        raise ValueError("rhe rotation chain encoding too long")
+    if old_signer_count > 0xFFFFFFFF or new_signer_count > 0xFFFFFFFF:
+        raise ValueError("too many signer ids")
+
+    buffer = bytearray(RHE_WIRE_TAG)
+    buffer += len(extension_body).to_bytes(4, "big", signed=False)
+    buffer += extension_body
+    buffer += len(chain_body).to_bytes(4, "big", signed=False)
+    buffer += chain_body
+    for signature in (old_sig, new_sig):
+        buffer += _encode_varint(signature.R)
+        buffer += _encode_varint(signature.z)
+        buffer += len(signature.signer_ids).to_bytes(4, "big", signed=False)
+        for signer_id in signature.signer_ids:
+            buffer += _encode_varint(signer_id)
+    return bytes(buffer)
+
+
+def decode_rhe(b: bytes) -> RHE:
+    """Decode the canonical encoding produced by :func:`encode_rhe`.
+
+    Accepts only the single canonical form: the tag ``b"ts/rhe/v1"``, a
+    4-byte non-zero frame length followed by the extension body
+    ``U64(old_total) || U64(n)`` and exactly ``n`` consecutive 32-byte leaf
+    digests, a 4-byte non-zero frame length followed by bytes that
+    :func:`decode_rotation_chain` accepts, and then the old and new
+    signature frames, each the length-prefixed integers ``R`` and ``z``,
+    the 4-byte non-zero signer count and exactly that many strictly
+    increasing positive signer ids. A non-bytes argument raises TypeError;
+    a wrong or missing tag, a zero or over-long frame length, a leaf count
+    that does not match the body width, a non-32-byte leaf, an empty
+    rotation chain, an illegal chain certificate, a zero ``R``, a
+    non-canonical integer (leading zero or over-long length), a zero
+    signer count, a non-positive or non-increasing signer id, truncation,
+    or trailing bytes raises ValueError, as does any chain encoding that
+    :func:`decode_rotation_chain` rejects. A successfully decoded proof
+    re-encodes to exactly the input bytes.
+
+    Decoding never verifies anything: the rotation chain certificates and
+    the old and new root signatures are not checked and the two signatures
+    need not belong to the chain's endpoint groups. A structurally legal
+    proof whose chain or signatures do not verify is returned normally,
+    and :func:`check_rhe` reports it as ``False``.
+    """
+    if not isinstance(b, bytes):
+        raise TypeError("b must be bytes")
+    if not b.startswith(RHE_WIRE_TAG):
+        raise ValueError("bad rhe tag")
+    offset = len(RHE_WIRE_TAG)
+
+    extension_body, offset = _read_audit_proof_block(
+        b, offset, what="rhe extension body"
+    )
+    if len(extension_body) < 16:
+        raise ValueError("truncated rhe extension body")
+    old_total = int.from_bytes(extension_body[:8], "big", signed=False)
+    leaf_count = int.from_bytes(extension_body[8:16], "big", signed=False)
+    leaf_bytes = extension_body[16:]
+    if leaf_count == 0:
+        raise ValueError("rhe extension leaves must be non-empty")
+    if old_total <= 0 or old_total >= leaf_count:
+        raise ValueError("rhe extension old_total out of range")
+    if len(leaf_bytes) != leaf_count * SEAL_HISTORY_PROOF_DIGEST_SIZE:
+        raise ValueError("rhe extension leaf width does not match count")
+    leaves = tuple(
+        leaf_bytes[
+            index: index + SEAL_HISTORY_PROOF_DIGEST_SIZE
+        ]
+        for index in range(
+            0,
+            len(leaf_bytes),
+            SEAL_HISTORY_PROOF_DIGEST_SIZE,
+        )
+    )
+    extension = SealHistoryExtension(old_total=old_total, leaves=leaves)
+
+    chain_body, offset = _read_audit_proof_block(
+        b, offset, what="rhe rotation chain"
+    )
+    rotations = decode_rotation_chain(chain_body)
+
+    old_sig, offset = _read_bundle_signature_frame(
+        b, offset, what="rhe old"
+    )
+    new_sig, offset = _read_bundle_signature_frame(
+        b, offset, what="rhe new"
+    )
+    if offset != len(b):
+        raise ValueError("trailing bytes after rhe")
+
+    proof = RHE(
+        extension=extension,
+        rotations=rotations,
+        old_sig=old_sig,
+        new_sig=new_sig,
+    )
+    if encode_rhe(proof) != b:
+        raise ValueError("non-canonical rhe encoding")
+    return proof
+
+
+def check_rhe(x: RHE) -> bool:
+    """Verify a cross-key append proof from nothing but its own contents.
+
+    The two roots are rebuilt from ``x.extension`` with the ordinary seal
+    history tree rules (the first ``old_total`` leaves give the old root
+    and all leaves the new one, odd tails pairing with themselves). The
+    rotation chain is first checked with :func:`verify_rotation_chain`;
+    only if that holds are the root signatures checked: ``x.old_sig`` is
+    verified on ``b"sh/r" || U64(old_total) || old_root`` under the first
+    certificate's group parameters and key
+    ``(q0, p0, g0, certificates[0].old)``, and ``x.new_sig`` on
+    ``b"sh/r" || U64(n) || new_root`` under the last certificate's group
+    parameters and key ``(qm, pm, gm, certificates[-1].new)``. Returns
+    ``True`` only when the chain verifies and both endpoint root
+    signatures verify; a well-formed proof with a broken chain, a
+    mismatched or wrong-group signature, tampered leaves or a swapped
+    signature pair returns ``False``.
+
+    A non-:class:`RHE` argument or wrong field types raise TypeError; an
+    empty rotation chain, an empty or mis-sized leaf set, an out-of-range
+    ``old_total``, a structurally illegal chain certificate or signature,
+    or a signature whose values do not fit its endpoint group raises
+    TypeError/ValueError, exactly as :func:`verify_rotation_chain`,
+    :func:`_validate_history_extension_structure` and
+    :func:`verify_signature` do.
+    """
+    _extension, rotations, old_sig, new_sig, old_total, leaves = (
+        _check_rhe_fields(x)
+    )
+
+    if not verify_rotation_chain(rotations):
+        return False
+
+    first = rotations.certificates[0]
+    last = rotations.certificates[-1]
+    old_root = _history_extension_root(leaves[:old_total])
+    new_root = _history_extension_root(leaves)
+    old_message = (
+        SEAL_HISTORY_PROOF_ROOT_TAG + _history_proof_u64(old_total) + old_root
+    )
+    new_message = (
+        SEAL_HISTORY_PROOF_ROOT_TAG
+        + _history_proof_u64(len(leaves))
+        + new_root
+    )
+
+    result = True
+    if not verify_signature(
+        old_message,
+        old_sig,
+        first.old,
+        group_prime=first.p,
+        generator=first.g,
+        prime=first.q,
+    ):
+        result = False
+    if not verify_signature(
+        new_message,
+        new_sig,
+        last.new,
+        group_prime=last.p,
+        generator=last.g,
+        prime=last.q,
+    ):
+        result = False
+    return result
