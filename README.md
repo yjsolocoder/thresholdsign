@@ -1637,6 +1637,24 @@ python3 -m thresholdsign
   `TypeError`；空历史/空叶、叶非恰 32 字节、总叶数不小于 `2^64`、
   `old_total` 不在 `0 < old_total < n`、嵌套签名或密钥结构非法抛
   `ValueError`；无状态
+- `encode_history_extension(proof) -> bytes` — 追加一致性证明的规范
+  传输/持久化编码：依次直拼标签
+  `b"thresholdsign/seal-history-extension/v1"`、8 字节无符号大端
+  `old_total`、8 字节无符号大端叶总数 `n` 及按原顺序的全部 32 字节
+  叶摘要，各段之间无分隔符或填充；总长度由标签与 `n` 唯一确定。
+  约束 `0 < old_total < n` 且 `n` 不超过 64 位无符号上限。只接受结构
+  合法的 `SealHistoryExtension`：非该证明入参或计数非整数（含布尔）、
+  叶集非元组、叶项非 `bytes` 抛 `TypeError`；空叶、`old_total` 为零
+  或不小于 `n`、`n` 达到上限、叶宽不等于 32 字节抛 `ValueError`。
+  不验签、不解析叶摘要的密码学含义、不含签名/密钥/封印等私密材料，
+  输出对同一证明恒定唯一、无状态
+- `decode_history_extension(blob) -> SealHistoryExtension` —
+  `encode_history_extension` 的逆操作，仅恢复冻结证明对象：拒绝非
+  `bytes`（`TypeError`）以及坏/缺标签、空叶、`old_total` 越界、
+  `n` 达到上限、叶数据不足或有余、叶宽不符、截断和尾随字节
+  （`ValueError`）；成功后重编码必逐字节等于输入，不验签、不解析叶
+  摘要、不留状态，结构合法但双根签名不匹配由
+  `check_history_extension` 返回 `False`
 - `Rotation(old, new, ids, t, q, p, g, sig)` — 冻结数据类，可按位置构造、按值
   相等；公开可验证的密钥轮换授权证书：`old`/`new` 为新旧联合公钥，`ids` 为严格
   递增的新成员编号元组，`t` 为新 threshold，`q`/`p`/`g` 为域素数、群素数与
