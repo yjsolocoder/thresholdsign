@@ -2,7 +2,10 @@
 
 Public API: Share / FeldmanCommitment / PedersenCommitment / split_secret /
 split_secret_verifiable / split_secret_pedersen / verify_share /
-verify_pedersen_share / reconstruct_secret / evaluate_polynomial, plus the
+verify_pedersen_share / reconstruct_secret / evaluate_polynomial, plus
+recover_secret / RecoveryReport that reconstruct the secret from a share set
+containing tampered shares by identifying the unique degree-below-threshold
+polynomial agreeing with the most shares, plus the
 single-round Pedersen DKG: DKGContribution / DKGReceivedShare / DKGResult /
 DKGRejection / create_dkg_contribution / verify_dkg_received_share /
 aggregate_dkg. The signing extension adds SigningContribution /
@@ -175,6 +178,7 @@ from __future__ import annotations
 import hashlib
 import secrets
 from dataclasses import dataclass
+from itertools import combinations
 from typing import Callable, Iterable, Sequence
 
 __all__ = [
@@ -189,6 +193,8 @@ __all__ = [
     "verify_share",
     "verify_pedersen_share",
     "reconstruct_secret",
+    "recover_secret",
+    "RecoveryReport",
     "DKGContribution",
     "DKGReceivedShare",
     "DKGResult",
@@ -858,6 +864,157 @@ def reconstruct_secret(shares: Iterable[Share], *, prime: int = DEFAULT_PRIME) -
             denominator = denominator * (share.x - other.x) % prime
         secret = (secret + share.y * numerator * pow(denominator, -1, prime)) % prime
     return secret
+
+
+@dataclass(frozen=True)
+class RecoveryReport:
+    """Outcome of an error-share-identifying secret reconstruction.
+
+    ``secret`` is the constant term of the decision polynomial, the value it
+    takes at ``x = 0``, matching :func:`reconstruct_secret`. ``accepted`` is
+    the tuple of shares that lie on that polynomial and ``rejected`` the
+    remaining shares; both are ordered by ascending ``x``. The dataclass is
+    frozen, positionally constructible and compared by value.
+    """
+
+    secret: int
+    accepted: tuple[Share, ...]
+    rejected: tuple[Share, ...]
+
+
+def _interpolate_coefficients(points: Sequence[Share], prime: int) -> tuple[int, ...]:
+    """Interpolate the unique degree-<len(points) polynomial at ``points``.
+
+    ``points`` must have distinct, non-zero ``x`` coordinates. Returns the
+    coefficient tuple from the constant term up, reduced modulo ``prime``.
+    """
+    width = len(points)
+    coefficients = [0] * width
+    for point in points:
+        # L_i(x) = y_i * prod_{j != i} (x - x_j) / (x_i - x_j); build the
+        # numerator as ascending coefficients and add it, scaled, to the
+        # running polynomial.
+        numerator: list[int] = [1]
+        denominator = 1
+        for other in points:
+            if other.x == point.x:
+                continue
+            numerator = [
+                (-other.x * numerator[0]) % prime,
+                *[
+                    (numerator[position] - other.x * numerator[position + 1]) % prime
+                    for position in range(len(numerator) - 1)
+                ],
+                numerator[-1],
+            ]
+            denominator = denominator * (point.x - other.x) % prime
+        scale = point.y * pow(denominator, -1, prime) % prime
+        for position in range(width):
+            coefficients[position] = (
+                coefficients[position] + scale * numerator[position]
+            ) % prime
+    return tuple(coefficients)
+
+
+def recover_secret(
+    shares: tuple[Share, ...] | list[Share],
+    threshold: int,
+    *,
+    prime: int = DEFAULT_PRIME,
+) -> RecoveryReport:
+    """Reconstruct a secret while identifying tampered shares.
+
+    Among the polynomials of degree below ``threshold`` over ``GF(prime)``,
+    pick the unique one that agrees with the most supplied shares. A share
+    agrees with a polynomial when it evaluates to the share's ``y`` at its
+    ``x``. ``accepted`` holds every share agreeing with that polynomial and
+    ``rejected`` every other share; both are ordered by ascending ``x``. The
+    reported secret is the polynomial's value at ``x = 0``, the same value
+    :func:`reconstruct_secret` returns for the accepted shares.
+
+    The decision depends only on share contents and ``threshold``, never on
+    submission order. A tie for the most-agreeing polynomial, or no
+    polynomial agreeing with at least ``threshold`` shares, cannot be
+    decided and raises ``ValueError``.
+    """
+    if not isinstance(shares, (tuple, list)):
+        raise TypeError("shares must be a tuple or list")
+    if not isinstance(threshold, int) or isinstance(threshold, bool):
+        raise TypeError("threshold must be an integer")
+    if not isinstance(prime, int) or isinstance(prime, bool):
+        raise TypeError("prime must be an integer")
+
+    for share in shares:
+        if not isinstance(share, Share):
+            raise TypeError("shares must contain Share instances")
+        if not isinstance(share.x, int) or isinstance(share.x, bool):
+            raise TypeError("share indices must be integers")
+        if not isinstance(share.y, int) or isinstance(share.y, bool):
+            raise TypeError("share values must be integers")
+
+    if not shares:
+        raise ValueError("at least one share is required")
+    if threshold < 1:
+        raise ValueError("threshold must be at least 1")
+    if threshold > len(shares):
+        raise ValueError("threshold must not exceed the number of shares")
+    if not _is_prime(prime):
+        raise ValueError("prime must be prime")
+
+    ordered = sorted(shares, key=lambda share: share.x)
+    for position, share in enumerate(ordered):
+        if not 0 < share.x < prime:
+            raise ValueError("share index must satisfy 0 < x < prime")
+        if not 0 <= share.y < prime:
+            raise ValueError("share value must satisfy 0 <= y < prime")
+        if position > 0 and share.x == ordered[position - 1].x:
+            raise ValueError("duplicate share index")
+
+    # Every degree-<threshold candidate that can matter is the interpolant of
+    # some threshold-sized subset; distinct interpolants are deduplicated by
+    # their coefficient tuples. Evaluating each candidate at every supplied
+    # point counts the shares it agrees with.
+    best_coefficients: tuple[int, ...] | None = None
+    best_count = 0
+    tied = False
+    seen: set[tuple[int, ...]] = set()
+    for combo in combinations(ordered, threshold):
+        coefficients = _interpolate_coefficients(combo, prime)
+        if coefficients in seen:
+            continue
+        seen.add(coefficients)
+        count = sum(
+            1
+            for share in ordered
+            if evaluate_polynomial(coefficients, share.x, prime=prime) == share.y
+        )
+        if count > best_count:
+            best_count = count
+            best_coefficients = coefficients
+            tied = False
+        elif count == best_count and coefficients != best_coefficients:
+            tied = True
+
+    if best_count < threshold:
+        raise ValueError(
+            "no polynomial of degree below threshold agrees with threshold shares"
+        )
+    if tied:
+        raise ValueError("multiple polynomials agree with the most shares; cannot decide")
+
+    assert best_coefficients is not None
+    secret = best_coefficients[0]
+    accepted = tuple(
+        share
+        for share in ordered
+        if evaluate_polynomial(best_coefficients, share.x, prime=prime) == share.y
+    )
+    rejected = tuple(
+        share
+        for share in ordered
+        if evaluate_polynomial(best_coefficients, share.x, prime=prime) != share.y
+    )
+    return RecoveryReport(secret, accepted, rejected)
 
 
 @dataclass(frozen=True)
