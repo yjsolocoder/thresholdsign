@@ -264,6 +264,8 @@ __all__ = [
     "encode_history_delta",
     "decode_history_delta",
     "verify_history_delta",
+    "slice_history_delta",
+    "concatenate_history_delta",
     "RHE",
     "encode_rhe",
     "decode_rhe",
@@ -13402,6 +13404,130 @@ def verify_history_delta(
     """
     expanded = expand_history_delta(chain)
     return verify_history_extension_bundle_chain(expanded, key)
+
+
+# ---------------------------------------------------------------------------
+# Continuous-interval slicing and adjacent-chain splicing of incremental
+# seal-history extension chains: a long delta chain can be cut into hop
+# segments for piecewise transport and archiving and the segments spliced
+# back into one chain afterwards. Both entry points work on expanded bundle
+# chains and compact the result back into delta form, so slicing and
+# concatenation are inverses; neither verifies any signature and neither
+# keeps hidden state.
+# ---------------------------------------------------------------------------
+
+
+def slice_history_delta(
+    chain: SealHistoryExtensionDeltaChain,
+    start: int,
+    stop: int,
+) -> SealHistoryExtensionDeltaChain:
+    """Take a non-empty half-open hop segment of an incremental extension chain.
+
+    The chain is first expanded into a self-contained
+    :class:`SealHistoryExtensionBundleChain`; the segment keeps expanded
+    bundles ``start:stop`` and the bracketing signatures
+    ``start:stop + 1`` — hop ``i`` stays bracketed by signatures ``i`` and
+    ``i + 1`` — and the segment is then compacted back into a
+    :class:`SealHistoryExtensionDeltaChain`. The result is therefore
+    exactly the delta form of the self-contained chain's corresponding
+    interval: it expands value by value into that interval, and single-hop
+    (empty ``additions``), head and tail segments all match it value by
+    value. No signature is verified here and no state is kept — verification
+    stays with :func:`verify_history_delta` on the result.
+
+    A non-:class:`SealHistoryExtensionDeltaChain` chain argument or any
+    wrong field or element type — a non-:class:`SealHistoryExtension`
+    ``first``, non-tuple field or batch, non-``bytes`` digest,
+    non-:class:`AggregateSignature` signature, or a wrong nested proof or
+    signature field type — raises TypeError, exactly as
+    :func:`expand_history_delta` does; a non-integer ``start`` or ``stop``
+    — booleans included — also raises TypeError. A negative or otherwise
+    out-of-range bound, an empty interval (``start >= stop``), an empty
+    addition batch, a digest that is not exactly 32 bytes, a signature count
+    other than ``len(additions) + 2``, or an illegal nested proof or
+    signature raises ValueError. The function is stateless.
+    """
+    start = _check_segment_bound(start, "start")
+    stop = _check_segment_bound(stop, "stop")
+    expanded = expand_history_delta(chain)
+    hop_count = len(expanded.items)
+    if start < 0 or stop < 0 or start > hop_count or stop > hop_count:
+        raise ValueError("slice bounds out of range")
+    if start >= stop:
+        raise ValueError("slice interval must be non-empty")
+    segment = SealHistoryExtensionBundleChain(
+        items=expanded.items[start:stop]
+    )
+    return compact_history_delta(segment)
+
+
+def concatenate_history_delta(
+    left: SealHistoryExtensionDeltaChain,
+    right: SealHistoryExtensionDeltaChain,
+) -> SealHistoryExtensionDeltaChain:
+    """Concatenate two adjacent incremental extension chains into one chain.
+
+    Both chains are first expanded into self-contained
+    :class:`SealHistoryExtensionBundleChain` values; the bundles are joined
+    left then right and the checkpoint signature at the seam is kept
+    exactly once — the left chain's last new-root signature and the right
+    chain's first old-root signature must be the very same value. The left
+    chain's last hop must additionally end on the exact tree the right
+    chain's first hop starts from: the left hop's ``extension.leaves``
+    must equal the first ``old_total`` leaves of the right hop, with the
+    leaf counts fitting exactly — a gap or overlap is rejected. The joined
+    self-contained chain is then compacted back into a
+    :class:`SealHistoryExtensionDeltaChain`, so the result is the delta
+    form of the two expanded chains joined in order and round-trips through
+    the canonical encoding byte for byte. No signature is verified here and
+    no state is kept — verification stays with :func:`verify_history_delta`
+    on the result.
+
+    A non-:class:`SealHistoryExtensionDeltaChain` argument or any wrong
+    field or element type — including a wrong nested proof or signature
+    field type — raises TypeError, exactly as :func:`expand_history_delta`
+    does. A leaf prefix mismatch at the seam (a gap or overlap between the
+    last left hop and the first right hop) or a mismatch between the two
+    shared checkpoint signatures by value raises ValueError, as does any
+    structural error either chain or its nested extension or signatures
+    would raise on its own. The function is stateless.
+    """
+    left_expanded = expand_history_delta(left)
+    right_expanded = expand_history_delta(right)
+
+    left_last = left_expanded.items[-1].extension
+    right_first = right_expanded.items[0].extension
+    old_total = right_first.old_total
+    if (
+        len(left_last.leaves) != old_total
+        or left_last.leaves != right_first.leaves[:old_total]
+    ):
+        raise ValueError(
+            "chains do not link: the left chain's last leaves must be the "
+            "right chain's first hop old prefix"
+        )
+    if left_expanded.items[-1].new_sig != right_expanded.items[0].old_sig:
+        raise ValueError(
+            "chains do not link: the shared checkpoint signature must be "
+            "identical by value"
+        )
+
+    joined = SealHistoryExtensionBundleChain(
+        items=left_expanded.items + right_expanded.items
+    )
+    result = compact_history_delta(joined)
+
+    # Defence in depth: the returned delta chain must expand back into
+    # exactly the two expanded chains joined in order, and its canonical
+    # encoding must round-trip byte for byte; refuse anything else.
+    reexpanded = expand_history_delta(result)
+    if reexpanded != joined:
+        raise ValueError("concatenated chain does not match the joined chains")
+    encoded = encode_history_delta(result)
+    if decode_history_delta(encoded) != result:
+        raise ValueError("concatenated chain does not encode byte for byte")
+    return result
 
 
 # ---------------------------------------------------------------------------

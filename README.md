@@ -1784,6 +1784,21 @@ python3 -m thresholdsign
   相邻叶前缀有缺口或重叠、或换密钥核验均返回 `False` 而不抛异常；结构错误
   （非本类入参、字段或元素类型不符、空批、叶宽非 32 字节、签名数不符、嵌套
   扩展或签名非法、密钥结构非法）照样抛 `TypeError`/`ValueError`
+- `slice_history_delta(chain, start, stop) -> SealHistoryExtensionDeltaChain`
+  — 先展开为自包含链，取跳束的半开区间 `items[start:stop]`（夹住该区间的
+  检查点签名随之保留，跳 `i` 仍由签名 `i`、`i+1` 夹住）再压回增量链，用于
+  长链分段传输；单跳段（`additions` 为空）、首段、尾段均与自包含链对应区间
+  逐值相等；不验签、无状态。链或字段、元素类型错（含嵌套证明或签名字段类型
+  错）、`start`/`stop` 非整数（含布尔）抛 `TypeError`；空区间（`start >=
+  stop`）、负界或越出跳数、嵌套结构非法或签名数不符抛 `ValueError`
+- `concatenate_history_delta(left, right) -> SealHistoryExtensionDeltaChain`
+  — 两侧展开链按左后右连接、接缝共享检查点签名仅保留一份，用于归档后整体
+  复原：要求左段末跳的 `extension.leaves` 恰为右段首跳
+  `extension.leaves[:extension.old_total]`（叶数严丝合缝，缺口或重叠均拒绝），
+  且左末 `new_sig` 与右首 `old_sig` 按值相等；结果等于两侧展开链顺序连接的
+  增量形式，展开后逐值等于连接链、规范编码逐字节往返；不验签、无状态。链或
+  字段、元素类型错抛 `TypeError`；嵌套结构非法或签名数错、叶前缀缺口/重叠、
+  共享签名按值不等抛 `ValueError`
 - `Rotation(old, new, ids, t, q, p, g, sig)` — 冻结数据类，可按位置构造、按值
   相等；公开可验证的密钥轮换授权证书：`old`/`new` 为新旧联合公钥，`ids` 为严格
   递增的新成员编号元组，`t` 为新 threshold，`q`/`p`/`g` 为域素数、群素数与
