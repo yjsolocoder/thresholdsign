@@ -1697,6 +1697,43 @@ python3 -m thresholdsign
   `SealHistoryExtensionBundle`/`SigningDKGResult` 入参抛 `TypeError`；
   嵌套扩展、签名或密钥结构非法抛 `ValueError`，与
   `check_history_extension` 完全一致；无状态
+- `SealHistoryExtensionBundleChain(items)` — 自包含追加证明包的非空
+  保序链冻结数据类，唯一字段 `items` 为按链序排列的
+  `SealHistoryExtensionBundle` 元组；相邻两包须满足前项叶总数等于后项
+  的 `extension.old_total`，且前项全部叶按序等于后项叶序列的开头
+  （由 `verify_history_extension_bundle_chain` 强制，构造时不校验）。可
+  按位置构造、按值相等与哈希，构造时不校验字段类型与边界，不含网络、
+  存储或隐藏状态
+- `encode_history_extension_bundle_chain(chain) -> bytes` —
+  多跳保序链的规范传输/持久化编码，输出唯一、不验签、不检查衔接、不
+  保存状态：依次直拼固定标签 `b"ts/shebc/v1"`、四字节无符号大端项数
+  `n`，再按原序写 `n` 个 U32 长度帧（4 字节无符号大端长度 + 帧体），
+  帧体即该包既有的规范编码 `encode_history_extension_bundle(item)`
+  且不得为空。只接受结构合法的链；非
+  `SealHistoryExtensionBundleChain` 入参或 `items` 非元组抛
+  `TypeError`，非 `SealHistoryExtensionBundle` 元素抛 `TypeError`（与
+  单包编码完全一致）；空链、项数或帧超长、嵌套包结构非法抛
+  `ValueError`
+- `decode_history_extension_bundle_chain(b) -> SealHistoryExtensionBundleChain` —
+  `encode_history_extension_bundle_chain` 的逆操作，仅按帧恢复结构，
+  逐帧以 `decode_history_extension_bundle` 还原为包，不验签、不解析叶
+  摘要、不检查衔接、不保存状态：只接受唯一规范形式（标签 + 非零
+  U32 项数 + 恰 `n` 个非零 U32 长度帧）。非 `bytes` 入参抛 `TypeError`；
+  坏标签、零项计数、零长或超长帧、嵌套包非规范、计数与帧数不符、截断
+  或尾随字节抛 `ValueError`；成功解码的结果重新编码后逐字节等于原始
+  输入，结构合法但签名错配或包不衔接的链照常返回，真伪由
+  `verify_history_extension_bundle_chain` 判定
+- `verify_history_extension_bundle_chain(chain, key) -> bool` —
+  多跳链的整体无状态核验入口：按链序对每个包调用
+  `verify_history_extension_bundle` 逐项复核，并要求每对相邻包衔接
+  ——前项叶总数恰等于后项的 `extension.old_total`，且前项全部叶按序
+  等于后项 `extension.leaves` 的前 `old_total` 个叶（即每跳的旧历史
+  恰为上一跳的新历史，叶前缀有缺口或重叠都不成立）。全部单包核验
+  通过且所有衔接成立才返回 `True`，缺一项都返回 `False`；任一包的
+  叶、旧项数或旧新根签名不匹配，或换一把密钥核验，均返回 `False`
+  而不抛异常。非 `SealHistoryExtensionBundleChain` 入参、`items` 非
+  元组或核验密钥类型不符抛 `TypeError`；空链、任一包嵌套结构非法抛
+  `ValueError`，沿用单包核验的既有边界
 - `Rotation(old, new, ids, t, q, p, g, sig)` — 冻结数据类，可按位置构造、按值
   相等；公开可验证的密钥轮换授权证书：`old`/`new` 为新旧联合公钥，`ids` 为严格
   递增的新成员编号元组，`t` 为新 threshold，`q`/`p`/`g` 为域素数、群素数与
