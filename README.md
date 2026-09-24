@@ -1799,6 +1799,37 @@ python3 -m thresholdsign
   增量形式，展开后逐值等于连接链、规范编码逐字节往返；不验签、无状态。链或
   字段、元素类型错抛 `TypeError`；嵌套结构非法或签名数错、叶前缀缺口/重叠、
   共享签名按值不等抛 `ValueError`
+- `partition_history_delta(chain, cuts) -> tuple[SealHistoryExtensionDeltaChain, ...]`
+  — `slice_history_delta` 的批量形式：按展开后跳束的边界编号一次把长链切成
+  多段，`cuts` 为整数元组，须严格递增、唯一且落在 `1..len(items)-1`；空元组
+  把整条链作为单段返回，否则依次切成 `[0, cuts[0])`、`[cuts[0], cuts[1])`、…、
+  `[cuts[-1], len(items))` 各段，返回的分段元组非空、按链序排列且不留空段，
+  等价于对同一链依次调用 `slice_history_delta`；不验签、无状态。链、元组或
+  切点类型错误（含布尔切点）抛 `TypeError`；重复、非递增或越界切点及嵌套结构
+  非法抛 `ValueError`
+- `join_history_delta_segments(segments) -> SealHistoryExtensionDeltaChain` —
+  `concatenate_history_delta` 的批量形式：`segments` 须为非空保序的
+  `SealHistoryExtensionDeltaChain` 元组，按输入顺序逐段拼接，每个接缝要求左段
+  末跳的叶序列恰为右段首跳叶序列的开头（缺口或重叠均拒绝）且共享检查点签名
+  按值相等、只保留一份；单段元组直接返回该段。任意合法分区逐段编解码后重组
+  还原原增量链，其规范编码与原链逐字节相同；不验签、无状态。元组或元素类型
+  错误抛 `TypeError`；空 `segments`、接缝叶前缀或共享签名不一致及嵌套结构非法
+  抛 `ValueError`
+- `encode_history_delta_segments(segments) -> bytes` — 分段集合的自定界规范
+  归档编码，把多个连续段作为一个字节串跨实现传输与持久化：依次直拼固定标签
+  `b"thresholdsign/history-delta-segments/v1"`、四字节无符号大端段数（恒非零），
+  再按原序写每段的四字节无符号大端长度帧，帧体直接复用该段的既有规范编码
+  `encode_history_delta(segment)` 且不得为空。只检查元组容器与各段结构合法性，
+  不排序、不验签、不检查接缝、不保存状态；非元组入参、元素非
+  `SealHistoryExtensionDeltaChain` 或嵌套字段类型错误抛 `TypeError`；空集合、
+  计数或帧超长及段自身结构非法抛 `ValueError`
+- `decode_history_delta_segments(blob) -> tuple[SealHistoryExtensionDeltaChain, ...]`
+  — `encode_history_delta_segments` 的逆操作，只接受唯一规范形式，按原序恢复
+  分段元组：不排序、不验签、不检查接缝、不保存状态，各段自身合法但彼此不连续
+  的集合照样正常往返，段序与接缝对错仍由 `join_history_delta_segments` 判定。
+  入参非 `bytes` 抛 `TypeError`；坏标签、零段计数、零长或超长帧、声明段数与
+  帧数不符、嵌套编码非规范、截断或尾随字节抛 `ValueError`，不返回部分结果；
+  成功解码后重编码逐字节等于输入
 - `Rotation(old, new, ids, t, q, p, g, sig)` — 冻结数据类，可按位置构造、按值
   相等；公开可验证的密钥轮换授权证书：`old`/`new` 为新旧联合公钥，`ids` 为严格
   递增的新成员编号元组，`t` 为新 threshold，`q`/`p`/`g` 为域素数、群素数与
