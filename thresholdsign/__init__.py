@@ -40,7 +40,9 @@ encode_history_multi_proof_bundle / decode_history_multi_proof_bundle /
 verify_history_multi_proof_bundle, and the append-only consistency proofs
 SealHistoryExtension / make_history_extension / check_history_extension
 that confirm an old sealed item sequence is a prefix of a new one from
-the two root signatures alone without disclosing any seal, and the
+the two root signatures alone without disclosing any seal, plus their
+canonical transport encoding encode_history_extension /
+decode_history_extension, and the
 cross-key form RHE / encode_rhe / decode_rhe / check_rhe that ties the
 two root signatures to a non-empty RotationChain so the old and new
 roots may be signed by different threshold keys, publicly
@@ -230,6 +232,8 @@ __all__ = [
     "SealHistoryExtension",
     "make_history_extension",
     "check_history_extension",
+    "encode_history_extension",
+    "decode_history_extension",
     "RHE",
     "encode_rhe",
     "decode_rhe",
@@ -12379,6 +12383,120 @@ def check_history_extension(
         generator=generator,
         prime=field_prime,
     )
+
+
+# ---------------------------------------------------------------------------
+# Canonical SealHistoryExtension transport: a self-delimiting (via the fixed
+# tag and the leaf count), byte-for-byte reproducible encoding of an
+# append-only consistency proof for cross-implementation exchange and
+# persistence. Decoding restores the frozen structure only — no signature is
+# checked and a leaf digest's cryptographic meaning is never inspected, so
+# check_history_extension remains the sole verifier afterwards and no state
+# is kept.
+# ---------------------------------------------------------------------------
+
+SEAL_HISTORY_EXTENSION_WIRE_TAG = (
+    b"thresholdsign/seal-history-extension/v1"
+)
+
+
+def encode_history_extension(proof: SealHistoryExtension) -> bytes:
+    """Canonically encode a seal-history consistency proof for transport.
+
+    The encoding is the direct concatenation, in order with no separators
+    or padding, of the tag ``b"thresholdsign/seal-history-extension/v1"``,
+    ``old_total`` as an 8-byte unsigned big-endian integer, the leaf total
+    ``n`` as an 8-byte unsigned big-endian integer, and then all ``n``
+    leaf digests in their original order, each exactly 32 raw bytes. The
+    total length is therefore fixed by the tag and the leaf count:
+    ``len(tag) + 16 + 32 * n``. The bounds are
+    ``0 < old_total < n < 2**64``; the leaf tuple must be non-empty and
+    every entry exactly 32 bytes.
+
+    Only the container structure is checked — no signature is verified and
+    the cryptographic meaning of any leaf digest is never inspected — so a
+    proof whose leaves do not rebuild the signed roots still encodes:
+    :func:`check_history_extension` stays the way to verify a proof
+    afterwards. A non-:class:`SealHistoryExtension` argument or a wrong
+    field type (a non-integer ``old_total`` including booleans, a
+    non-tuple leaf sequence or a non-bytes leaf entry) raises TypeError;
+    an empty leaf tuple, ``old_total`` zero or not smaller than the leaf
+    total, a leaf total of ``2**64 - 1``, or a leaf that is not exactly
+    32 bytes raises ValueError. The encoding carries no signature, key,
+    seal or other private material, keeps no state, and the same proof
+    object always encodes to the same unique bytes.
+    """
+    old_total, leaves = _validate_history_extension_structure(proof)
+    if len(leaves) >= 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("too many leaves")
+    buffer = bytearray(SEAL_HISTORY_EXTENSION_WIRE_TAG)
+    buffer += _history_proof_u64(old_total)
+    buffer += _history_proof_u64(len(leaves))
+    for leaf in leaves:
+        buffer += leaf
+    return bytes(buffer)
+
+
+def decode_history_extension(blob: bytes) -> SealHistoryExtension:
+    """Decode the canonical encoding produced by :func:`encode_history_extension`.
+
+    Accepts only the single canonical form: the tag
+    ``b"thresholdsign/seal-history-extension/v1"`` followed by two
+    8-byte unsigned big-endian counts, ``old_total`` and the leaf total
+    ``n``, and then exactly ``n`` consecutive raw 32-byte leaf digests in
+    order, with nothing trailing. A non-bytes argument raises TypeError; a
+    wrong or missing tag, fewer than the 16 count bytes, an empty or
+    maximal (``2**64 - 1``) leaf total, an ``old_total`` outside
+    ``0 < old_total < n``, fewer leaf bytes than the count requires,
+    truncation, or trailing bytes raises ValueError. A successfully
+    decoded proof re-encodes to exactly the input bytes.
+
+    Decoding only restores the frozen proof object: the leaf digests are
+    not parsed for cryptographic meaning and no signature, key or seal is
+    checked. A structurally legal proof whose roots do not verify is
+    returned normally, and :func:`check_history_extension` reports it as
+    ``False``.
+    """
+    if not isinstance(blob, bytes):
+        raise TypeError("blob must be bytes")
+    if not blob.startswith(SEAL_HISTORY_EXTENSION_WIRE_TAG):
+        raise ValueError("bad seal history extension tag")
+    offset = len(SEAL_HISTORY_EXTENSION_WIRE_TAG)
+    if offset + 16 > len(blob):
+        raise ValueError("truncated seal history extension counts")
+    old_total = int.from_bytes(blob[offset:offset + 8], "big", signed=False)
+    leaf_count = int.from_bytes(blob[offset + 8:offset + 16], "big")
+    offset += 16
+    if leaf_count == 0:
+        raise ValueError("seal history extension leaves must be non-empty")
+    if leaf_count >= 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("seal history extension leaf count too large")
+    if old_total <= 0 or old_total >= leaf_count:
+        raise ValueError("seal history extension old_total out of range")
+
+    expected_width = leaf_count * SEAL_HISTORY_PROOF_DIGEST_SIZE
+    leaf_bytes = blob[offset:]
+    if len(leaf_bytes) < expected_width:
+        raise ValueError("truncated seal history extension leaves")
+    if len(leaf_bytes) > expected_width:
+        raise ValueError("trailing bytes after seal history extension")
+    leaves = tuple(
+        bytes(
+            leaf_bytes[
+                index: index + SEAL_HISTORY_PROOF_DIGEST_SIZE
+            ]
+        )
+        for index in range(
+            0,
+            expected_width,
+            SEAL_HISTORY_PROOF_DIGEST_SIZE,
+        )
+    )
+
+    proof = SealHistoryExtension(old_total=old_total, leaves=leaves)
+    if encode_history_extension(proof) != blob:
+        raise ValueError("non-canonical seal history extension encoding")
+    return proof
 
 
 # ---------------------------------------------------------------------------

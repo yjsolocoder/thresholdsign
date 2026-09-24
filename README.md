@@ -1637,6 +1637,25 @@ python3 -m thresholdsign
   `TypeError`；空历史/空叶、叶非恰 32 字节、总叶数不小于 `2^64`、
   `old_total` 不在 `0 < old_total < n`、嵌套签名或密钥结构非法抛
   `ValueError`；无状态
+- `encode_history_extension(proof) -> bytes` — 一致性证明的规范跨实现
+  传输/持久化编码，输出唯一、不验签、不保存状态：依次直拼固定标签
+  `b"thresholdsign/seal-history-extension/v1"`、八字节无符号大端旧项数
+  `old_total`、八字节无符号大端叶总数 `n`，再按原顺序直拼全部 `n` 条
+  叶摘要，每条恰 32 字节，各段之间无分隔符或填充；总长度完全由标签与
+  叶数唯一确定（`len(tag) + 16 + 32*n`）。只处理容器结构，不解析叶摘要
+  的密码学含义；编码不含签名、密钥、封印或任何私密材料，同一证明对象
+  恒定编码为同一字节串。非 `SealHistoryExtension` 入参或字段类型错误
+  （计数非整数含布尔、叶集非元组、叶项非 `bytes`）抛 `TypeError`；空
+  叶集、`old_total` 为零或不小于叶总数、叶总数达到 `2^64 - 1`、叶宽
+  不等于 32 字节抛 `ValueError`
+- `decode_history_extension(b) -> SealHistoryExtension` —
+  `encode_history_extension` 的逆操作，仅恢复冻结证明对象，不验签、不
+  解析叶摘要：只接受唯一规范形式（标签 + 两个八字节大端计数 + 恰
+  `n` 条 32 字节叶），非 `bytes` 入参抛 `TypeError`；标签不匹配、计数
+  段截断、叶总数为零或达到 `2^64 - 1`、`old_total` 不在
+  `0 < old_total < n`、叶数据不足、截断或存在尾随字节抛 `ValueError`；
+  成功解码的结果重新编码后逐字节等于原始输入，根是否匹配由
+  `check_history_extension` 判定
 - `Rotation(old, new, ids, t, q, p, g, sig)` — 冻结数据类，可按位置构造、按值
   相等；公开可验证的密钥轮换授权证书：`old`/`new` 为新旧联合公钥，`ids` 为严格
   递增的新成员编号元组，`t` 为新 threshold，`q`/`p`/`g` 为域素数、群素数与
