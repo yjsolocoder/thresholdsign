@@ -67,7 +67,9 @@ folding an ordered tuple of segments back into one chain, and the
 self-delimiting segment-set transport encoding
 encode_history_delta_segments / decode_history_delta_segments for
 archiving or transferring several consecutive segments as one ordered
-object, and the
+object, and the whole-archive threshold-Schnorr seal of that segment set
+HistoryDeltaSegmentsSeal / hds_message with its transport encoding
+encode_hds / decode_hds and key-bound verifier verify_hds, and the
 cross-key form RHE / encode_rhe / decode_rhe / check_rhe that ties the
 two root signatures to a non-empty RotationChain so the old and new
 roots may be signed by different threshold keys, publicly
@@ -279,6 +281,11 @@ __all__ = [
     "join_history_delta_segments",
     "encode_history_delta_segments",
     "decode_history_delta_segments",
+    "HistoryDeltaSegmentsSeal",
+    "hds_message",
+    "encode_hds",
+    "decode_hds",
+    "verify_hds",
     "RHE",
     "encode_rhe",
     "decode_rhe",
@@ -13792,6 +13799,258 @@ def decode_history_delta_segments(
             "non-canonical seal history delta chain segments encoding"
         )
     return segments_tuple
+
+
+# ---------------------------------------------------------------------------
+# Sealed segment-set archives: one threshold Schnorr signature over the
+# canonical segment-set encoding produced by encode_history_delta_segments.
+# The signed message commits to the verifying public key and to the digest of
+# the exact segment-set bytes, so deleting, inserting, reordering or
+# substituting a segment — or presenting the archive under another key —
+# all invalidate the signature. The seal keeps no state: the segments are
+# only structure-checked here and the seam/order judgement stays with
+# join_history_delta_segments, exactly as for the unsigned segment set.
+# ---------------------------------------------------------------------------
+
+HDS_MESSAGE_TAG = b"ts/hds/m1"
+HDS_WIRE_TAG = b"ts/hds/w1"
+
+
+@dataclass(frozen=True)
+class HistoryDeltaSegmentsSeal:
+    """A whole segment-set archive sealed by one threshold signature.
+
+    The fields, in order, are ``segments`` — a non-empty, order-preserving
+    tuple of :class:`SealHistoryExtensionDeltaChain` values, each a
+    structurally legal incremental append chain — and ``signature`` — the
+    threshold Schnorr :class:`AggregateSignature` on :func:`hds_message` of
+    the segments and the verifying public key. The dataclass is frozen,
+    positionally constructible and compared by value; the segments keep
+    their order and the seal carries no network, storage or hidden state.
+    Neither field is checked at construction time — :func:`encode_hds`
+    checks the structure and :func:`verify_hds` is the way to test a seal
+    afterwards. Segment order and the seams between neighbours are not
+    judged here: :func:`join_history_delta_segments` remains the sole place
+    that does that.
+    """
+
+    segments: tuple[SealHistoryExtensionDeltaChain, ...]
+    signature: AggregateSignature
+
+
+def _check_history_delta_segments(
+    segments: object,
+) -> tuple[SealHistoryExtensionDeltaChain, ...]:
+    """Type- and structure-check a non-empty ordered segment tuple.
+
+    Mirrors the container and per-segment checks of
+    :func:`encode_history_delta_segments`: a tuple of
+    :class:`SealHistoryExtensionDeltaChain` instances, non-empty, each
+    structurally legal through its own canonical encoder. Nothing here
+    inspects the seams or verifies a signature.
+    """
+    if not isinstance(segments, tuple):
+        raise TypeError("segments must be a tuple")
+    for segment in segments:
+        if not isinstance(segment, SealHistoryExtensionDeltaChain):
+            raise TypeError(
+                "each segment must be a SealHistoryExtensionDeltaChain "
+                "instance"
+            )
+    if len(segments) == 0:
+        raise ValueError("segments must be a non-empty tuple")
+    if len(segments) > 0xFFFFFFFF:
+        raise ValueError("too many seal history delta chain segments")
+    for index, segment in enumerate(segments):
+        frame = encode_history_delta(segment)
+        if len(frame) > 0xFFFFFFFF:
+            raise ValueError(
+                f"seal history delta chain segment {index + 1} too long"
+            )
+    return segments
+
+
+def hds_message(
+    segments: tuple[SealHistoryExtensionDeltaChain, ...], public_key: int
+) -> bytes:
+    """Encode the canonical message the threshold key signs to seal a segment set.
+
+    The message is, in order, the tag ``b"ts/hds/m1"``, the 32-byte
+    ``SHA256`` digest of the canonical
+    :func:`encode_history_delta_segments` output ``E`` for ``segments``,
+    and ``VARINT(public_key)`` — a 4-byte unsigned big-endian length
+    followed by the shortest unsigned big-endian value (zero is the single
+    byte ``00``, positive values carry no leading zero). It carries no
+    signature and keeps no state.
+
+    ``segments`` must be a non-empty tuple of structurally legal
+    :class:`SealHistoryExtensionDeltaChain` values exactly as
+    :func:`encode_history_delta_segments` requires and ``public_key`` a
+    non-boolean non-negative integer. Wrong element or field types raise
+    TypeError; an empty segment tuple, an illegal segment, a negative or
+    boolean public key, or an over-long key encoding raises ValueError.
+    """
+    _check_history_delta_segments(segments)
+    if not isinstance(public_key, int) or isinstance(public_key, bool):
+        raise TypeError("public_key must be an integer")
+    encoded_segments = encode_history_delta_segments(segments)
+    encoded_key = _encode_varint(public_key)
+    return (
+        HDS_MESSAGE_TAG
+        + hashlib.sha256(encoded_segments).digest()
+        + encoded_key
+    )
+
+
+def _check_hds_fields(
+    seal: object,
+) -> tuple[tuple[SealHistoryExtensionDeltaChain, ...], AggregateSignature]:
+    """Type- and structure-check a HistoryDeltaSegmentsSeal value."""
+    if not isinstance(seal, HistoryDeltaSegmentsSeal):
+        raise TypeError(
+            "seal must be a HistoryDeltaSegmentsSeal instance"
+        )
+    segments = _check_history_delta_segments(seal.segments)
+    signer_count = _check_history_proof_bundle_signature(seal.signature)
+    if signer_count > 0xFFFFFFFF:
+        raise ValueError("too many signer ids")
+    return segments, seal.signature
+
+
+def encode_hds(seal: HistoryDeltaSegmentsSeal) -> bytes:
+    """Canonically encode a sealed segment-set archive for transport or persistence.
+
+    The encoding is, in order, the tag ``b"ts/hds/w1"``, the 4-byte
+    unsigned big-endian length ``len(E)`` followed by the raw segment-set
+    encoding ``E = encode_history_delta_segments(seal.segments)`` (never
+    empty), and then the same signature frame an
+    :class:`AuditProofBundle` carries: ``VARINT(R)``, ``VARINT(z)``, the
+    4-byte unsigned big-endian signer count ``k`` and one
+    ``VARINT(id)`` per ascending signer id. A ``VARINT`` is a 4-byte
+    unsigned big-endian body length followed by the shortest unsigned
+    big-endian value (zero is the single byte ``00``, positive values
+    carry no leading zero); ``R`` must be positive and ``z`` may be zero.
+
+    Only a structurally legal :class:`HistoryDeltaSegmentsSeal` is
+    accepted: the segments must be a non-empty tuple encodable by
+    :func:`encode_history_delta_segments` (each segment by
+    :func:`encode_history_delta`) and the signature an
+    :class:`AggregateSignature` with a positive ``R``, a non-negative
+    ``z`` and a non-empty tuple of strictly increasing positive ids. The
+    segments are not sorted, no seam is inspected and the signature is
+    not checked: :func:`join_history_delta_segments` stays the way to
+    judge order and seams and :func:`verify_hds` the way to verify the
+    seal afterwards. The output for a given seal is unique and the
+    encoding carries no network, storage or hidden state. Wrong field
+    types raise TypeError; an empty segment tuple, an illegal nested
+    segment or signature structure, or an over-long frame raises
+    ValueError.
+    """
+    segments, signature = _check_hds_fields(seal)
+    encoded_segments = encode_history_delta_segments(segments)
+    if len(encoded_segments) > 0xFFFFFFFF:
+        raise ValueError("seal history delta chain segments encoding too long")
+
+    buffer = bytearray(HDS_WIRE_TAG)
+    buffer += len(encoded_segments).to_bytes(4, "big", signed=False)
+    buffer += encoded_segments
+    buffer += _encode_varint(signature.R)
+    buffer += _encode_varint(signature.z)
+    buffer += len(signature.signer_ids).to_bytes(4, "big", signed=False)
+    for signer_id in signature.signer_ids:
+        buffer += _encode_varint(signer_id)
+    return bytes(buffer)
+
+
+def decode_hds(blob: bytes) -> HistoryDeltaSegmentsSeal:
+    """Decode the canonical encoding produced by :func:`encode_hds`.
+
+    Accepts only the single canonical form: the tag ``b"ts/hds/w1"``, a
+    4-byte non-zero segment-set frame length followed by bytes that
+    :func:`decode_history_delta_segments` accepts, the length-prefixed
+    integers ``R`` and ``z``, the 4-byte non-zero signer count ``k`` and
+    then exactly ``k`` strictly increasing positive signer ids — the
+    exact signature frame layout an :class:`AuditProofBundle` uses. A
+    non-bytes argument raises TypeError; a wrong or missing tag, a zero
+    or over-long segment-set frame length, a declared segment count that
+    does not match its frames, a non-canonical nested segment-set (or
+    nested chain) encoding, a zero ``R``, a negative value, a zero or
+    mismatched signer count, an illegal signature structure, a
+    non-canonical integer (leading zero or over-long length),
+    truncation, or trailing bytes raises ValueError. A successfully
+    decoded seal re-encodes to exactly the input bytes.
+
+    Decoding only restores the structure: the nested segment set is
+    decoded with :func:`decode_history_delta_segments` (which verifies no
+    signature and checks no seam) and the seal signature is not checked.
+    A structurally legal seal whose segments do not join, whose
+    signatures do not verify, or whose seal signature does not bind them
+    is returned normally, and :func:`verify_hds` reports it as ``False``.
+    """
+    if not isinstance(blob, bytes):
+        raise TypeError("blob must be bytes")
+    if not blob.startswith(HDS_WIRE_TAG):
+        raise ValueError("bad history delta segments seal tag")
+    offset = len(HDS_WIRE_TAG)
+
+    encoded_segments, offset = _read_audit_proof_block(
+        blob, offset, what="sealed history delta chain segments"
+    )
+    segments = decode_history_delta_segments(encoded_segments)
+
+    signature, offset = _read_bundle_signature_frame(
+        blob, offset, what="history delta segments seal"
+    )
+    if offset != len(blob):
+        raise ValueError("trailing bytes after history delta segments seal")
+
+    seal = HistoryDeltaSegmentsSeal(
+        segments=segments,
+        signature=signature,
+    )
+    if encode_hds(seal) != blob:
+        raise ValueError("non-canonical history delta segments seal encoding")
+    return seal
+
+
+def verify_hds(seal: HistoryDeltaSegmentsSeal, key: SigningDKGResult) -> bool:
+    """Verify a sealed segment-set archive against its segments and the threshold key.
+
+    ``seal`` must be a structurally legal
+    :class:`HistoryDeltaSegmentsSeal` — its segments a non-empty tuple
+    encodable by :func:`encode_history_delta_segments` and its signature
+    an :class:`AggregateSignature` with a positive ``R``, a non-negative
+    ``z`` and a non-empty tuple of strictly increasing positive ids — and
+    ``key`` a legal :class:`SigningDKGResult`. Wrong field types raise
+    TypeError; an empty segment tuple, an illegal segment, signature or
+    key structure raises ValueError.
+
+    The canonical :func:`hds_message` of the segments and
+    ``key.public_key`` is recomputed and checked as the signature's
+    threshold Schnorr message via :func:`verify_signature` with the key's
+    group parameters. Returns ``True`` only when the signature verifies
+    over exactly the sealed segments and key: a well-formed seal whose
+    segments are deleted from, inserted into, substituted or reordered,
+    whose signature was tampered with, or which is checked under another
+    key returns ``False`` without raising. The segments' own root
+    signatures and the seams between segments are not re-judged here;
+    :func:`verify_history_delta` and
+    :func:`join_history_delta_segments` stay the entries for those
+    checks. The function is stateless.
+    """
+    segments, signature = _check_hds_fields(seal)
+    _result, public_key, field_prime, group_prime, generator = _check_signing_setup(key)
+    _check_signing_dkg_structure(key)
+
+    message = hds_message(segments, public_key)
+    return verify_signature(
+        message,
+        signature,
+        public_key,
+        group_prime=group_prime,
+        generator=generator,
+        prime=field_prime,
+    )
 
 
 # ---------------------------------------------------------------------------
