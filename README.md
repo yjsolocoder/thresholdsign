@@ -1734,6 +1734,77 @@ python3 -m thresholdsign
   而不抛异常。非 `SealHistoryExtensionBundleChain` 入参、`items` 非
   元组或核验密钥类型不符抛 `TypeError`；空链、任一包嵌套结构非法抛
   `ValueError`，沿用单包核验的既有边界
+
+多跳归档时每跳都完整携带全部历史叶，叶越多跳数越多重复越大。冻结数据类
+`SealHistoryExtensionDeltaChain(first, additions, signatures)` 是该自包含
+链的等价增量紧凑形式：`first` 为首跳的 `SealHistoryExtension`（完整携带
+首跳全部叶），`additions` 为 `tuple[tuple[bytes, ...], ...]`，每批非空、
+按原序保存该跳新增的 32 字节叶摘要（历史叶整体只存一份，不再逐跳重复），
+`signatures` 为恰含 `len(additions) + 2` 个 `AggregateSignature` 的元组
+——首证明由第 0、1 个签名夹住，第 `i` 批追加后产生由第 `i + 1`、`i + 2`
+个签名夹住的后继证明，共享检查点签名按原序复用、只存一份。三字段均无
+默认值，可按位置构造、按值相等与哈希，不含网络、存储或隐藏状态：
+
+```python
+from thresholdsign import (
+    SealHistoryExtensionDeltaChain,
+    compact_history_delta,
+    expand_history_delta,
+    verify_history_delta,
+)
+
+delta = SealHistoryExtensionDeltaChain(first, (batch1, batch2), signatures)
+chain = expand_history_delta(delta)          # SealHistoryExtensionBundleChain
+assert verify_history_extension_bundle_chain(chain, key)   # 仍由既有核验器核验
+assert compact_history_delta(chain) == delta
+```
+
+`expand_history_delta(chain)` 按原序无损展开：首证明原样保留并与第 0、1
+个签名配成首包，第 `i` 批追加到累计叶序列之后，生成 `old_total` 取追加前
+累计叶数、`leaves` 为累计叶加本批原序摘要的后继 `SealHistoryExtension`，
+展开后共 `len(additions) + 1` 个包，每包由相邻两个签名夹住、签名按原序
+复用，不验签；累计叶数超过 `2^64 - 1` 抛 `ValueError`。
+`compact_history_delta(chain)` 是其逆操作：首跳扩展原样保留，逐跳提取
+新增叶 `extension.leaves[extension.old_total:]` 作为一批，并要求相邻包
+共享的检查点签名按值相等（前项 `new_sig ==` 后项 `old_sig`）、前项全部
+叶恰为后项的旧前缀（缺口或重叠都拒绝），同样不验签。两入口对非本类
+入参、字段或元素类型不符（扩展非 `SealHistoryExtension`、字段或批次非
+元组、摘要非 `bytes`、签名非 `AggregateSignature`）抛 `TypeError`；对
+空批、叶宽非 32 字节、签名个数不符（展开要求 `len(additions) + 2`）、
+嵌套扩展或签名非法、共享签名按值不等、叶前缀缺口或重叠抛 `ValueError`。
+自包含链、单包与追加一致性证明的既有行为均不变，无状态。
+
+增量链另有唯一规范编解码，三个入口配套使用，输出唯一、无隐藏状态：
+
+```python
+from thresholdsign import (
+    encode_history_delta,
+    decode_history_delta,
+    verify_history_delta,
+)
+
+blob = encode_history_delta(delta)             # 仅接受结构合法的增量链
+restored = decode_history_delta(blob)          # 仅恢复结构，不验签
+assert encode_history_delta(restored) == blob  # 逐字节往返
+assert verify_history_delta(restored, key)     # 先展开再复用既有链核验
+```
+
+编码依次为固定标签 `b"ts/shed/v1"`、首证明帧 `U32(len(P))||P`
+（`P = encode_history_extension(first)`，帧永不为空）、追加批数
+`U32(b)`（可为零）、`b` 个追加批，末尾为 `b + 2` 个既有规范签名帧。
+每个追加批编码为 `U32(m)||m*32 字节摘要`，`m` 必须大于零且摘要保持原序；
+所有 `U32` 均为 4 字节无符号大端；签名帧完全沿用
+`encode_history_extension_bundle` 的既有规范规则
+（`VARINT(R)`、`VARINT(z)`、U32 签名者数 `k` 及 `k` 个递增
+`VARINT(id)`）。解码只恢复结构、不验签、不检查展开衔接：解码入参非
+`bytes` 或字段/元素类型不符抛 `TypeError`；坏标签、计数错（批数或叶数
+溢出/为零）、截断、尾随字节、非规范嵌套、空批、叶宽错误、签名数不符、
+嵌套签名非法抛 `ValueError`；成功解码后重编码必须逐字节等于原始输入。
+`verify_history_delta(chain, key)` 先展开为自包含链再复用
+`verify_history_extension_bundle_chain`，全部单包核验与相邻衔接全真才
+返回 `True`；结构合法但叶、旧项数、根签名不匹配或换密钥核验均返回
+`False` 而不抛异常，无状态。
+
 - `Rotation(old, new, ids, t, q, p, g, sig)` — 冻结数据类，可按位置构造、按值
   相等；公开可验证的密钥轮换授权证书：`old`/`new` 为新旧联合公钥，`ids` 为严格
   递增的新成员编号元组，`t` 为新 threshold，`q`/`p`/`g` 为域素数、群素数与

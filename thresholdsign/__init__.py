@@ -52,6 +52,11 @@ encode_history_extension_bundle_chain /
 decode_history_extension_bundle_chain /
 verify_history_extension_bundle_chain that archives and verifies a run of
 consecutive extensions as one order-preserving object, and the
+incremental compact form SealHistoryExtensionDeltaChain /
+expand_history_delta / compact_history_delta / encode_history_delta /
+decode_history_delta / verify_history_delta that carries the first hop
+in full and then only the leaves each later hop appends so multi-hop
+archives store every historical leaf exactly once, and the
 cross-key form RHE / encode_rhe / decode_rhe / check_rhe that ties the
 two root signatures to a non-empty RotationChain so the old and new
 roots may be signed by different threshold keys, publicly
@@ -251,6 +256,12 @@ __all__ = [
     "encode_history_extension_bundle_chain",
     "decode_history_extension_bundle_chain",
     "verify_history_extension_bundle_chain",
+    "SealHistoryExtensionDeltaChain",
+    "expand_history_delta",
+    "compact_history_delta",
+    "encode_history_delta",
+    "decode_history_delta",
+    "verify_history_delta",
     "RHE",
     "encode_rhe",
     "decode_rhe",
@@ -12918,6 +12929,490 @@ def verify_history_extension_bundle_chain(
                 result = False
         previous = bundle
     return result
+
+
+# ---------------------------------------------------------------------------
+# Incremental seal-history extension chain: a space-saving delta form of
+# SealHistoryExtensionBundleChain that carries the first hop's extension in
+# full and then only the leaves each later hop appends, so the historical
+# leaf digests shared by every hop are stored exactly once across a
+# multi-hop archive. The two conversion entry points expand the delta form
+# into the existing self-contained bundle chain (verified by the existing
+# verify_history_extension_bundle_chain) and compact a linking bundle chain
+# back into delta form; neither conversion verifies any signature and
+# neither keeps hidden state.
+# ---------------------------------------------------------------------------
+
+SEAL_HISTORY_EXTENSION_DELTA_CHAIN_WIRE_TAG = b"ts/shed/v1"
+
+
+@dataclass(frozen=True)
+class SealHistoryExtensionDeltaChain:
+    """An incremental extension chain that never repeats historical leaves.
+
+    The fields, in order, are ``first`` (the
+    :class:`SealHistoryExtension` covering the first hop, carried in
+    full), ``additions`` (the tuple of non-empty batches of new 32-byte
+    leaf digests, in chain order — batch ``i`` holds exactly the leaves
+    hop ``i + 1`` appends on top of every previous leaf, in their
+    original order) and ``signatures`` (the tuple of
+    :class:`AggregateSignature` checkpoint root signatures, exactly
+    ``len(additions) + 2`` long): the first proof is bracketed by
+    signatures ``0`` and ``1``, and each later hop produced from batch
+    ``i`` is bracketed by signatures ``i + 1`` and ``i + 2`` — the
+    new-root signature of one hop is the old-root signature of the next,
+    reused by value and stored once. The expanded chain has
+    ``len(additions) + 1`` bundles; hop ``i + 1`` has ``old_total`` equal
+    to the cumulative leaf count before batch ``i`` and its leaves are
+    that prefix followed by batch ``i`` in order. The dataclass is
+    frozen, positionally constructible and compared by value, has no
+    field defaults, and carries no network, storage or hidden state.
+    Field types and bounds are not checked at construction time —
+    :func:`expand_history_delta` checks the structure and
+    :func:`verify_history_delta` remains the way to verify the expanded
+    chain afterwards.
+    """
+
+    first: SealHistoryExtension
+    additions: tuple[tuple[bytes, ...], ...]
+    signatures: tuple[AggregateSignature, ...]
+
+
+def _check_seal_history_extension_delta_chain_fields(
+    chain: object,
+) -> tuple[
+    int,
+    SealHistoryExtension,
+    tuple[tuple[bytes, ...], ...],
+    tuple[AggregateSignature, ...],
+]:
+    """Type- and structure-check a delta chain's fields, without verifying.
+
+    ``first`` must be a :class:`SealHistoryExtension`, ``additions`` a
+    tuple of non-empty tuples of 32-byte ``bytes`` digests and
+    ``signatures`` a tuple of :class:`AggregateSignature` values exactly
+    ``len(additions) + 2`` long; the nested extension and signatures are
+    not validated here (the conversion and codec entry points do that).
+    Wrong field or element types raise TypeError; an empty batch, a
+    digest of the wrong width or a signature count other than
+    ``len(additions) + 2`` raises ValueError. Returns
+    ``(batch_count, first, additions, signatures)``.
+    """
+    if not isinstance(chain, SealHistoryExtensionDeltaChain):
+        raise TypeError(
+            "chain must be a SealHistoryExtensionDeltaChain instance"
+        )
+    first = chain.first
+    additions = chain.additions
+    signatures = chain.signatures
+    if not isinstance(first, SealHistoryExtension):
+        raise TypeError(
+            "chain.first must be a SealHistoryExtension instance"
+        )
+    if not isinstance(additions, tuple):
+        raise TypeError("chain.additions must be a tuple")
+    if not isinstance(signatures, tuple):
+        raise TypeError("chain.signatures must be a tuple")
+    for batch in additions:
+        if not isinstance(batch, tuple):
+            raise TypeError("each chain addition batch must be a tuple")
+        for digest in batch:
+            if not isinstance(digest, bytes):
+                raise TypeError("each chain addition digest must be bytes")
+    for signature in signatures:
+        if not isinstance(signature, AggregateSignature):
+            raise TypeError(
+                "each chain signature must be an AggregateSignature instance"
+            )
+    try:
+        batch_count = len(additions)
+        signature_count = len(signatures)
+    except OverflowError:
+        raise ValueError("too many chain items") from None
+    for batch in additions:
+        if len(batch) == 0:
+            raise ValueError("each chain addition batch must be non-empty")
+        for digest in batch:
+            if len(digest) != SEAL_HISTORY_PROOF_DIGEST_SIZE:
+                raise ValueError(
+                    "chain addition digests must be exactly 32 bytes"
+                )
+    if signature_count != batch_count + 2:
+        raise ValueError(
+            "chain.signatures must contain exactly len(chain.additions) + 2 "
+            "signatures"
+        )
+    return batch_count, first, additions, signatures
+
+
+def expand_history_delta(
+    chain: SealHistoryExtensionDeltaChain,
+) -> SealHistoryExtensionBundleChain:
+    """Expand a delta chain into the existing self-contained bundle chain.
+
+    The first hop's extension is kept as-is and paired with signatures
+    ``0`` and ``1``; batch ``i`` of ``chain.additions`` then produces hop
+    ``i + 1`` whose ``old_total`` is the cumulative leaf count *before*
+    the batch and whose leaves are that whole prefix followed by the
+    batch's digests in their original order, so every historical leaf is
+    stored once in the delta form instead of being repeated by every
+    hop. The ``len(additions) + 2`` signatures are reused in their
+    original order: hop ``i`` of the result is bracketed by signatures
+    ``i`` and ``i + 1``. No signature is verified here — the expanded
+    :class:`SealHistoryExtensionBundleChain` is checked by the existing
+    :func:`verify_history_extension_bundle_chain`.
+
+    A non-:class:`SealHistoryExtensionDeltaChain` argument or a wrong
+    field or element type (non-:class:`SealHistoryExtension` ``first``,
+    non-tuple fields or batches, non-``bytes`` digests,
+    non-:class:`AggregateSignature` signatures) raises TypeError. An
+    empty batch, a digest that is not exactly 32 bytes, a signature
+    count other than ``len(additions) + 2``, an illegal nested extension
+    or signature, or a cumulative leaf count above ``2**64 - 1`` raises
+    ValueError. The function is stateless.
+    """
+    _batch_count, first, additions, signatures = (
+        _check_seal_history_extension_delta_chain_fields(chain)
+    )
+    _validate_history_extension_structure(first)
+    for index, signature in enumerate(signatures):
+        _check_history_proof_bundle_signature(
+            signature, field=f"chain.signatures[{index}]"
+        )
+
+    items = [
+        SealHistoryExtensionBundle(
+            extension=first, old_sig=signatures[0], new_sig=signatures[1]
+        )
+    ]
+    leaves = first.leaves
+    for index, batch in enumerate(additions):
+        old_total = len(leaves)
+        leaves = leaves + batch
+        if len(leaves) > 0xFFFFFFFFFFFFFFFF:
+            raise ValueError("too many leaves")
+        items.append(
+            SealHistoryExtensionBundle(
+                extension=SealHistoryExtension(
+                    old_total=old_total, leaves=leaves
+                ),
+                old_sig=signatures[index + 1],
+                new_sig=signatures[index + 2],
+            )
+        )
+    return SealHistoryExtensionBundleChain(items=tuple(items))
+
+
+def compact_history_delta(
+    chain: SealHistoryExtensionBundleChain,
+) -> SealHistoryExtensionDeltaChain:
+    """Compact a linking self-contained bundle chain into delta form.
+
+    The first hop's extension is kept in full as ``first`` and the
+    chain's ``len(items) + 1`` signatures are carried over in their
+    original order. For every later hop the batch of newly appended
+    leaves — ``extension.leaves[extension.old_total:]`` — is extracted
+    in chain order, and the shared checkpoint signature must be reused
+    by value: the predecessor's ``new_sig`` must equal the successor's
+    ``old_sig``. The historical leaves every hop repeats are thus
+    dropped and each leaf digest is stored exactly once. No signature is
+    verified here — verification stays with
+    :func:`verify_history_extension_bundle_chain` on the expanded form.
+
+    A non-:class:`SealHistoryExtensionBundleChain` argument or a wrong
+    field or element type raises TypeError, exactly as the structural
+    checks of :func:`encode_history_extension_bundle_chain` do. An empty
+    chain, a signature count other than ``len(items) + 1``, an illegal
+    nested extension or signature, a shared checkpoint signature that is
+    not identical by value between adjacent hops, or a broken prefix
+    between adjacent hops — a leaf-prefix gap or overlap, i.e. the
+    predecessor's leaves not exactly equal to the successor's first
+    ``old_total`` leaves — raises ValueError. The function is stateless.
+    """
+    if not isinstance(chain, SealHistoryExtensionBundleChain):
+        raise TypeError(
+            "chain must be a SealHistoryExtensionBundleChain instance"
+        )
+    count = _check_history_extension_bundle_chain_items(chain.items)
+    for item in chain.items:
+        _validate_history_extension_structure(item.extension)
+        _check_history_proof_bundle_signature(
+            item.old_sig, field="bundle.old_sig"
+        )
+        _check_history_proof_bundle_signature(
+            item.new_sig, field="bundle.new_sig"
+        )
+
+    signatures = [chain.items[0].old_sig]
+    additions = []
+    previous = chain.items[0]
+    for bundle in chain.items[1:]:
+        if previous.new_sig != bundle.old_sig:
+            raise ValueError(
+                "chain bundles do not link: the shared checkpoint signature "
+                "must be identical by value"
+            )
+        signatures.append(bundle.old_sig)
+        old_total = bundle.extension.old_total
+        if (
+            len(previous.extension.leaves) != old_total
+            or previous.extension.leaves
+            != bundle.extension.leaves[:old_total]
+        ):
+            raise ValueError(
+                "chain bundles do not link: the predecessor's leaves must be "
+                "the successor's old prefix"
+            )
+        additions.append(bundle.extension.leaves[old_total:])
+        previous = bundle
+    signatures.append(chain.items[-1].new_sig)
+
+    if len(signatures) != count + 1:  # defence in depth
+        raise ValueError(
+            "chain.signatures must contain exactly len(chain.items) + 1 "
+            "signatures"
+        )
+
+    return SealHistoryExtensionDeltaChain(
+        first=chain.items[0].extension,
+        additions=tuple(additions),
+        signatures=tuple(signatures),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Canonical incremental seal-history extension chain transport: a
+# self-delimiting, byte-for-byte reproducible encoding of a
+# SealHistoryExtensionDeltaChain for cross-implementation exchange and
+# persistence. Decoding restores structure only — the nested first
+# extension goes through decode_history_extension, its leaf digests stay
+# opaque and no signature is checked — so verify_history_delta remains the
+# sole verifier afterwards; it expands into a
+# SealHistoryExtensionBundleChain and reuses
+# verify_history_extension_bundle_chain.
+# ---------------------------------------------------------------------------
+
+def encode_history_delta(chain: SealHistoryExtensionDeltaChain) -> bytes:
+    """Canonically encode an incremental extension chain for transport or
+    persistence.
+
+    The encoding is, in order, the fixed tag ``b"ts/shed/v1"``, the
+    first-proof frame (the 4-byte unsigned big-endian length
+    ``len(P)`` followed by ``P = encode_history_extension(chain.first)``,
+    never empty), the 4-byte unsigned big-endian batch count
+    ``b = len(chain.additions)`` (possibly zero), then one frame per
+    addition batch in chain order — each the 4-byte unsigned big-endian
+    digest count ``m`` (always non-zero) followed by exactly ``m`` raw
+    32-byte leaf digests in their original order, with no further
+    separators — and finally the ``b + 2`` existing canonical signature
+    frames in order: the first proof is bracketed by frames ``0`` and
+    ``1`` and batch ``i`` is bracketed by frames ``i + 1`` and
+    ``i + 2``. Every signature frame is exactly the signature frame of
+    :func:`encode_history_extension_bundle`: ``VARINT(R)``, ``VARINT(z)``,
+    the 4-byte unsigned big-endian signer count and one ``VARINT(id)``
+    per ascending signer id.
+
+    Only the chain container and the nested extension and signature
+    structures are checked — the prefix linkage is not verified and no
+    signature is checked against any root: :func:`verify_history_delta`
+    stays the way to verify a chain afterwards. A non-chain argument, a
+    non-tuple field or batch, or a non-``bytes`` digest raises
+    TypeError, and a non-:class:`AggregateSignature` signature element
+    raises TypeError exactly as :func:`encode_history_extension` and
+    :func:`encode_history_extension_bundle` do for their fields. An
+    empty addition batch, a digest that is not exactly 32 bytes, a
+    signature count other than ``b + 2``, an over-long count or frame,
+    or an illegal nested extension or signature raises ValueError. The
+    output for a given chain is unique, carries no network, storage or
+    hidden state and a successfully decoded chain re-encodes byte for
+    byte to the original input.
+    """
+    batch_count, first, additions, signatures = (
+        _check_seal_history_extension_delta_chain_fields(chain)
+    )
+    if batch_count > 0xFFFFFFFF:
+        raise ValueError("too many chain addition batches")
+
+    encoded_first = encode_history_extension(first)
+    if len(encoded_first) > 0xFFFFFFFF:
+        raise ValueError("seal history extension encoding too long")
+
+    batch_counts = []
+    for batch in additions:
+        if len(batch) > 0xFFFFFFFF:
+            raise ValueError("too many chain addition digests")
+        batch_counts.append(len(batch))
+
+    signer_counts = []
+    for index, signature in enumerate(signatures):
+        signer_count = _check_history_proof_bundle_signature(
+            signature, field=f"chain.signatures[{index}]"
+        )
+        if signer_count > 0xFFFFFFFF:
+            raise ValueError("too many signer ids")
+        signer_counts.append(signer_count)
+
+    buffer = bytearray(SEAL_HISTORY_EXTENSION_DELTA_CHAIN_WIRE_TAG)
+    buffer += len(encoded_first).to_bytes(4, "big", signed=False)
+    buffer += encoded_first
+    buffer += batch_count.to_bytes(4, "big", signed=False)
+    for batch, digest_count in zip(additions, batch_counts):
+        buffer += digest_count.to_bytes(4, "big", signed=False)
+        for digest in batch:
+            buffer += digest
+    for signature, signer_count in zip(signatures, signer_counts):
+        buffer += _encode_varint(signature.R)
+        buffer += _encode_varint(signature.z)
+        buffer += signer_count.to_bytes(4, "big", signed=False)
+        for signer_id in signature.signer_ids:
+            buffer += _encode_varint(signer_id)
+    return bytes(buffer)
+
+
+def decode_history_delta(blob: bytes) -> SealHistoryExtensionDeltaChain:
+    """Decode the canonical encoding produced by :func:`encode_history_delta`.
+
+    Accepts only the single canonical form: the tag ``b"ts/shed/v1"``,
+    a 4-byte unsigned big-endian non-zero length followed by bytes that
+    :func:`decode_history_extension` accepts as the first proof, the
+    4-byte unsigned big-endian batch count ``b`` (possibly zero), then
+    exactly ``b`` addition batches, each a 4-byte unsigned big-endian
+    non-zero digest count ``m`` followed by exactly ``m`` raw 32-byte
+    leaf digests, and finally exactly ``b + 2`` existing canonical
+    signature frames, each the length-prefixed integers ``R`` and ``z``,
+    the 4-byte non-zero signer count and exactly that many strictly
+    increasing positive signer ids. A non-bytes argument raises
+    TypeError; a wrong or missing tag, a zero or over-long first-proof
+    frame length, any encoding :func:`decode_history_extension` rejects
+    (bad nested tag, truncated counts or leaves, an out-of-range
+    ``old_total``, trailing bytes), a zero ``m`` (an empty addition
+    batch), a non-canonical signature integer (leading zero or
+    over-long length), a zero ``R``, a zero signer count, a
+    non-positive or non-increasing signer id, a count mismatch,
+    truncation, or trailing bytes raises ValueError. A successfully
+    decoded chain re-encodes to exactly the input bytes.
+
+    Decoding only restores the structure: the nested first extension
+    goes through :func:`decode_history_extension`, whose leaf digests
+    stay opaque, no signature frame is checked and the prefix linkage
+    between the first extension and the batches is not checked either.
+    A structurally legal chain whose signatures do not match or whose
+    batches do not link is returned normally, and
+    :func:`verify_history_delta` reports it as ``False``.
+    """
+    if not isinstance(blob, bytes):
+        raise TypeError("blob must be bytes")
+    if not blob.startswith(SEAL_HISTORY_EXTENSION_DELTA_CHAIN_WIRE_TAG):
+        raise ValueError("bad seal history extension delta chain tag")
+    offset = len(SEAL_HISTORY_EXTENSION_DELTA_CHAIN_WIRE_TAG)
+
+    encoded_first, offset = _read_audit_proof_block(
+        blob,
+        offset,
+        what="seal history extension delta chain first proof",
+    )
+    first = decode_history_extension(encoded_first)
+
+    if offset + 4 > len(blob):
+        raise ValueError(
+            "truncated seal history extension delta chain batch count"
+        )
+    batch_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+
+    additions = []
+    for batch_index in range(batch_count):
+        if offset + 4 > len(blob):
+            raise ValueError(
+                "truncated seal history extension delta chain addition "
+                f"batch {batch_index + 1} digest count"
+            )
+        digest_count = int.from_bytes(blob[offset:offset + 4], "big")
+        offset += 4
+        if digest_count == 0:
+            raise ValueError(
+                "seal history extension delta chain addition batches must "
+                "be non-empty"
+            )
+        batch_size = digest_count * SEAL_HISTORY_PROOF_DIGEST_SIZE
+        if offset + batch_size > len(blob):
+            raise ValueError(
+                "truncated seal history extension delta chain addition "
+                f"batch {batch_index + 1}"
+            )
+        batch = tuple(
+            bytes(
+                blob[
+                    offset
+                    + digest_index * SEAL_HISTORY_PROOF_DIGEST_SIZE:
+                    offset
+                    + (digest_index + 1) * SEAL_HISTORY_PROOF_DIGEST_SIZE
+                ]
+            )
+            for digest_index in range(digest_count)
+        )
+        additions.append(batch)
+        offset += batch_size
+
+    signatures = []
+    for index in range(batch_count + 2):
+        signature, offset = _read_bundle_signature_frame(
+            blob,
+            offset,
+            what=(
+                "seal history extension delta chain signature "
+                f"{index + 1}"
+            ),
+        )
+        signatures.append(signature)
+    if offset != len(blob):
+        raise ValueError(
+            "trailing bytes after seal history extension delta chain"
+        )
+
+    chain = SealHistoryExtensionDeltaChain(
+        first=first,
+        additions=tuple(additions),
+        signatures=tuple(signatures),
+    )
+    if encode_history_delta(chain) != blob:
+        raise ValueError(
+            "non-canonical seal history extension delta chain encoding"
+        )
+    return chain
+
+
+def verify_history_delta(
+    chain: SealHistoryExtensionDeltaChain, key: SigningDKGResult
+) -> bool:
+    """Verify an incremental extension chain after expanding it.
+
+    The chain is first expanded into a
+    :class:`SealHistoryExtensionBundleChain` with
+    :func:`expand_history_delta` — the first extension kept in full and
+    every addition batch appended on top of the cumulative leaves — and
+    the result is checked by the existing
+    :func:`verify_history_extension_bundle_chain`: every hop is verified
+    with :func:`check_history_extension` and every adjacent pair must
+    link, the predecessor's leaves exactly equal to the successor's
+    first ``old_total`` leaves. Returns ``True`` only when every hop
+    verifies and every linkage holds; a structurally legal chain with a
+    mismatched signature, tampered leaves or ``old_total``, a leaf
+    prefix gap or overlap, a root-signature mismatch, or one presented
+    under another key returns ``False`` without raising.
+
+    A non-:class:`SealHistoryExtensionDeltaChain` argument raises
+    TypeError; a non-tuple field or batch, a non-``bytes`` digest, a
+    non-:class:`AggregateSignature` signature element, an empty
+    addition batch, a digest that is not exactly 32 bytes, a signature
+    count other than ``len(additions) + 2``, or an illegal nested
+    extension, signature or key structure raises TypeError/ValueError,
+    exactly as the structural checks of :func:`encode_history_delta` and
+    :func:`verify_history_extension_bundle_chain` do. The function is
+    stateless.
+    """
+    expanded = expand_history_delta(chain)
+    return verify_history_extension_bundle_chain(expanded, key)
 
 
 # ---------------------------------------------------------------------------
