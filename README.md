@@ -1180,6 +1180,18 @@ python3 -m thresholdsign
   （指数按 `field_prime` 约简）；匹配返回 `True`，份额被篡改、两份额坐标不同或交叉组合
   返回 `False`
 - `reconstruct_secret(shares, *, prime=DEFAULT_PRIME)` — 在 `x = 0` 处做拉格朗日插值
+- `RecoveryReport(secret, accepted, rejected)` — 冻结数据类，可按位置构造、按值相等；
+  `secret` 为判定多项式在零点的取值（与 `reconstruct_secret(accepted)` 一致），
+  `accepted` / `rejected` 分别为吻合与不吻合判定多项式的份额元组，均按横坐标升序排列
+- `recover_secret(shares, threshold, *, prime=DEFAULT_PRIME)` — 带错误份额识别的重建：
+  枚举每份 `threshold` 份额插值出的次数小于 `threshold` 的候选多项式，取吻合份额最多的
+  唯一候选作为判定多项式，返回 `RecoveryReport`；判定只取决于份额内容与 `threshold`，
+  与提交顺序无关。最多份额被多条不同多项式并列吻合，或没有任何多项式吻合至少
+  `threshold` 份时无法判定，抛 `ValueError`；`threshold` 为 1 时按常数多项式判定，
+  取值相同的份额同属可信。容器或元素类型不符、`threshold` 与 `prime` 非整数（含布尔）
+  抛 `TypeError`；份额为空、横坐标重复、坐标不在 `1..prime-1`、纵坐标不在
+  `0..prime-1`、`threshold < 1`、`threshold` 超过份额份数或 `prime` 非素数抛
+  `ValueError`
 - `DKGContribution(sender_id, participant_ids, shares, blinding_shares, commitment)`
   — 冻结数据类；一名参与者的 DKG 贡献：`participant_ids` 严格递增且无重复，
   `shares[i]` / `blinding_shares[i]` 是发给 `participant_ids[i]` 的双份额，

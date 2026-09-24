@@ -2,7 +2,8 @@
 
 Public API: Share / FeldmanCommitment / PedersenCommitment / split_secret /
 split_secret_verifiable / split_secret_pedersen / verify_share /
-verify_pedersen_share / reconstruct_secret / evaluate_polynomial, plus the
+verify_pedersen_share / reconstruct_secret / evaluate_polynomial, plus
+error-share-aware reconstruction via recover_secret / RecoveryReport, and the
 single-round Pedersen DKG: DKGContribution / DKGReceivedShare / DKGResult /
 DKGRejection / create_dkg_contribution / verify_dkg_received_share /
 aggregate_dkg. The signing extension adds SigningContribution /
@@ -175,6 +176,7 @@ from __future__ import annotations
 import hashlib
 import secrets
 from dataclasses import dataclass
+from itertools import combinations
 from typing import Callable, Iterable, Sequence
 
 __all__ = [
@@ -189,6 +191,8 @@ __all__ = [
     "verify_share",
     "verify_pedersen_share",
     "reconstruct_secret",
+    "recover_secret",
+    "RecoveryReport",
     "DKGContribution",
     "DKGReceivedShare",
     "DKGResult",
@@ -858,6 +862,116 @@ def reconstruct_secret(shares: Iterable[Share], *, prime: int = DEFAULT_PRIME) -
             denominator = denominator * (share.x - other.x) % prime
         secret = (secret + share.y * numerator * pow(denominator, -1, prime)) % prime
     return secret
+
+
+@dataclass(frozen=True)
+class RecoveryReport:
+    """Outcome of an error-share-aware secret reconstruction.
+
+    ``secret`` is the value of the deciding polynomial at ``x = 0``, the
+    same value :func:`reconstruct_secret` yields on the accepted shares.
+    ``accepted`` holds the shares that lie on the deciding polynomial and
+    ``rejected`` every other share; both tuples are ordered by strictly
+    increasing coordinate. The dataclass is frozen, positionally
+    constructible and compared by value, and carries no network, storage
+    or hidden state.
+    """
+
+    secret: int
+    accepted: tuple[Share, ...]
+    rejected: tuple[Share, ...]
+
+
+def _lagrange_evaluate(points: Sequence[Share], x: int, prime: int) -> int:
+    """Evaluate the interpolant of ``points`` at ``x`` modulo ``prime``."""
+    total = 0
+    for position, anchor in enumerate(points):
+        numerator = 1
+        denominator = 1
+        for other_position, other in enumerate(points):
+            if position == other_position:
+                continue
+            numerator = numerator * (x - other.x) % prime
+            denominator = denominator * (anchor.x - other.x) % prime
+        total = (
+            total + anchor.y * numerator * pow(denominator, -1, prime)
+        ) % prime
+    return total
+
+
+def recover_secret(
+    shares: Sequence[Share],
+    threshold: int,
+    *,
+    prime: int = DEFAULT_PRIME,
+) -> RecoveryReport:
+    """Rebuild the secret while identifying tampered shares.
+
+    Every ``threshold``-sized subset interpolates a candidate polynomial of
+    degree below ``threshold`` (a constant polynomial when ``threshold`` is
+    1). The candidate fitting the most shares decides: shares it fits are
+    accepted, the rest rejected, and its value at ``x = 0`` is the
+    recovered secret, matching :func:`reconstruct_secret` on the accepted
+    shares. The decision depends only on the share contents and
+    ``threshold``, never on submission order.
+
+    A tie between distinct polynomials fitting the same maximal number of
+    shares, or no polynomial fitting at least ``threshold`` shares, leaves
+    the secret undecidable and raises ``ValueError``.
+    """
+    if not isinstance(shares, (list, tuple)):
+        raise TypeError("shares must be a tuple or list of Share instances")
+    if not isinstance(threshold, int) or isinstance(threshold, bool):
+        raise TypeError("threshold must be an integer")
+    if not isinstance(prime, int) or isinstance(prime, bool):
+        raise TypeError("prime must be an integer")
+    materialised = list(shares)
+    if not materialised:
+        raise ValueError("at least one share is required")
+    for share in materialised:
+        if not isinstance(share, Share):
+            raise TypeError("shares must be Share instances")
+        if not 0 < share.x < prime:
+            raise ValueError("share index must satisfy 0 < x < prime")
+        if not 0 <= share.y < prime:
+            raise ValueError("share value must satisfy 0 <= y < prime")
+    indices = [share.x for share in materialised]
+    if len(set(indices)) != len(indices):
+        raise ValueError("duplicate share index")
+    if threshold < 1:
+        raise ValueError("threshold must be at least 1")
+    if threshold > len(materialised):
+        raise ValueError("threshold must not exceed the number of shares")
+    if not _is_prime(prime):
+        raise ValueError("prime must be prime")
+
+    ordered = sorted(materialised, key=lambda share: share.x)
+
+    # Each candidate is the degree-below-threshold interpolant of one
+    # threshold-sized subset. Two subsets on the same polynomial fit exactly
+    # the same supplied coordinates, so the set of fitted coordinates is a
+    # canonical key that both deduplicates candidates and records their fit.
+    candidates: dict[frozenset[int], int] = {}
+    for subset in combinations(ordered, threshold):
+        fit = frozenset(
+            share.x
+            for share in ordered
+            if _lagrange_evaluate(subset, share.x, prime) == share.y
+        )
+        if fit not in candidates:
+            candidates[fit] = reconstruct_secret(list(subset), prime=prime)
+
+    best_count = max(len(fit) for fit in candidates)
+    if best_count < threshold:
+        raise ValueError("not enough consistent shares to recover the secret")
+    winners = [fit for fit in candidates if len(fit) == best_count]
+    if len(winners) > 1:
+        raise ValueError("ambiguous recovery: multiple polynomials fit the most shares")
+
+    best_fit = winners[0]
+    accepted = tuple(share for share in ordered if share.x in best_fit)
+    rejected = tuple(share for share in ordered if share.x not in best_fit)
+    return RecoveryReport(candidates[best_fit], accepted, rejected)
 
 
 @dataclass(frozen=True)
