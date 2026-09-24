@@ -1734,6 +1734,56 @@ python3 -m thresholdsign
   而不抛异常。非 `SealHistoryExtensionBundleChain` 入参、`items` 非
   元组或核验密钥类型不符抛 `TypeError`；空链、任一包嵌套结构非法抛
   `ValueError`，沿用单包核验的既有边界
+- `SealHistoryExtensionDeltaChain(first, additions, signatures)` — 自包含
+  追加证明链的增量紧凑表示，多跳归档时历史叶整体只存一份；冻结数据类，
+  三字段依次为首跳的 `SealHistoryExtension`（完整携带首跳全部叶）、追加叶
+  批次与聚合签名元组，均无默认值：`additions` 为非空批的元组
+  `tuple[tuple[bytes, ...], ...]`，每批按原序保存该跳新增的 32 字节叶摘要，
+  `signatures` 恰含 `len(additions) + 2` 个 `AggregateSignature`，首证明由
+  第 0、1 个签名夹住，第 `i` 批产生由第 `i + 1`、`i + 2` 个签名夹住的后继
+  证明，相邻两跳的共享检查点签名按原序只存一份。可按位置构造、按值相等与
+  哈希；构造时不校验字段类型与边界，不含网络、存储或隐藏状态
+- `expand_history_delta(chain) -> SealHistoryExtensionBundleChain` —
+  把增量链无损展开为既有自包含链：首跳扩展原样保留，随后每批追加到累计叶
+  序列之后，派生 `old_total` 取追加前累计叶数、`leaves` 为累计叶加本批的
+  后继 `SealHistoryExtension`，共 `len(additions) + 1` 跳，签名按原序复用
+  夹住每跳；不验签、无状态。非 `SealHistoryExtensionDeltaChain` 入参或字段、
+  元素类型错误（首项非 `SealHistoryExtension`、字段或批非元组、摘要非
+  `bytes`、签名非 `AggregateSignature`、嵌套字段类型错）抛 `TypeError`；
+  空批、叶宽非 32 字节、签名数不等于 `len(additions) + 2`、嵌套扩展或签名
+  非法、累计叶数超过 2^64-1 抛 `ValueError`
+- `compact_history_delta(chain) -> SealHistoryExtensionDeltaChain` —
+  `expand_history_delta` 的逆操作：首跳扩展完整保留为 `first`，此后每跳提取
+  新增叶 `extension.leaves[extension.old_total:]` 作为一批按原序保存，并要求
+  相邻两跳的共享检查点签名（前项 `new_sig` 与后项 `old_sig`）按值相等、只存
+  一份；不验签、无状态。非 `SealHistoryExtensionBundleChain` 入参或字段、
+  元素类型错误抛 `TypeError`；空链、嵌套扩展或签名非法、叶前缀缺口或重叠、
+  共享签名按值不等抛 `ValueError`
+- `encode_history_delta(chain) -> bytes` — 仅接受现有增量链并输出唯一规范
+  编码、无隐藏状态：依次直拼固定标签 `b"ts/shed/v1"`、首证明帧
+  `U32(len(P))||P`（`P = encode_history_extension(first)`，帧体即首跳扩展的
+  既有规范编码）、`U32(b)` 批次数（可为零），随后按原序为每批写
+  `U32(m)||m*32 字节叶摘要`（`m` 恒非零），末尾按原序写 `b + 2` 个既有规范
+  签名帧（`VARINT(R)`、`VARINT(z)`、U32 签名者数及递增 `VARINT(id)`），首证明
+  与其后每批各自由相邻两个签名帧夹住；U32 均为 4 字节无符号大端。非本类入参
+  或字段、元素类型错误抛 `TypeError`；空批、叶宽非 32 字节、签名数不等于
+  `b + 2`、计数或帧超长、嵌套扩展或签名非法抛 `ValueError`
+- `decode_history_delta(blob: bytes) -> SealHistoryExtensionDeltaChain` —
+  恢复 `encode_history_delta` 的唯一规范形式，仅还原结构、不验签、不解析叶
+  摘要、不检查衔接、不保存状态：标签后为非零 U32 首证明帧（帧体须被
+  `decode_history_extension` 接受）、U32 批次数 `b`、恰 `b` 个非空批及末尾恰
+  `b + 2` 个签名帧。入参非 `bytes`（含 `bytearray`）抛 `TypeError`；坏标签、
+  零长或超长首帧、计数错（批次数、帧数、签名帧数不符）、零叶批、非规范嵌套、
+  `R` 为零、签名者数为零或编号非正/非递增、截断或尾随字节抛 `ValueError`；
+  成功解码后重编码必须逐字节等于原始输入，结构合法但叶、签名或衔接不匹配的
+  链照常返回，真伪由 `verify_history_delta` 判定
+- `verify_history_delta(chain, key) -> bool` — 整体无状态核验入口：先经
+  `expand_history_delta` 展开为自包含链，再复用既有
+  `verify_history_extension_bundle_chain`，逐跳核验双根签名并检查相邻叶前缀
+  衔接；全真才返回 `True`。结构合法但叶或 `old_total` 被篡改、根签名错配、
+  相邻叶前缀有缺口或重叠、或换密钥核验均返回 `False` 而不抛异常；结构错误
+  （非本类入参、字段或元素类型不符、空批、叶宽非 32 字节、签名数不符、嵌套
+  扩展或签名非法、密钥结构非法）照样抛 `TypeError`/`ValueError`
 - `Rotation(old, new, ids, t, q, p, g, sig)` — 冻结数据类，可按位置构造、按值
   相等；公开可验证的密钥轮换授权证书：`old`/`new` 为新旧联合公钥，`ids` 为严格
   递增的新成员编号元组，`t` 为新 threshold，`q`/`p`/`g` 为域素数、群素数与
