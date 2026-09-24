@@ -1656,6 +1656,47 @@ python3 -m thresholdsign
   `0 < old_total < n`、叶数据不足、截断或存在尾随字节抛 `ValueError`；
   成功解码的结果重新编码后逐字节等于原始输入，根是否匹配由
   `check_history_extension` 判定
+- `SealHistoryExtensionBundle(extension, old_sig, new_sig)` —
+  自包含传输包的冻结数据类，三字段无默认，依次为
+  `SealHistoryExtension` 一致性证明、旧根签名与新根签名（各为对
+  `b"sh/r" || U64(total) || root` 语句的 `AggregateSignature`）；可按
+  位置构造、按值相等与哈希，构造时不校验字段类型与边界，不含网络、
+  存储或隐藏状态
+- `encode_history_extension_bundle(bundle) -> bytes` —
+  自包含包的规范传输/持久化编码，输出唯一、不验签、不保存状态：依次
+  直拼固定标签 `b"ts/sheb/v1"`、`P = encode_history_extension(bundle.extension)`
+  的 U32 长度帧（4 字节无符号大端长度 + `P`，帧体即一致性证明既有
+  规范编码），末尾依次直拼旧、新两份签名帧；签名帧完全沿用既有
+  聚合签名帧的规范规则（`VARINT(R)`、`VARINT(z)`、U32 签名者数 `k`
+  及 `k` 个递增 `VARINT(id)`，零为单字节 `00`、正数禁前导零），不
+  另立新口径。只接受结构合法的包，不解析叶摘要的密码学含义也不检查
+  签名与根是否匹配；编码不含密钥、封印或任何私密材料，同一对象恒定
+  编码为同一字节串。非 `SealHistoryExtensionBundle` 入参或字段类型
+  错误（扩展非 `SealHistoryExtension`、签名非 `AggregateSignature`、
+  `R`/`z` 非整数含布尔、签名者序列非元组或含非整数）抛 `TypeError`；
+  嵌套扩展结构非法（空叶、`old_total` 越界、叶宽错误等）、`R` 非正、
+  `z` 为负、签名者为空或非严格递增、帧超长抛 `ValueError`
+- `decode_history_extension_bundle(b) -> SealHistoryExtensionBundle` —
+  `encode_history_extension_bundle` 的逆操作，仅恢复结构，不验签、不
+  解析叶摘要、不保存隐藏状态：只接受唯一规范形式（标签 + 非零 U32
+  长度帧 + `decode_history_extension` 可接受的帧体 + 旧、新两个签名
+  帧）。非 `bytes` 入参抛 `TypeError`；坏标签、零长或超长帧、嵌套
+  扩展非法（坏嵌套标签、计数/叶截断、`old_total` 越界、帧内尾随字
+  节）、`R` 为零、非规范整数（前导零或超长）、签名者数为零、签名者
+  编号非正或非递增、截断或存在尾随字节抛 `ValueError`；成功解码的
+  结果重新编码后逐字节等于原始输入，结构合法但叶或签名与根不匹配照
+  常返回，真伪由 `verify_history_extension_bundle` 判定
+- `verify_history_extension_bundle(bundle, key) -> bool` —
+  仅凭自包含包与核验密钥完成追加一致性核验，是
+  `check_history_extension(bundle.extension, bundle.old_sig,
+  bundle.new_sig, key)` 的便捷包装：由扩展前 `old_total` 个叶重建旧
+  根、全部叶重建新根（奇数尾自配），旧、新双根签名分别对各自的
+  `b"sh/r" || U64(total) || root` 语句验签，叶与旧新双根签名全部一
+  致才返回 `True`；叶或 `old_total` 被篡改、叶序调换、叶截断、签名
+  互换或错配、签名属于其他语句、换密钥核验均返回 `False`。非
+  `SealHistoryExtensionBundle`/`SigningDKGResult` 入参抛 `TypeError`；
+  嵌套扩展、签名或密钥结构非法抛 `ValueError`，与
+  `check_history_extension` 完全一致；无状态
 - `Rotation(old, new, ids, t, q, p, g, sig)` — 冻结数据类，可按位置构造、按值
   相等；公开可验证的密钥轮换授权证书：`old`/`new` 为新旧联合公钥，`ids` 为严格
   递增的新成员编号元组，`t` 为新 threshold，`q`/`p`/`g` 为域素数、群素数与
