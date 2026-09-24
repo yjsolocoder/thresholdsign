@@ -42,7 +42,10 @@ SealHistoryExtension / make_history_extension / check_history_extension
 that confirm an old sealed item sequence is a prefix of a new one from
 the two root signatures alone without disclosing any seal, plus their
 canonical transport encoding encode_history_extension /
-decode_history_extension, and the
+decode_history_extension, the self-contained proof-plus-both-root-
+signatures packet SealHistoryExtensionBundle /
+encode_history_extension_bundle / decode_history_extension_bundle /
+verify_history_extension_bundle, and the
 cross-key form RHE / encode_rhe / decode_rhe / check_rhe that ties the
 two root signatures to a non-empty RotationChain so the old and new
 roots may be signed by different threshold keys, publicly
@@ -234,6 +237,10 @@ __all__ = [
     "check_history_extension",
     "encode_history_extension",
     "decode_history_extension",
+    "SealHistoryExtensionBundle",
+    "encode_history_extension_bundle",
+    "decode_history_extension_bundle",
+    "verify_history_extension_bundle",
     "RHE",
     "encode_rhe",
     "decode_rhe",
@@ -12497,6 +12504,191 @@ def decode_history_extension(blob: bytes) -> SealHistoryExtension:
     if encode_history_extension(proof) != blob:
         raise ValueError("non-canonical seal history extension encoding")
     return proof
+
+
+# ---------------------------------------------------------------------------
+# Canonical SealHistoryExtension bundle transport: a self-delimiting,
+# byte-for-byte reproducible, self-contained packet that carries an append
+# consistency proof together with its old- and new-root AggregateSignature
+# pair, so a receiver no longer has to match the two root signatures to the
+# proof itself. Decoding restores structure only — the nested proof goes
+# through decode_history_extension, its leaf digests stay opaque and no
+# signature is checked, so verify_history_extension_bundle remains the sole
+# verifier afterwards.
+# ---------------------------------------------------------------------------
+
+SEAL_HISTORY_EXTENSION_BUNDLE_WIRE_TAG = b"ts/sheb/v1"
+
+
+@dataclass(frozen=True)
+class SealHistoryExtensionBundle:
+    """A seal-history consistency proof together with its two root signatures.
+
+    The fields, in order, are ``proof`` (a :class:`SealHistoryExtension`),
+    ``old_signature`` (the :class:`AggregateSignature` on the old
+    ``b"sh/r" || U64(old_total) || old_root`` statement) and
+    ``new_signature`` (the :class:`AggregateSignature` on the new
+    ``b"sh/r" || U64(n) || new_root`` statement). The dataclass is frozen,
+    positionally constructible and compared by value, and carries no
+    network, storage or hidden state. Field types and bounds are not
+    checked at construction time —
+    :func:`encode_history_extension_bundle` checks the structure and
+    :func:`verify_history_extension_bundle` is the way to test a bundle
+    afterwards.
+    """
+
+    proof: SealHistoryExtension
+    old_signature: AggregateSignature
+    new_signature: AggregateSignature
+
+
+def encode_history_extension_bundle(
+    bundle: SealHistoryExtensionBundle,
+) -> bytes:
+    """Canonically encode a seal-history extension bundle for transport or persistence.
+
+    The encoding is, in order, the tag ``b"ts/sheb/v1"``, the 4-byte
+    unsigned big-endian length ``len(P)`` followed by
+    ``P = encode_history_extension(bundle.proof)`` (never empty), and then
+    the old and new signature frames, each exactly the signature frame of
+    :func:`encode_history_proof_bundle`: ``VARINT(R)``, ``VARINT(z)``, the
+    4-byte unsigned big-endian signer count ``k`` and one ``VARINT(id)``
+    per ascending signer id. A ``VARINT`` is a 4-byte unsigned big-endian
+    body length followed by the shortest unsigned big-endian value (zero
+    is the single byte ``00``, positive values carry no leading zero);
+    ``R`` must be positive and ``z`` may be zero.
+
+    Only a structurally legal :class:`SealHistoryExtensionBundle` is
+    accepted — a non-bundle or non-:class:`SealHistoryExtension` proof
+    argument, or wrong proof/signature field types, raise TypeError and
+    illegal proof or signature structure (the exact bounds of
+    :func:`encode_history_extension`, a non-positive ``R``, a negative
+    ``z``, an empty or non-strictly-increasing signer id tuple) or an
+    over-long frame raises ValueError, exactly as
+    :func:`check_history_extension`'s structural checks do — but the
+    prefix relation is not verified and neither signature is checked
+    against the roots: :func:`verify_history_extension_bundle` stays the
+    way to verify a bundle afterwards. The output for a given bundle is
+    unique, keeps no state, and carries no key, seal or other private
+    material.
+    """
+    if not isinstance(bundle, SealHistoryExtensionBundle):
+        raise TypeError(
+            "bundle must be a SealHistoryExtensionBundle instance"
+        )
+    if not isinstance(bundle.proof, SealHistoryExtension):
+        raise TypeError(
+            "bundle.proof must be a SealHistoryExtension instance"
+        )
+    encoded_proof = encode_history_extension(bundle.proof)
+    old_signer_count = _check_history_proof_bundle_signature(
+        bundle.old_signature, field="bundle.old_signature"
+    )
+    new_signer_count = _check_history_proof_bundle_signature(
+        bundle.new_signature, field="bundle.new_signature"
+    )
+    if len(encoded_proof) > 0xFFFFFFFF:
+        raise ValueError("seal history extension proof encoding too long")
+    if old_signer_count > 0xFFFFFFFF or new_signer_count > 0xFFFFFFFF:
+        raise ValueError("too many signer ids")
+
+    buffer = bytearray(SEAL_HISTORY_EXTENSION_BUNDLE_WIRE_TAG)
+    buffer += len(encoded_proof).to_bytes(4, "big", signed=False)
+    buffer += encoded_proof
+    for signature in (bundle.old_signature, bundle.new_signature):
+        buffer += _encode_varint(signature.R)
+        buffer += _encode_varint(signature.z)
+        buffer += len(signature.signer_ids).to_bytes(4, "big", signed=False)
+        for signer_id in signature.signer_ids:
+            buffer += _encode_varint(signer_id)
+    return bytes(buffer)
+
+
+def decode_history_extension_bundle(
+    blob: bytes,
+) -> SealHistoryExtensionBundle:
+    """Decode the canonical encoding produced by :func:`encode_history_extension_bundle`.
+
+    Accepts only the single canonical form: the tag ``b"ts/sheb/v1"``, a
+    4-byte non-zero frame length followed by bytes that
+    :func:`decode_history_extension` accepts, and then the old and new
+    signature frames, each the length-prefixed integers ``R`` and ``z``,
+    the 4-byte non-zero signer count ``k`` and exactly ``k`` strictly
+    increasing positive signer ids. A non-bytes argument raises
+    TypeError; a wrong or missing tag, a zero or over-long proof frame
+    length, a non-canonical nested proof, a zero ``R``, a non-canonical
+    integer (leading zero or over-long length), a zero signer count, a
+    non-positive or non-increasing signer id, truncation, or trailing
+    bytes raises ValueError. A successfully decoded bundle re-encodes to
+    exactly the input bytes.
+
+    Decoding only restores the structure: the nested proof is decoded
+    with :func:`decode_history_extension` (which keeps the leaf digests
+    opaque and verifies nothing) and neither signature is checked. A
+    structurally legal bundle whose signatures do not match its roots is
+    returned normally, and :func:`verify_history_extension_bundle`
+    reports it as ``False``.
+    """
+    if not isinstance(blob, bytes):
+        raise TypeError("blob must be bytes")
+    if not blob.startswith(SEAL_HISTORY_EXTENSION_BUNDLE_WIRE_TAG):
+        raise ValueError("bad seal history extension bundle tag")
+    offset = len(SEAL_HISTORY_EXTENSION_BUNDLE_WIRE_TAG)
+
+    encoded_proof, offset = _read_audit_proof_block(
+        blob, offset, what="seal history extension bundle proof"
+    )
+    proof = decode_history_extension(encoded_proof)
+
+    old_signature, offset = _read_bundle_signature_frame(
+        blob, offset, what="seal history extension bundle old"
+    )
+    new_signature, offset = _read_bundle_signature_frame(
+        blob, offset, what="seal history extension bundle new"
+    )
+    if offset != len(blob):
+        raise ValueError(
+            "trailing bytes after seal history extension bundle"
+        )
+
+    bundle = SealHistoryExtensionBundle(
+        proof=proof,
+        old_signature=old_signature,
+        new_signature=new_signature,
+    )
+    if encode_history_extension_bundle(bundle) != blob:
+        raise ValueError(
+            "non-canonical seal history extension bundle encoding"
+        )
+    return bundle
+
+
+def verify_history_extension_bundle(
+    bundle: SealHistoryExtensionBundle, key: SigningDKGResult
+) -> bool:
+    """Verify a bundle exactly as :func:`check_history_extension` would.
+
+    This is a convenience wrapper over
+    ``check_history_extension(bundle.proof, bundle.old_signature,
+    bundle.new_signature, key)``: the old and new roots are rebuilt from
+    the proof's leaves and each signature verified on its
+    ``b"sh/r" || U64(total) || root`` statement. Returns ``True`` only
+    when both hold; a well-formed bundle with tampered leaves or
+    ``old_total``, a swapped or mismatched signature pair, or one
+    presented under another key, returns ``False``.
+
+    A non-:class:`SealHistoryExtensionBundle` argument raises TypeError;
+    illegal nested proof, signature or key structure raises
+    TypeError/ValueError, exactly as :func:`check_history_extension`
+    does.
+    """
+    if not isinstance(bundle, SealHistoryExtensionBundle):
+        raise TypeError(
+            "bundle must be a SealHistoryExtensionBundle instance"
+        )
+    return check_history_extension(
+        bundle.proof, bundle.old_signature, bundle.new_signature, key
+    )
 
 
 # ---------------------------------------------------------------------------
