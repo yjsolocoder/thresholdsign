@@ -46,6 +46,12 @@ decode_history_extension, and the self-contained bundle
 SealHistoryExtensionBundle / encode_history_extension_bundle /
 decode_history_extension_bundle / verify_history_extension_bundle that
 pairs the consistency proof with its old and new root signatures, and the
+non-empty, order-preserving chain of such bundles
+SealHistoryExtensionBundleChain /
+encode_history_extension_bundle_chain /
+decode_history_extension_bundle_chain /
+verify_history_extension_bundle_chain that archives a growing sealed
+history as one object, and the
 cross-key form RHE / encode_rhe / decode_rhe / check_rhe that ties the
 two root signatures to a non-empty RotationChain so the old and new
 roots may be signed by different threshold keys, publicly
@@ -241,6 +247,10 @@ __all__ = [
     "encode_history_extension_bundle",
     "decode_history_extension_bundle",
     "verify_history_extension_bundle",
+    "SealHistoryExtensionBundleChain",
+    "encode_history_extension_bundle_chain",
+    "decode_history_extension_bundle_chain",
+    "verify_history_extension_bundle_chain",
     "RHE",
     "encode_rhe",
     "decode_rhe",
@@ -12691,6 +12701,228 @@ def verify_history_extension_bundle(
     return check_history_extension(
         bundle.extension, bundle.old_sig, bundle.new_sig, key
     )
+
+
+# ---------------------------------------------------------------------------
+# Seal-history extension bundle chains: a non-empty, order-preserving
+# sequence of self-contained consistency-proof bundles where each hop's new
+# history is exactly the next hop's old history — the predecessor's leaf
+# total equals the successor's old_total and the predecessor's leaves are
+# the successor's leaf prefix — so a growing sealed history can be archived
+# and verified as one object. The chain transport reuses the existing
+# canonical bundle encoding per frame; decoding restores the structure only
+# (no signature, leaf digest or linkage is checked), so
+# verify_history_extension_bundle_chain remains the sole verifier
+# afterwards and no state is kept.
+# ---------------------------------------------------------------------------
+
+SEAL_HISTORY_EXTENSION_BUNDLE_CHAIN_WIRE_TAG = b"ts/shebc/v1"
+
+
+@dataclass(frozen=True)
+class SealHistoryExtensionBundleChain:
+    """A non-empty, order-preserving chain of extension-proof bundles.
+
+    ``items`` is the non-empty tuple of
+    :class:`SealHistoryExtensionBundle` values in chain order: for every
+    adjacent pair the predecessor's leaf count must equal the successor's
+    ``extension.old_total`` and the predecessor's ``extension.leaves``
+    must equal the successor's ``extension.leaves[:old_total]`` (enforced
+    by :func:`verify_history_extension_bundle_chain`, not by
+    construction). The dataclass is frozen, positionally constructible and
+    compared by value, and carries no network, storage or hidden state.
+    Item types and the non-empty bound are not checked at construction
+    time — :func:`encode_history_extension_bundle_chain` checks the
+    structure and :func:`verify_history_extension_bundle_chain` is the
+    way to test a chain afterwards.
+    """
+
+    items: tuple[SealHistoryExtensionBundle, ...]
+
+
+def _check_history_extension_bundle_chain_items(items: object) -> int:
+    """Type- and structure-check a chain's items container, without verifying.
+
+    Items must be a non-empty tuple of
+    :class:`SealHistoryExtensionBundle` values; the bundles themselves are
+    neither encoded nor verified here (that is
+    :func:`verify_history_extension_bundle`'s job during verification).
+    Returns the item count.
+    """
+    if not isinstance(items, tuple):
+        raise TypeError("items must be a tuple")
+    try:
+        count = len(items)
+    except OverflowError:
+        raise ValueError("too many chain items") from None
+    if count == 0:
+        raise ValueError("items must be non-empty")
+    for item in items:
+        if not isinstance(item, SealHistoryExtensionBundle):
+            raise TypeError(
+                "each chain item must be a SealHistoryExtensionBundle instance"
+            )
+    return count
+
+
+def encode_history_extension_bundle_chain(
+    chain: SealHistoryExtensionBundleChain,
+) -> bytes:
+    """Canonically encode a chain of self-contained consistency-proof bundles.
+
+    The encoding is, in order, the tag ``b"ts/shebc/v1"``, the item count
+    ``n = len(chain.items)`` as a 4-byte unsigned big-endian integer, and
+    then one frame per item in chain order: each frame is the 4-byte
+    unsigned big-endian length ``len(E)`` followed by
+    ``E = encode_history_extension_bundle(item)``, the existing canonical
+    single-bundle encoding (never empty).
+
+    Only the chain container and the bundle structures are checked — the
+    prefix linkage is not verified and no signature is checked:
+    :func:`verify_history_extension_bundle_chain` stays the way to verify
+    a chain afterwards. A non-chain argument or a non-tuple item sequence
+    raises TypeError, and a non-:class:`SealHistoryExtensionBundle`
+    element raises TypeError exactly as
+    :func:`encode_history_extension_bundle` does for its extension and
+    signature fields. An empty chain, an over-long count or frame, or an
+    illegal nested bundle raises ValueError. The output for a given chain
+    is unique and the encoding carries no network, storage or hidden
+    state.
+    """
+    if not isinstance(chain, SealHistoryExtensionBundleChain):
+        raise TypeError(
+            "chain must be a SealHistoryExtensionBundleChain instance"
+        )
+    count = _check_history_extension_bundle_chain_items(chain.items)
+    if count > 0xFFFFFFFF:
+        raise ValueError("too many chain items")
+
+    bodies = []
+    for item in chain.items:
+        body = encode_history_extension_bundle(item)
+        if len(body) > 0xFFFFFFFF:
+            raise ValueError(
+                "seal history extension bundle encoding too long"
+            )
+        bodies.append(body)
+
+    buffer = bytearray(SEAL_HISTORY_EXTENSION_BUNDLE_CHAIN_WIRE_TAG)
+    buffer += count.to_bytes(4, "big", signed=False)
+    for body in bodies:
+        buffer += len(body).to_bytes(4, "big", signed=False)
+        buffer += body
+    return bytes(buffer)
+
+
+def decode_history_extension_bundle_chain(
+    blob: bytes,
+) -> SealHistoryExtensionBundleChain:
+    """Decode the canonical encoding produced by :func:`encode_history_extension_bundle_chain`.
+
+    Accepts only the single canonical form: the tag
+    ``b"ts/shebc/v1"``, the 4-byte unsigned big-endian non-zero item
+    count ``n``, and then exactly ``n`` frames, each a 4-byte unsigned
+    big-endian non-zero length followed by bytes that
+    :func:`decode_history_extension_bundle` accepts. A non-bytes
+    argument raises TypeError; a wrong or missing tag, an empty chain, a
+    zero or over-long frame length, an illegal nested bundle, a count
+    mismatch, truncation, or trailing bytes raises ValueError. A
+    successfully decoded chain re-encodes to exactly the input bytes.
+
+    Decoding only restores the structure: every nested bundle goes
+    through :func:`decode_history_extension_bundle`, whose leaf digests
+    stay opaque and whose signatures are not checked, and the prefix
+    linkage between adjacent bundles is not checked either. A
+    structurally legal chain whose signatures do not match or whose
+    bundles do not link is returned normally, and
+    :func:`verify_history_extension_bundle_chain` reports it as
+    ``False``.
+    """
+    if not isinstance(blob, bytes):
+        raise TypeError("blob must be bytes")
+    if not blob.startswith(SEAL_HISTORY_EXTENSION_BUNDLE_CHAIN_WIRE_TAG):
+        raise ValueError("bad seal history extension bundle chain tag")
+    offset = len(SEAL_HISTORY_EXTENSION_BUNDLE_CHAIN_WIRE_TAG)
+
+    if offset + 4 > len(blob):
+        raise ValueError(
+            "truncated seal history extension bundle chain count"
+        )
+    count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    if count == 0:
+        raise ValueError(
+            "seal history extension bundle chain must be non-empty"
+        )
+
+    items = []
+    for index in range(count):
+        body, offset = _read_audit_proof_block(
+            blob,
+            offset,
+            what=f"seal history extension bundle chain item {index + 1}",
+        )
+        items.append(decode_history_extension_bundle(body))
+    if offset != len(blob):
+        raise ValueError(
+            "trailing bytes after seal history extension bundle chain"
+        )
+
+    chain = SealHistoryExtensionBundleChain(items=tuple(items))
+    if encode_history_extension_bundle_chain(chain) != blob:
+        raise ValueError(
+            "non-canonical seal history extension bundle chain encoding"
+        )
+    return chain
+
+
+def verify_history_extension_bundle_chain(
+    chain: SealHistoryExtensionBundleChain, key: SigningDKGResult
+) -> bool:
+    """Verify every bundle of a chain and the prefix linkage between neighbours.
+
+    Each item is verified with
+    :func:`verify_history_extension_bundle` against ``key``, and for
+    every adjacent pair the predecessor's leaf count must equal the
+    successor's ``extension.old_total`` and the predecessor's
+    ``extension.leaves`` must equal the first ``old_total`` leaves of the
+    successor's ``extension.leaves`` — the old tree of each hop is
+    exactly the new tree of the previous one. Returns ``True`` only when
+    every single bundle verifies and every linkage holds; a well-formed
+    chain with a mismatched signature pair, tampered leaves, a gap or
+    overlap between neighbours, or one presented under another key
+    returns ``False``.
+
+    A non-:class:`SealHistoryExtensionBundleChain` argument raises
+    TypeError; an empty chain, a non-tuple item sequence, a
+    non-:class:`SealHistoryExtensionBundle` element, or an illegal
+    nested bundle or key structure raises TypeError/ValueError, exactly
+    as the structural checks of
+    :func:`encode_history_extension_bundle_chain` and
+    :func:`verify_history_extension_bundle` do. The function is
+    stateless.
+    """
+    if not isinstance(chain, SealHistoryExtensionBundleChain):
+        raise TypeError(
+            "chain must be a SealHistoryExtensionBundleChain instance"
+        )
+    _check_history_extension_bundle_chain_items(chain.items)
+
+    result = True
+    previous = None
+    for bundle in chain.items:
+        if not verify_history_extension_bundle(bundle, key):
+            result = False
+        if previous is not None:
+            previous_leaves = previous.extension.leaves
+            old_total = bundle.extension.old_total
+            if (
+                len(previous_leaves) != old_total
+                or previous_leaves != bundle.extension.leaves[:old_total]
+            ):
+                result = False
+        previous = bundle
+    return result
 
 
 # ---------------------------------------------------------------------------
