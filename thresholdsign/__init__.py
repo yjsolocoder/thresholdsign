@@ -58,7 +58,16 @@ extension in full and then only each later hop's newly appended 32-byte
 leaf batches with the shared checkpoint signatures stored once, along
 with its canonical transport encoding encode_history_delta /
 decode_history_delta and the stateless whole-chain verifier
-verify_history_delta, and the
+verify_history_delta, plus half-open interval slicing slice_history_delta
+and adjacent-chain splicing concatenate_history_delta for segmented
+transport and archive reassembly, and the multi-cut batch form of the
+same pair partition_history_delta / join_history_delta_segments for
+splitting a long chain into several consecutive hop segments at once and
+folding an ordered tuple of segments back into one chain, and the
+self-delimiting segment-set transport encoding
+encode_history_delta_segments / decode_history_delta_segments for
+archiving or transferring several consecutive segments as one ordered
+object, and the
 cross-key form RHE / encode_rhe / decode_rhe / check_rhe that ties the
 two root signatures to a non-empty RotationChain so the old and new
 roots may be signed by different threshold keys, publicly
@@ -266,6 +275,10 @@ __all__ = [
     "verify_history_delta",
     "slice_history_delta",
     "concatenate_history_delta",
+    "partition_history_delta",
+    "join_history_delta_segments",
+    "encode_history_delta_segments",
+    "decode_history_delta_segments",
     "RHE",
     "encode_rhe",
     "decode_rhe",
@@ -13528,6 +13541,257 @@ def concatenate_history_delta(
     if decode_history_delta(encoded) != result:
         raise ValueError("concatenated chain does not encode byte for byte")
     return result
+
+
+# ---------------------------------------------------------------------------
+# Multi-cut batch partitioning and reassembly of incremental seal-history
+# extension chains: a long delta chain is split into consecutive hop
+# segments at once, or an ordered tuple of segments is folded back into one
+# chain, on top of the interval slice and the adjacent-chain splice. Both
+# entry points are pure structural transforms: no signature is verified and
+# no state is kept — verification stays with verify_history_delta.
+# ---------------------------------------------------------------------------
+
+
+def partition_history_delta(
+    chain: SealHistoryExtensionDeltaChain,
+    cuts: tuple[int, ...],
+) -> tuple[SealHistoryExtensionDeltaChain, ...]:
+    """Split an incremental extension chain into consecutive hop segments.
+
+    ``cuts`` is a tuple of boundary indices into the expanded chain's
+    hop sequence: cut ``c`` ends one segment just before expanded hop
+    ``c`` and starts the next segment at it, exactly as repeated
+    :func:`slice_history_delta` calls over the intervals
+    ``[0, cuts[0])``, ``[cuts[0], cuts[1])``, ...,
+    ``[cuts[-1], len(hops))`` would. The cuts must be strictly
+    increasing (hence unique) and each must lie in
+    ``1..len(hops) - 1``, so every segment is non-empty; an empty
+    ``cuts`` tuple returns the whole chain as the single segment. The
+    segments are returned in chain order as a tuple of
+    :class:`SealHistoryExtensionDeltaChain` values, each the delta form
+    of its expanded interval. No signature is verified here and no
+    state is kept — verification stays with :func:`verify_history_delta`
+    on each segment, and :func:`join_history_delta_segments` folds the
+    segments back into the original chain.
+
+    A non-:class:`SealHistoryExtensionDeltaChain` chain argument or any
+    wrong field or element type raises TypeError, exactly as
+    :func:`expand_history_delta` does; a non-tuple ``cuts`` or a
+    non-integer cut — booleans included — also raises TypeError. A
+    repeated, non-increasing or out-of-range cut raises ValueError, as
+    does any structural error the expanded chain or its nested extension
+    or signatures would raise on their own.
+    """
+    expanded = expand_history_delta(chain)
+    if not isinstance(cuts, tuple):
+        raise TypeError("cuts must be a tuple")
+    hop_count = len(expanded.items)
+    previous = 0
+    for cut in cuts:
+        _check_segment_bound(cut, "each cut")
+        if cut < 1 or cut > hop_count - 1:
+            raise ValueError("each cut must lie in 1..len(hops) - 1")
+        if cut <= previous:
+            raise ValueError("cuts must be strictly increasing and unique")
+        previous = cut
+
+    bounds = (0,) + cuts + (hop_count,)
+    segments = []
+    for index in range(len(bounds) - 1):
+        start = bounds[index]
+        stop = bounds[index + 1]
+        if start >= stop:
+            raise ValueError("partition segments must be non-empty")
+        segment = SealHistoryExtensionBundleChain(
+            items=expanded.items[start:stop]
+        )
+        segments.append(compact_history_delta(segment))
+    return tuple(segments)
+
+
+def join_history_delta_segments(
+    segments: tuple[SealHistoryExtensionDeltaChain, ...],
+) -> SealHistoryExtensionDeltaChain:
+    """Fold an ordered tuple of incremental extension chain segments into one.
+
+    ``segments`` must be a non-empty tuple of
+    :class:`SealHistoryExtensionDeltaChain` values in chain order; they
+    are joined left to right by repeated
+    :func:`concatenate_history_delta` calls, so each seam must satisfy
+    the same two link conditions as that pairwise splice: the left
+    segment's last expanded hop's ``extension.leaves`` must equal the
+    first ``old_total`` leaves of the right segment's first expanded hop
+    (a gap or overlap is rejected), and the two shared checkpoint
+    signatures at the seam must be identical by value. A single segment
+    is returned as the chain itself. In particular, joining the tuple
+    produced by :func:`partition_history_delta` for any legal cuts
+    restores the original chain value by value, and its canonical
+    encoding matches the original byte for byte. No signature is
+    verified here and no state is kept — verification stays with
+    :func:`verify_history_delta` on the result.
+
+    A non-tuple ``segments`` argument or a
+    non-:class:`SealHistoryExtensionDeltaChain` element raises
+    TypeError, as does any wrong field or element type inside a segment,
+    exactly as :func:`expand_history_delta` does. An empty ``segments``
+    tuple raises ValueError, as does any leaf prefix or shared signature
+    mismatch at a seam and any structural error a segment or its nested
+    extension or signatures would raise on its own.
+    """
+    if not isinstance(segments, tuple):
+        raise TypeError("segments must be a tuple")
+    for segment in segments:
+        if not isinstance(segment, SealHistoryExtensionDeltaChain):
+            raise TypeError(
+                "each segment must be a SealHistoryExtensionDeltaChain "
+                "instance"
+            )
+    if len(segments) == 0:
+        raise ValueError("segments must be a non-empty tuple")
+    for segment in segments:
+        _check_history_extension_delta_chain_fields(segment)
+
+    joined = segments[0]
+    for segment in segments[1:]:
+        joined = concatenate_history_delta(joined, segment)
+    return joined
+
+
+# ---------------------------------------------------------------------------
+# Canonical seal-history delta-chain segment-set transport: a
+# self-delimiting envelope around one or more whole
+# SealHistoryExtensionDeltaChain frames so that several consecutive segments
+# can be archived or cross-implementation transferred as a single object.
+# Like the single-chain codec this restores structure only — no signature is
+# checked, seams are not inspected and no state is kept — and
+# join_history_delta_segments remains the sole place that judges order
+# continuity and the seams between neighbours.
+# ---------------------------------------------------------------------------
+
+HISTORY_DELTA_SEGMENTS_WIRE_TAG = (
+    b"thresholdsign/history-delta-segments/v1"
+)
+
+
+def encode_history_delta_segments(
+    segments: tuple[SealHistoryExtensionDeltaChain, ...],
+) -> bytes:
+    """Canonically encode a non-empty ordered tuple of incremental
+    extension chain segments as one self-delimiting object.
+
+    The encoding is, in order, the tag
+    ``b"thresholdsign/history-delta-segments/v1"``, the 4-byte unsigned
+    big-endian segment count (never zero), then one frame per segment in
+    tuple order — each the 4-byte unsigned big-endian byte length
+    followed by the exact bytes of :func:`encode_history_delta` for that
+    segment (never empty), with no further separators.
+
+    Only the tuple container and the structural legality of each
+    segment (via its own canonical encoder) are checked — the segments
+    are not sorted, no seam between neighbours is inspected and no
+    signature is checked: :func:`join_history_delta_segments` stays the
+    way to judge order continuity and the seams, and
+    :func:`verify_history_delta` the way to verify the joined result
+    afterwards. A non-tuple ``segments`` argument or a
+    non-:class:`SealHistoryExtensionDeltaChain` element raises
+    TypeError, as does any wrong field or element type inside a segment,
+    exactly as :func:`encode_history_delta` does. An empty tuple, an
+    over-long count or frame, or any structural error a segment or its
+    nested extension or signatures would raise on its own raises
+    ValueError. The output for a given tuple is unique and the encoding
+    carries no network, storage or hidden state.
+    """
+    if not isinstance(segments, tuple):
+        raise TypeError("segments must be a tuple")
+    for segment in segments:
+        if not isinstance(segment, SealHistoryExtensionDeltaChain):
+            raise TypeError(
+                "each segment must be a SealHistoryExtensionDeltaChain "
+                "instance"
+            )
+    segment_count = len(segments)
+    if segment_count == 0:
+        raise ValueError("segments must be a non-empty tuple")
+    if segment_count > 0xFFFFFFFF:
+        raise ValueError("too many seal history delta chain segments")
+
+    frames = []
+    for index, segment in enumerate(segments):
+        frame = encode_history_delta(segment)
+        if len(frame) > 0xFFFFFFFF:
+            raise ValueError(
+                f"seal history delta chain segment {index + 1} too long"
+            )
+        frames.append(frame)
+
+    buffer = bytearray(HISTORY_DELTA_SEGMENTS_WIRE_TAG)
+    buffer += segment_count.to_bytes(4, "big", signed=False)
+    for frame in frames:
+        buffer += len(frame).to_bytes(4, "big", signed=False)
+        buffer += frame
+    return bytes(buffer)
+
+
+def decode_history_delta_segments(
+    blob: bytes,
+) -> tuple[SealHistoryExtensionDeltaChain, ...]:
+    """Decode the canonical segment set produced by
+    :func:`encode_history_delta_segments`.
+
+    Accepts only the single canonical form: the tag
+    ``b"thresholdsign/history-delta-segments/v1"``, a 4-byte unsigned
+    big-endian non-zero segment count, then exactly that many frames,
+    each a 4-byte unsigned big-endian non-zero byte length followed by
+    the exact canonical encoding of one
+    :class:`SealHistoryExtensionDeltaChain` accepted by
+    :func:`decode_history_delta`. The segments are restored in their
+    original order as a tuple; they are not sorted, no seam between
+    neighbours is checked and no signature is verified —
+    :func:`join_history_delta_segments` judges order and seams
+    afterwards. A non-bytes argument raises TypeError; a wrong or
+    missing tag, a zero segment count, a zero or over-long frame length,
+    a count mismatch, truncation, trailing bytes, or a frame whose
+    nested chain encoding is illegal or non-canonical (including a
+    frame that would not re-encode byte for byte) raises ValueError. A
+    successfully decoded tuple re-encodes to exactly the input bytes.
+
+    Decoding only restores structure: a set of individually legal but
+    mutually incompatible segments is returned normally, and
+    :func:`join_history_delta_segments` reports the mismatch.
+    """
+    if not isinstance(blob, bytes):
+        raise TypeError("blob must be bytes")
+    if not blob.startswith(HISTORY_DELTA_SEGMENTS_WIRE_TAG):
+        raise ValueError("bad seal history delta chain segments tag")
+    offset = len(HISTORY_DELTA_SEGMENTS_WIRE_TAG)
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated seal history delta chain segments count")
+    segment_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    if segment_count == 0:
+        raise ValueError("seal history delta chain segments must be non-empty")
+
+    segments = []
+    for index in range(segment_count):
+        frame, offset = _read_audit_proof_block(
+            blob,
+            offset,
+            what=f"seal history delta chain segment {index + 1}",
+        )
+        segments.append(decode_history_delta(frame))
+    if offset != len(blob):
+        raise ValueError(
+            "trailing bytes after seal history delta chain segments"
+        )
+
+    segments_tuple = tuple(segments)
+    if encode_history_delta_segments(segments_tuple) != blob:
+        raise ValueError(
+            "non-canonical seal history delta chain segments encoding"
+        )
+    return segments_tuple
 
 
 # ---------------------------------------------------------------------------
