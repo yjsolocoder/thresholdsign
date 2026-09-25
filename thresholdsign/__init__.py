@@ -76,7 +76,10 @@ encode_hds / decode_hds and key-bound verifier verify_hds, and the
 non-empty order-preserving chain of such whole-archive seals
 HistoryDeltaSegmentsSealChain / hdsc_message with its transport
 encoding encode_hdsc / decode_hdsc and key-bound verifier verify_hdsc,
-and the
+and the compact multi-seal membership proofs over that chain HDSCProof /
+make_hdsc_proof / check_hdsc_proof that locate several seals at once
+behind one root signature, with their canonical transport encoding
+encode_hdsc_proof / decode_hdsc_proof, and the
 cross-key form RHE / encode_rhe / decode_rhe / check_rhe that ties the
 two root signatures to a non-empty RotationChain so the old and new
 roots may be signed by different threshold keys, publicly
@@ -301,6 +304,11 @@ __all__ = [
     "encode_hdsc",
     "decode_hdsc",
     "verify_hdsc",
+    "HDSCProof",
+    "make_hdsc_proof",
+    "check_hdsc_proof",
+    "encode_hdsc_proof",
+    "decode_hdsc_proof",
     "RHE",
     "encode_rhe",
     "decode_rhe",
@@ -14524,6 +14532,566 @@ def verify_hdsc(
         generator=generator,
         prime=field_prime,
     )
+
+
+# ---------------------------------------------------------------------------
+# Compact multi-seal membership proofs for chains of sealed segment sets: one
+# threshold signature on a Merkle root statement lets a third party confirm
+# that several HistoryDeltaSegmentsSeal values each sit at a fixed position
+# in the exact seal chain without fetching the chain itself. The tree is
+# isomorphic to the existing seal-history membership proofs — SHA256 over
+# domain-separated leaf/node prefixes with the odd tail of every level
+# paired with itself — but the leaves bind each position to the existing
+# canonical whole-seal encoding encode_hds and the signed root statement is
+# b"ts/hdscp/r1" || U64(total) || root. The compact walk sends each
+# companion digest at most once, level by level left to right, omitting
+# companions that are themselves disclosed and odd tails, so the sibling
+# count and order are derived from the total and the indices alone. No state
+# is kept and check_hdsc_proof rebuilds the root from the disclosed seals
+# and siblings, then re-runs verify_hds on every disclosed seal and
+# verify_signature on the root signature, so a proof certifies both the
+# memberships and the seals themselves.
+# ---------------------------------------------------------------------------
+
+HDSC_PROOF_LEAF_TAG = b"ts/hdscp/l1"
+HDSC_PROOF_NODE_TAG = b"ts/hdscp/n1"
+HDSC_PROOF_ROOT_TAG = b"ts/hdscp/r1"
+HDSC_PROOF_WIRE_TAG = b"ts/hdscp/w1"
+
+HDSC_PROOF_DIGEST_SIZE = 32  # SHA256 output width; every tree node is this wide
+
+
+def _hdsc_proof_u64(value: int) -> bytes:
+    """8-byte unsigned big-endian encoding of a non-negative integer < 2**64."""
+    return value.to_bytes(8, "big", signed=False)
+
+
+def _hdsc_proof_leaf(index: int, seal: HistoryDeltaSegmentsSeal) -> bytes:
+    """The index-bound leaf digest ``H(b"ts/hdscp/l1" || U64(i) || H(encode_hds(seal)))``."""
+    return hashlib.sha256(
+        HDSC_PROOF_LEAF_TAG
+        + _hdsc_proof_u64(index)
+        + hashlib.sha256(encode_hds(seal)).digest()
+    ).digest()
+
+
+def _hdsc_proof_node(left: bytes, right: bytes) -> bytes:
+    """The ordered internal digest ``H(b"ts/hdscp/n1" || left || right)``."""
+    return hashlib.sha256(
+        HDSC_PROOF_NODE_TAG + left + right
+    ).digest()
+
+
+def _hdsc_proof_levels(
+    seals: tuple[HistoryDeltaSegmentsSeal, ...],
+) -> list[tuple[bytes, ...]]:
+    """Build the leaf level and every internal level up to the single root.
+
+    A level with an odd tail width is paired with its own last node
+    duplicated, so every level above the leaves has an even width.
+    """
+    levels: list[tuple[bytes, ...]] = [
+        tuple(
+            _hdsc_proof_leaf(index, seal)
+            for index, seal in enumerate(seals)
+        )
+    ]
+    current = levels[0]
+    while len(current) > 1:
+        if len(current) % 2 == 1:
+            current = current + current[-1:]
+        current = tuple(
+            _hdsc_proof_node(current[index], current[index + 1])
+            for index in range(0, len(current), 2)
+        )
+        levels.append(current)
+    return levels
+
+
+@dataclass(frozen=True)
+class HDSCProof:
+    """A compact Merkle membership proof for several seals of a seal chain.
+
+    The fields, in order, are ``indices`` (the proven leaf positions as a
+    non-empty tuple of strictly increasing, unique non-negative integers),
+    ``total`` (the total, non-empty chain seal count), ``seals`` (the
+    proven :class:`HistoryDeltaSegmentsSeal` values, one per entry of
+    ``indices``, in the same order) and ``siblings`` (the 32-byte sibling
+    digests consumed from the leaf level up to the root, in ascending
+    level order; the tuple is empty when no companion digests are
+    needed). At a level whose width is odd, the last node pairs with
+    itself and no sibling is carried for it. The dataclass is frozen,
+    positionally constructible and compared by value, and carries no
+    network, storage or hidden state. Field types and bounds are not
+    checked at construction time — :func:`check_hdsc_proof` is the way
+    to test a proof afterwards.
+    """
+
+    indices: tuple[int, ...]
+    total: int
+    seals: tuple[HistoryDeltaSegmentsSeal, ...]
+    siblings: tuple[bytes, ...]
+
+
+def make_hdsc_proof(
+    chain: HistoryDeltaSegmentsSealChain, indices: tuple[int, ...]
+) -> tuple[bytes, HDSCProof]:
+    """Build the root statement and a compact multi-seal membership proof.
+
+    ``chain`` must be a :class:`HistoryDeltaSegmentsSealChain` whose
+    seals are a non-empty tuple of structurally legal
+    :class:`HistoryDeltaSegmentsSeal` values exactly as
+    :func:`encode_hds` requires, and ``indices`` a non-empty tuple of
+    leaf positions to prove. The tree is built in chain order with
+    SHA256: leaves are ``H(b"ts/hdscp/l1" || U64(i) ||
+    H(encode_hds(seal)))`` and internal nodes ``H(b"ts/hdscp/n1" || left
+    || right)``; a level with an odd tail width duplicates its last node
+    for pairing. Returns ``(message, proof)`` where ``message`` is
+    ``b"ts/hdscp/r1" || U64(total) || root`` (the 8-byte unsigned
+    big-endian seal count followed by the 32-byte root) — the bytes to
+    be threshold-signed — and ``proof`` is the :class:`HDSCProof` whose
+    ``seals`` pair one to one with ``indices``. Its ``siblings`` are
+    collected level by level, in ascending level order (leaves upward)
+    and left to right within a level, one entry per needed companion:
+    when the companion position is itself a proven node carried in the
+    proof, or the node is the last member of an odd-width level (paired
+    with itself), no sibling is appended; otherwise the companion digest
+    is. Proven nodes from lower levels feed the level above exactly as
+    in the tree, so no digest is sent twice. The chain's own outer
+    signature is not consulted: the proof is built from the seals alone
+    and the returned statement needs a fresh threshold signature.
+
+    Wrong argument types raise TypeError: a
+    non-:class:`HistoryDeltaSegmentsSealChain` chain, a non-tuple index
+    sequence or a non-integer (including boolean) index. An empty chain
+    or index tuple, a structurally illegal seal, a count that does not
+    fit ``0 < total < 2**64``, indices that are not strictly increasing
+    and unique, or an index outside ``0 <= i < total`` raises
+    ValueError.
+    """
+    if not isinstance(chain, HistoryDeltaSegmentsSealChain):
+        raise TypeError(
+            "chain must be a HistoryDeltaSegmentsSealChain instance"
+        )
+    if not isinstance(indices, tuple):
+        raise TypeError("indices must be a tuple")
+    seals = _check_hdsc_seals(chain.seals)
+    total = len(seals)
+    if total > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("too many history delta segments seal chain seals")
+    if len(indices) == 0:
+        raise ValueError("indices must be non-empty")
+    previous = -1
+    for index in indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("each index must be an integer")
+        if index <= previous:
+            raise ValueError("indices must be strictly increasing and unique")
+        if index < 0 or index >= total:
+            raise ValueError("index out of range")
+        previous = index
+
+    levels = _hdsc_proof_levels(seals)
+
+    siblings: list[bytes] = []
+    positions = set(indices)
+    for level in levels[:-1]:
+        width = len(level)
+        padded = level if width % 2 == 0 else level + level[-1:]
+        next_positions = set()
+        for position in sorted(positions):
+            if width % 2 == 1 and position == width - 1:
+                # Odd tail with no companion: the tree pairs it with itself.
+                pass
+            elif (position ^ 1) in positions:
+                # The companion is itself a disclosed node; nothing to send.
+                pass
+            else:
+                siblings.append(padded[position ^ 1])
+            next_positions.add(position // 2)
+        positions = next_positions
+
+    root = levels[-1][0]
+    proof_seals = tuple(seals[index] for index in indices)
+    proof = HDSCProof(
+        indices=tuple(indices),
+        total=total,
+        seals=proof_seals,
+        siblings=tuple(siblings),
+    )
+    return HDSC_PROOF_ROOT_TAG + _hdsc_proof_u64(total) + root, proof
+
+
+def _validate_hdsc_proof_structure(
+    proof: object,
+) -> tuple[
+    tuple[int, ...],
+    int,
+    tuple[HistoryDeltaSegmentsSeal, ...],
+    tuple[bytes, ...],
+]:
+    """Type- and structure-check an HDSCProof, returning its fields.
+
+    Only the container structure is checked: the seals themselves are
+    neither encoded nor verified here (encoding happens in the leaf
+    recomputation and verification is :func:`verify_hds`'s job). The
+    bounds are ``0 < total < 2**64``, a non-empty ``indices`` tuple of
+    strictly increasing indices in ``0 <= i < total`` and a siblings
+    tuple whose entries are exactly 32 bytes. Wrong field types raise
+    TypeError; illegal bounds or shapes raise ValueError. The two count
+    couplings — seals pairing one-to-one with indices and the sibling
+    count the compact walk derives from ``total`` and ``indices`` — are
+    not judged here: the codec rejects their mismatch with ValueError
+    while :func:`check_hdsc_proof` reports it as ``False``.
+    """
+    if not isinstance(proof, HDSCProof):
+        raise TypeError("proof must be an HDSCProof instance")
+    indices = proof.indices
+    total = proof.total
+    seals = proof.seals
+    siblings = proof.siblings
+    if not isinstance(indices, tuple):
+        raise TypeError("proof.indices must be a tuple")
+    if not isinstance(total, int) or isinstance(total, bool):
+        raise TypeError("proof.total must be an integer")
+    if not isinstance(seals, tuple):
+        raise TypeError("proof.seals must be a tuple")
+    if not isinstance(siblings, tuple):
+        raise TypeError("proof.siblings must be a tuple")
+
+    if total <= 0:
+        raise ValueError("proof.total must be positive")
+    if total > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("too many history delta segments seal chain seals")
+    if len(indices) == 0:
+        raise ValueError("proof.indices must be non-empty")
+
+    previous = -1
+    for index in indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("proof.indices entries must be integers")
+        if index <= previous:
+            raise ValueError(
+                "proof.indices must be strictly increasing and unique"
+            )
+        if index < 0 or index >= total:
+            raise ValueError("proof.indices entry out of range")
+        previous = index
+
+    for seal in seals:
+        if not isinstance(seal, HistoryDeltaSegmentsSeal):
+            raise TypeError(
+                "proof.seals entries must be "
+                "HistoryDeltaSegmentsSeal instances"
+            )
+
+    for sibling in siblings:
+        if not isinstance(sibling, bytes):
+            raise TypeError("proof.siblings entries must be bytes")
+    for sibling in siblings:
+        if len(sibling) != HDSC_PROOF_DIGEST_SIZE:
+            raise ValueError(
+                "proof.siblings entries must be exactly 32 bytes"
+            )
+    return indices, total, seals, siblings
+
+
+def check_hdsc_proof(
+    proof: HDSCProof,
+    signature: AggregateSignature,
+    key: SigningDKGResult,
+) -> bool:
+    """Rebuild a proof's Merkle root and verify its seals and root signature.
+
+    The root ``signature`` and ``key`` structures are checked first.
+    Each disclosed seal's leaf digest is then recomputed from its
+    position and the seal exactly as in :func:`make_hdsc_proof`, and the
+    root is rebuilt level by level while consuming ``proof.siblings`` in
+    ascending level order and left to right within a level: the current
+    level holds the digests of the proven nodes at their current
+    positions, paired left to right; when a companion is itself a
+    current-level node its digest is used directly, when the node is the
+    last member of an odd-width level it is paired with itself, and
+    otherwise the next 32-byte entry of ``siblings`` is consumed. The
+    current width contracts as ``(width + 1) // 2`` and the rebuild must
+    consume every sibling exactly. Every disclosed seal is then
+    re-checked with :func:`verify_hds` against ``key`` in index order,
+    and the statement ``b"ts/hdscp/r1" || U64(total) || root`` is
+    finally checked as ``signature``'s threshold Schnorr message via
+    :func:`verify_signature` with the key's group parameters. Returns
+    ``True`` only when the rebuild consumes every sibling exactly and
+    reaches the single signed root, every seal verifies against the key
+    and the signature verifies; a well-formed proof whose seals,
+    indices, siblings, root or signature was tampered with — seals
+    swapped or altered, a seal, index or sibling missing or extra, a
+    misplaced sibling — or which is presented under another key, returns
+    ``False`` rather than raising.
+
+    A non-:class:`HDSCProof` or non-:class:`AggregateSignature` argument
+    or any wrong field type (non-tuple indices/seals/siblings, a
+    non-integer ``total`` or index including booleans, a
+    non-:class:`HistoryDeltaSegmentsSeal` seal or non-bytes sibling)
+    raises TypeError; a non-positive or over-64-bit ``total``, empty
+    indices, an index out of range or not strictly increasing, a sibling
+    entry that is not exactly 32 bytes, or a structurally illegal seal,
+    signature or ``key`` raises ValueError, exactly as
+    :func:`verify_hds` and :func:`verify_signature` would.
+    """
+    indices, total, seals, siblings = _validate_hdsc_proof_structure(proof)
+    if not isinstance(signature, AggregateSignature):
+        raise TypeError("signature must be an AggregateSignature instance")
+    _check_history_proof_bundle_signature(signature)
+
+    _result, public_key, field_prime, group_prime, generator = _check_signing_setup(key)
+    _check_signing_dkg_structure(key)
+
+    if len(seals) != len(indices):
+        return False
+
+    nodes = {
+        index: _hdsc_proof_leaf(index, seal)
+        for index, seal in zip(indices, seals)
+    }
+    pending = iter(siblings)
+    width = total
+    while width > 1:
+        next_nodes = {}
+        for position in sorted(nodes):
+            parent = position // 2
+            if parent in next_nodes:
+                continue
+            if width % 2 == 1 and position == width - 1:
+                # Odd tail with no companion: pair the node with itself.
+                next_nodes[parent] = _hdsc_proof_node(
+                    nodes[position], nodes[position]
+                )
+            elif (position ^ 1) in nodes:
+                left = position if position % 2 == 0 else position ^ 1
+                next_nodes[parent] = _hdsc_proof_node(
+                    nodes[left], nodes[left ^ 1]
+                )
+            else:
+                sibling = next(pending, None)
+                if sibling is None:
+                    # A sibling the walk needs is missing.
+                    return False
+                if position % 2 == 0:
+                    next_nodes[parent] = _hdsc_proof_node(
+                        nodes[position], sibling
+                    )
+                else:
+                    next_nodes[parent] = _hdsc_proof_node(
+                        sibling, nodes[position]
+                    )
+        nodes = next_nodes
+        width = (width + 1) // 2
+
+    if next(pending, None) is not None:
+        # The rebuild must consume every sibling exactly.
+        return False
+
+    for seal in seals:
+        if not verify_hds(seal, key):
+            return False
+
+    signed_message = (
+        HDSC_PROOF_ROOT_TAG + _hdsc_proof_u64(total) + nodes[0]
+    )
+    return verify_signature(
+        signed_message,
+        signature,
+        public_key,
+        group_prime=group_prime,
+        generator=generator,
+        prime=field_prime,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Canonical HDSCProof transport: a self-delimiting, byte-for-byte
+# reproducible encoding of a compact multi-seal chain membership proof for
+# cross-implementation exchange and persistence. Decoding restores structure
+# only — the nested seals go through decode_hds, no seal or signature is
+# checked and no state is kept, so check_hdsc_proof remains the sole
+# verifier afterwards.
+# ---------------------------------------------------------------------------
+
+
+def encode_hdsc_proof(proof: HDSCProof) -> bytes:
+    """Canonically encode a multi-seal chain membership proof for transport/storage.
+
+    The encoding is the direct concatenation, in order, of the tag
+    ``b"ts/hdscp/w1"``, ``VARINT(total)``, the index count as a 4-byte
+    unsigned big-endian integer, one ``VARINT(index)`` per proven leaf
+    in the proof's strictly increasing order, the seal count as a 4-byte
+    unsigned big-endian integer, one frame per seal — the 4-byte
+    unsigned big-endian length ``len(E)`` followed by the raw seal bytes
+    ``E = encode_hds(seal)`` (never empty) — and finally the sibling
+    count as a 4-byte unsigned big-endian integer followed by the raw
+    32-byte sibling digests in their original leaf-to-root, left-to-right
+    order. A ``VARINT`` is a 4-byte unsigned big-endian body length
+    followed by the shortest unsigned big-endian value (zero is the
+    single byte ``00`` and positive values carry no leading zero). The
+    indices must be non-empty, strictly increasing, unique and within
+    ``0 <= i < total``, the seal count must equal the index count, and
+    the sibling count must be the unique one derived from ``total`` and
+    the indices by the compact multi-proof walk.
+
+    Only a structurally legal :class:`HDSCProof` is accepted — a
+    non-proof or wrong field/entry types raise TypeError and illegal
+    bounds, an empty index tuple, a seal tuple that does not pair
+    one-to-one with the indices, a sibling that is not exactly 32 bytes,
+    a sibling count other than the one ``total`` and the indices
+    determine, a structurally illegal nested seal or an over-long frame
+    raise ValueError — but the seals are not verified and no signature
+    is checked: :func:`check_hdsc_proof` stays the way to verify a proof
+    afterwards. The output for a given proof is unique and the encoding
+    carries no network, storage or hidden state.
+    """
+    indices, total, seals, siblings = _validate_hdsc_proof_structure(proof)
+    if len(seals) != len(indices):
+        raise ValueError(
+            "proof.seals must pair one-to-one with proof.indices"
+        )
+    required_siblings = _required_history_multi_proof_siblings(
+        total, indices
+    )
+    if len(siblings) != required_siblings:
+        raise ValueError(
+            "proof.siblings count is not the one determined by total "
+            "and indices"
+        )
+    if len(indices) > 0xFFFFFFFF:
+        raise ValueError("too many indices")
+    if len(siblings) > 0xFFFFFFFF:
+        raise ValueError("too many siblings")
+
+    encoded_seals = []
+    for position, seal in enumerate(seals):
+        encoded_seal = encode_hds(seal)
+        if len(encoded_seal) > 0xFFFFFFFF:
+            raise ValueError(
+                f"hdsc proof seal {position + 1} encoding too long"
+            )
+        encoded_seals.append(encoded_seal)
+
+    buffer = bytearray(HDSC_PROOF_WIRE_TAG)
+    buffer += _encode_varint(total)
+    buffer += len(indices).to_bytes(4, "big", signed=False)
+    for index in indices:
+        buffer += _encode_varint(index)
+    buffer += len(encoded_seals).to_bytes(4, "big", signed=False)
+    for encoded_seal in encoded_seals:
+        buffer += len(encoded_seal).to_bytes(4, "big", signed=False)
+        buffer += encoded_seal
+    buffer += len(siblings).to_bytes(4, "big", signed=False)
+    for sibling in siblings:
+        buffer += sibling
+    return bytes(buffer)
+
+
+def decode_hdsc_proof(blob: bytes) -> HDSCProof:
+    """Decode the canonical encoding produced by :func:`encode_hdsc_proof`.
+
+    Accepts only the single canonical form: the tag ``b"ts/hdscp/w1"``,
+    the length-prefixed integer ``total`` (a 4-byte unsigned big-endian
+    length followed by its shortest unsigned big-endian value, zero
+    encoded as the single byte ``00``), the 4-byte non-zero index count
+    followed by one canonical ``VARINT`` per strictly increasing index,
+    the 4-byte seal count (which must equal the index count) followed by
+    that many non-empty seal frames (a 4-byte non-zero length followed
+    by bytes that :func:`decode_hds` accepts), and finally the 4-byte
+    sibling count followed by exactly that many raw 32-byte sibling
+    digests, where the count must be the unique one derived from
+    ``total`` and the disclosed indices. A non-bytes argument raises
+    TypeError; a wrong or missing tag, an empty index list, a
+    non-positive or over-64-bit ``total``, an index outside
+    ``0 <= i < total``, indices that are not strictly increasing and
+    unique, a seal count that does not match the index count, an empty,
+    truncated or non-canonical seal frame, a missing or extra sibling
+    relative to the count ``total`` and the indices require, a sibling
+    that is not exactly 32 bytes, truncation, trailing bytes, or a
+    non-canonical integer (leading zero or over-long length) raises
+    ValueError. A successfully decoded proof re-encodes to exactly the
+    input bytes.
+
+    Decoding only restores the structure: each nested seal is decoded
+    with :func:`decode_hds` (which verifies no signature and judges no
+    seam) and nothing else is verified. A structurally legal proof whose
+    seals do not verify or whose root signature is invalid is returned
+    normally, and :func:`check_hdsc_proof` reports it as ``False``.
+    """
+    if not isinstance(blob, bytes):
+        raise TypeError("blob must be bytes")
+    if not blob.startswith(HDSC_PROOF_WIRE_TAG):
+        raise ValueError("bad hdsc proof tag")
+    offset = len(HDSC_PROOF_WIRE_TAG)
+
+    total, offset = _read_varint(blob, offset, what="hdsc proof total")
+    if total <= 0:
+        raise ValueError("hdsc proof total must be positive")
+    if total > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("hdsc proof total too large")
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated hdsc proof index count")
+    index_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    if index_count == 0:
+        raise ValueError("hdsc proof indices must be non-empty")
+    indices = []
+    for _ in range(index_count):
+        index, offset = _read_varint(
+            blob, offset, what="hdsc proof index"
+        )
+        indices.append(index)
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated hdsc proof seal count")
+    seal_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    if seal_count != index_count:
+        raise ValueError(
+            "hdsc proof seal count must match the index count"
+        )
+    seals = []
+    for position in range(seal_count):
+        encoded_seal, offset = _read_audit_proof_block(
+            blob,
+            offset,
+            what=f"hdsc proof seal {position + 1}",
+        )
+        seals.append(decode_hds(encoded_seal))
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated hdsc proof sibling count")
+    sibling_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    siblings = []
+    for _ in range(sibling_count):
+        if offset + HDSC_PROOF_DIGEST_SIZE > len(blob):
+            raise ValueError("truncated hdsc proof sibling")
+        siblings.append(
+            bytes(
+                blob[
+                    offset:offset + HDSC_PROOF_DIGEST_SIZE
+                ]
+            )
+        )
+        offset += HDSC_PROOF_DIGEST_SIZE
+    if offset != len(blob):
+        raise ValueError("trailing bytes after hdsc proof")
+
+    proof = HDSCProof(
+        indices=tuple(indices),
+        total=total,
+        seals=tuple(seals),
+        siblings=tuple(siblings),
+    )
+    _validate_hdsc_proof_structure(proof)
+    if encode_hdsc_proof(proof) != blob:
+        raise ValueError("non-canonical hdsc proof encoding")
+    return proof
 
 
 # ---------------------------------------------------------------------------
