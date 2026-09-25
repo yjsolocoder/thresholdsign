@@ -90,7 +90,11 @@ re-checks every bundle with verify_hdsc_proof_bundle before the outer
 verify_signature, and the canonical archive transport encoding
 encode_hdsc_proof_bundle_archive / decode_hdsc_proof_bundle_archive for
 transferring or persisting a whole archive as one self-delimiting byte
-string, and the
+string, and the compact multi-package membership proofs over such an
+archive HDSCArchiveProof / make_hdsc_archive_proof /
+check_hdsc_archive_proof that locate several archive bundles at once
+behind one fresh root signature — with no transport encoding of their
+own and no proof-plus-root-signature bundle type — and the
 cross-key form RHE / encode_rhe / decode_rhe / check_rhe that ties the
 two root signatures to a non-empty RotationChain so the old and new
 roots may be signed by different threshold keys, publicly
@@ -329,6 +333,9 @@ __all__ = [
     "verify_hdsc_proof_bundle_archive",
     "encode_hdsc_proof_bundle_archive",
     "decode_hdsc_proof_bundle_archive",
+    "HDSCArchiveProof",
+    "make_hdsc_archive_proof",
+    "check_hdsc_archive_proof",
     "RHE",
     "encode_rhe",
     "decode_rhe",
@@ -15613,6 +15620,420 @@ def decode_hdsc_proof_bundle_archive(blob: bytes) -> HDSCProofBundleArchive:
     if encode_hdsc_proof_bundle_archive(archive) != blob:
         raise ValueError("non-canonical HDSC proof bundle archive encoding")
     return archive
+
+
+# ---------------------------------------------------------------------------
+# Compact multi-package membership proofs for archives of HDSC proof bundles:
+# one threshold signature on a Merkle root statement lets a third party confirm
+# that several HDSCProofBundle values each sit at a fixed position in the exact
+# archive without fetching the archive itself. The tree is isomorphic to the
+# existing membership proofs — SHA256 over domain-separated leaf/node prefixes
+# with the odd tail of every level paired with itself — but the leaves bind
+# each position to the existing canonical whole-bundle encoding
+# encode_hdsc_proof_bundle and the signed root statement is
+# b"ts/hdscba/r1" || U64(total) || root. The compact walk sends each companion
+# digest at most once, level by level left to right, omitting companions that
+# are themselves disclosed and odd tails, so the sibling count and order are
+# derived from the total and the indices alone. No state is kept and the
+# archive's own outer signature is not consulted at construction;
+# check_hdsc_archive_proof rebuilds the root from the disclosed bundles and
+# siblings, re-runs verify_hdsc_proof_bundle on every disclosed bundle (and,
+# through it, every inner proof and seal) and verify_signature on the root
+# signature, so a proof certifies both the memberships and the bundles.
+# No transport encoding is provided for these proofs and no proof-plus-root-
+# signature bundle type: the root message is signed by the caller through the
+# usual two-round threshold flow and handed over out of band.
+# ---------------------------------------------------------------------------
+
+HDSC_ARCHIVE_PROOF_LEAF_TAG = b"ts/hdscba/l1"
+HDSC_ARCHIVE_PROOF_NODE_TAG = b"ts/hdscba/n1"
+HDSC_ARCHIVE_PROOF_ROOT_TAG = b"ts/hdscba/r1"
+
+HDSC_ARCHIVE_PROOF_DIGEST_SIZE = 32  # SHA256 output width; every tree node is this wide
+
+
+def _hdsc_archive_proof_u64(value: int) -> bytes:
+    """8-byte unsigned big-endian encoding of a non-negative integer < 2**64."""
+    return value.to_bytes(8, "big", signed=False)
+
+
+def _hdsc_archive_proof_leaf(index: int, bundle: HDSCProofBundle) -> bytes:
+    """The index-bound leaf digest for one archive bundle.
+
+    ``H(b"ts/hdscba/l1" || U64(i) ||
+    H(encode_hdsc_proof_bundle(bundle)))``.
+    """
+    return hashlib.sha256(
+        HDSC_ARCHIVE_PROOF_LEAF_TAG
+        + _hdsc_archive_proof_u64(index)
+        + hashlib.sha256(encode_hdsc_proof_bundle(bundle)).digest()
+    ).digest()
+
+
+def _hdsc_archive_proof_node(left: bytes, right: bytes) -> bytes:
+    """The ordered internal digest ``H(b"ts/hdscba/n1" || left || right)``."""
+    return hashlib.sha256(
+        HDSC_ARCHIVE_PROOF_NODE_TAG + left + right
+    ).digest()
+
+
+def _hdsc_archive_proof_levels(
+    bundles: tuple[HDSCProofBundle, ...],
+) -> list[tuple[bytes, ...]]:
+    """Build the leaf level and every internal level up to the single root.
+
+    A level with an odd tail width is paired with its own last node
+    duplicated, so every level above the leaves has an even width.
+    """
+    levels: list[tuple[bytes, ...]] = [
+        tuple(
+            _hdsc_archive_proof_leaf(index, bundle)
+            for index, bundle in enumerate(bundles)
+        )
+    ]
+    current = levels[0]
+    while len(current) > 1:
+        if len(current) % 2 == 1:
+            current = current + current[-1:]
+        current = tuple(
+            _hdsc_archive_proof_node(current[index], current[index + 1])
+            for index in range(0, len(current), 2)
+        )
+        levels.append(current)
+    return levels
+
+
+def _check_hdsc_archive_proof_items(
+    items: object,
+) -> tuple[HDSCProofBundle, ...]:
+    """Type- and structure-check a non-empty ordered tuple of archive bundles.
+
+    Mirrors the container and per-item checks the archive applies: a tuple
+    of :class:`HDSCProofBundle` instances, non-empty, each structurally
+    legal through its own canonical encoder. Nothing here verifies a
+    signature — neither the per-bundle root signatures nor the archive's
+    outer signature.
+    """
+    if not isinstance(items, tuple):
+        raise TypeError("items must be a tuple")
+    for item in items:
+        if not isinstance(item, HDSCProofBundle):
+            raise TypeError(
+                "each archive item must be an HDSCProofBundle instance"
+            )
+    if len(items) == 0:
+        raise ValueError("archive items must be a non-empty tuple")
+    if len(items) > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("too many HDSC proof bundle archive items")
+    for item in items:
+        encode_hdsc_proof_bundle(item)
+    return items
+
+
+@dataclass(frozen=True)
+class HDSCArchiveProof:
+    """A compact Merkle membership proof for several bundles of an archive.
+
+    The fields, in order, are ``indices`` (the proven leaf positions as a
+    non-empty tuple of strictly increasing, unique non-negative integers),
+    ``total`` (the total, non-empty archive item count), ``bundles`` (the
+    proven :class:`HDSCProofBundle` values, one per entry of ``indices``,
+    in the same order) and ``siblings`` (the 32-byte sibling digests
+    consumed from the leaf level up to the root, in ascending level order;
+    the tuple is empty when no companion digests are needed). At a level
+    whose width is odd, the last node pairs with itself and no sibling is
+    carried for it. The dataclass is frozen, positionally constructible
+    and compared by value, and carries no network, storage or hidden
+    state. Field types and bounds are not checked at construction time —
+    :func:`check_hdsc_archive_proof` is the way to test a proof
+    afterwards.
+    """
+
+    indices: tuple[int, ...]
+    total: int
+    bundles: tuple[HDSCProofBundle, ...]
+    siblings: tuple[bytes, ...]
+
+
+def make_hdsc_archive_proof(
+    archive: HDSCProofBundleArchive, indices: tuple[int, ...]
+) -> tuple[bytes, HDSCArchiveProof]:
+    """Build the root statement and a compact multi-package membership proof.
+
+    ``archive`` must be an :class:`HDSCProofBundleArchive` whose items are
+    a non-empty tuple of structurally legal :class:`HDSCProofBundle`
+    values exactly as :func:`encode_hdsc_proof_bundle` requires, and
+    ``indices`` a non-empty tuple of leaf positions to prove. The tree is
+    built in archive order with SHA256: leaves are
+    ``H(b"ts/hdscba/l1" || U64(i) || H(encode_hdsc_proof_bundle(bundle)))``
+    and internal nodes ``H(b"ts/hdscba/n1" || left || right)``; a level
+    with an odd tail width duplicates its last node for pairing. Returns
+    ``(message, proof)`` where ``message`` is
+    ``b"ts/hdscba/r1" || U64(total) || root`` (the 8-byte unsigned
+    big-endian item count followed by the 32-byte root) — the bytes to be
+    threshold-signed — and ``proof`` is the :class:`HDSCArchiveProof`
+    whose ``bundles`` pair one to one with ``indices``. Its ``siblings``
+    are collected level by level, in ascending level order (leaves
+    upward) and left to right within a level, one entry per needed
+    companion: when the companion position is itself a proven node
+    carried in the proof, or the node is the last member of an
+    odd-width level (paired with itself), no sibling is appended;
+    otherwise the companion digest is. Proven nodes from lower levels
+    feed the level above exactly as in the tree, so no digest is sent
+    twice. Only the structure is consulted: the archive's own outer
+    signature is not verified and no state is kept; the returned
+    statement needs a fresh threshold signature from the caller's
+    two-round threshold flow, and one signature over the root covers any
+    index subset of the same archive.
+
+    Wrong argument types raise TypeError: a
+    non-:class:`HDSCProofBundleArchive` archive, a non-tuple index
+    sequence or a non-integer (including boolean) index, as do a
+    non-tuple ``items`` field, a non-:class:`HDSCProofBundle` element and
+    wrong nested field types. An empty archive or index tuple, a
+    structurally illegal bundle, a count that does not fit
+    ``0 < total < 2**64``, indices that are not strictly increasing and
+    unique, or an index outside ``0 <= i < total`` raises ValueError.
+    """
+    if not isinstance(archive, HDSCProofBundleArchive):
+        raise TypeError(
+            "archive must be an HDSCProofBundleArchive instance"
+        )
+    if not isinstance(indices, tuple):
+        raise TypeError("indices must be a tuple")
+    bundles = _check_hdsc_archive_proof_items(archive.items)
+    total = len(bundles)
+    if total > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("too many HDSC proof bundle archive items")
+    if len(indices) == 0:
+        raise ValueError("indices must be non-empty")
+    previous = -1
+    for index in indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("each index must be an integer")
+        if index <= previous:
+            raise ValueError("indices must be strictly increasing and unique")
+        if index < 0 or index >= total:
+            raise ValueError("index out of range")
+        previous = index
+
+    levels = _hdsc_archive_proof_levels(bundles)
+
+    siblings: list[bytes] = []
+    positions = set(indices)
+    for level in levels[:-1]:
+        width = len(level)
+        padded = level if width % 2 == 0 else level + level[-1:]
+        next_positions = set()
+        for position in sorted(positions):
+            if width % 2 == 1 and position == width - 1:
+                # Odd tail with no companion: the tree pairs it with itself.
+                pass
+            elif (position ^ 1) in positions:
+                # The companion is itself a disclosed node; nothing to send.
+                pass
+            else:
+                siblings.append(padded[position ^ 1])
+            next_positions.add(position // 2)
+        positions = next_positions
+
+    root = levels[-1][0]
+    proof_bundles = tuple(bundles[index] for index in indices)
+    proof = HDSCArchiveProof(
+        indices=tuple(indices),
+        total=total,
+        bundles=proof_bundles,
+        siblings=tuple(siblings),
+    )
+    return HDSC_ARCHIVE_PROOF_ROOT_TAG + _hdsc_archive_proof_u64(total) + root, proof
+
+
+def _validate_hdsc_archive_proof_structure(
+    proof: object,
+) -> tuple[
+    tuple[int, ...],
+    int,
+    tuple[HDSCProofBundle, ...],
+    tuple[bytes, ...],
+]:
+    """Type- and structure-check an HDSCArchiveProof, returning its fields.
+
+    Only the container structure is checked: the bundles themselves are
+    neither encoded nor verified here (encoding happens in the leaf
+    recomputation and verification is :func:`verify_hdsc_proof_bundle`'s
+    job). The bounds are ``0 < total < 2**64``, a non-empty ``indices``
+    tuple of strictly increasing indices in ``0 <= i < total`` and a
+    siblings tuple whose entries are exactly 32 bytes. Wrong field or
+    element types raise TypeError; illegal bounds or shapes raise
+    ValueError. The two count couplings — bundles pairing one-to-one with
+    indices and the sibling count the compact walk derives from ``total``
+    and the indices — are not judged here: :func:`check_hdsc_archive_proof`
+    reports a mismatch as ``False``.
+    """
+    if not isinstance(proof, HDSCArchiveProof):
+        raise TypeError("proof must be an HDSCArchiveProof instance")
+    indices = proof.indices
+    total = proof.total
+    bundles = proof.bundles
+    siblings = proof.siblings
+    if not isinstance(indices, tuple):
+        raise TypeError("proof.indices must be a tuple")
+    if not isinstance(total, int) or isinstance(total, bool):
+        raise TypeError("proof.total must be an integer")
+    if not isinstance(bundles, tuple):
+        raise TypeError("proof.bundles must be a tuple")
+    if not isinstance(siblings, tuple):
+        raise TypeError("proof.siblings must be a tuple")
+
+    if total <= 0:
+        raise ValueError("proof.total must be positive")
+    if total > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("too many HDSC proof bundle archive items")
+    if len(indices) == 0:
+        raise ValueError("proof.indices must be non-empty")
+
+    previous = -1
+    for index in indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("proof.indices entries must be integers")
+        if index <= previous:
+            raise ValueError(
+                "proof.indices must be strictly increasing and unique"
+            )
+        if index < 0 or index >= total:
+            raise ValueError("proof.indices entry out of range")
+        previous = index
+
+    for bundle in bundles:
+        if not isinstance(bundle, HDSCProofBundle):
+            raise TypeError(
+                "proof.bundles entries must be HDSCProofBundle instances"
+            )
+
+    for sibling in siblings:
+        if not isinstance(sibling, bytes):
+            raise TypeError("proof.siblings entries must be bytes")
+    for sibling in siblings:
+        if len(sibling) != HDSC_ARCHIVE_PROOF_DIGEST_SIZE:
+            raise ValueError(
+                "proof.siblings entries must be exactly 32 bytes"
+            )
+    return indices, total, bundles, siblings
+
+
+def check_hdsc_archive_proof(
+    proof: HDSCArchiveProof,
+    signature: AggregateSignature,
+    key: SigningDKGResult,
+) -> bool:
+    """Rebuild a proof's Merkle root and verify its bundles and root signature.
+
+    The root ``signature`` and ``key`` structures are checked first.
+    Each disclosed bundle's leaf digest is then recomputed from its
+    position and the bundle exactly as in
+    :func:`make_hdsc_archive_proof`, and the root is rebuilt level by
+    level while consuming ``proof.siblings`` in ascending level order
+    and left to right within a level: the current level holds the
+    digests of the proven nodes at their current positions, paired left
+    to right; when a companion is itself a current-level node its digest
+    is used directly, when the node is the last member of an odd-width
+    level it is paired with itself, and otherwise the next 32-byte entry
+    of ``siblings`` is consumed. The current width contracts as
+    ``(width + 1) // 2`` and the rebuild must consume every sibling
+    exactly. Every disclosed bundle is then re-checked with
+    :func:`verify_hdsc_proof_bundle` against ``key`` in index order — so
+    each inner proof, each disclosed seal and each inner root signature
+    must verify — and the statement
+    ``b"ts/hdscba/r1" || U64(total) || root`` is finally checked as
+    ``signature``'s threshold Schnorr message via
+    :func:`verify_signature` with the key's group parameters. Returns
+    ``True`` only when the rebuild consumes every sibling exactly and
+    reaches the single signed root, every bundle verifies against the
+    key and the signature verifies; a well-formed proof whose bundles,
+    indices, siblings, root or signature was tampered with — bundles
+    swapped or altered, an index, bundle or sibling missing or extra, a
+    misplaced sibling, an inner proof or seal that does not verify — or
+    which is presented under another key, returns ``False`` rather than
+    raising.
+
+    A non-:class:`HDSCArchiveProof` or non-:class:`AggregateSignature`
+    argument or any wrong field type (non-tuple indices/bundles/siblings,
+    a non-integer ``total`` or index including booleans, a
+    non-:class:`HDSCProofBundle` bundle or non-bytes sibling) raises
+    TypeError; a non-positive or over-64-bit ``total``, empty indices,
+    an index out of range or not strictly increasing, a sibling entry
+    that is not exactly 32 bytes, or a structurally illegal bundle,
+    signature or ``key`` raises ValueError, exactly as
+    :func:`verify_hdsc_proof_bundle` and :func:`verify_signature` would.
+    """
+    indices, total, bundles, siblings = _validate_hdsc_archive_proof_structure(proof)
+    if not isinstance(signature, AggregateSignature):
+        raise TypeError("signature must be an AggregateSignature instance")
+    _check_history_proof_bundle_signature(signature)
+
+    _result, public_key, field_prime, group_prime, generator = _check_signing_setup(key)
+    _check_signing_dkg_structure(key)
+
+    if len(bundles) != len(indices):
+        return False
+
+    nodes = {
+        index: _hdsc_archive_proof_leaf(index, bundle)
+        for index, bundle in zip(indices, bundles)
+    }
+    pending = iter(siblings)
+    width = total
+    while width > 1:
+        next_nodes = {}
+        for position in sorted(nodes):
+            parent = position // 2
+            if parent in next_nodes:
+                continue
+            if width % 2 == 1 and position == width - 1:
+                # Odd tail with no companion: pair the node with itself.
+                next_nodes[parent] = _hdsc_archive_proof_node(
+                    nodes[position], nodes[position]
+                )
+            elif (position ^ 1) in nodes:
+                left = position if position % 2 == 0 else position ^ 1
+                next_nodes[parent] = _hdsc_archive_proof_node(
+                    nodes[left], nodes[left ^ 1]
+                )
+            else:
+                sibling = next(pending, None)
+                if sibling is None:
+                    # A sibling the walk needs is missing.
+                    return False
+                if position % 2 == 0:
+                    next_nodes[parent] = _hdsc_archive_proof_node(
+                        nodes[position], sibling
+                    )
+                else:
+                    next_nodes[parent] = _hdsc_archive_proof_node(
+                        sibling, nodes[position]
+                    )
+        nodes = next_nodes
+        width = (width + 1) // 2
+
+    if next(pending, None) is not None:
+        # The rebuild must consume every sibling exactly.
+        return False
+
+    for bundle in bundles:
+        if not verify_hdsc_proof_bundle(bundle, key):
+            return False
+
+    signed_message = (
+        HDSC_ARCHIVE_PROOF_ROOT_TAG + _hdsc_archive_proof_u64(total) + nodes[0]
+    )
+    return verify_signature(
+        signed_message,
+        signature,
+        public_key,
+        group_prime=group_prime,
+        generator=generator,
+        prime=field_prime,
+    )
 
 
 # ---------------------------------------------------------------------------
