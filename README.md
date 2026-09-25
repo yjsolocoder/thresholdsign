@@ -1145,6 +1145,108 @@ C = U32(n) || Σ_i ( U32(len(E_i)) || E_i )
 非法嵌套束或外层签名结构、坏标签、零长或超长帧、计数错、截断、尾随或非规范
 编码抛 `ValueError`；`blob` 非 `bytes` 抛 `TypeError`。
 
+归档里的多个束还可用一个根签名一并证明归属，而无需出示整份归档：
+
+```python
+from thresholdsign import HAMP, make_hamp, check_hamp
+
+# archive 为现有 SMPBundleArchive；i 为非空、严格递增的整数元组
+message, proof = make_hamp(archive, (0, 2, 4))
+signature = sign_threshold(key, message)        # 一个根签名覆盖多个束
+assert check_hamp(proof, signature, key)
+```
+
+冻结数据类 `HAMP(indices, total, bundles, siblings)` 字段依次为待证叶下标元组
+`tuple[int, ...]`（非空、严格递增、不含布尔）、归档项总数 `int`、与下标逐项
+对应的束元组 `tuple[SMPBundle, ...]`（按下标自取，原序）与兄弟摘要元组
+`tuple[bytes, ...]`（每项恰为 32 字节），可按位置构造、按值相等且不可变，不带
+任何隐藏状态；构造时不校验。`make_hamp(archive, indices) -> tuple[bytes, HAMP]`
+要求 `archive` 为现有 `SMPBundleArchive`、`indices` 为非空严格递增且不含布尔的
+整数元组并满足 `0 <= i_j < total < 2^64`（`total = len(archive.items)`）；
+`bundles` 按 `indices` 取归档项。记第 `j` 项束的既有规范传输编码
+`E_j = encode_smp_bundle(archive.items[j])`、`H` 为 SHA256、`U64` 为 8 字节
+无符号大端，树规则为
+
+```text
+叶   = H(b"hamp/l" || U64(j) || H(E_j))
+节点 = H(b"hamp/n" || left || right)
+根消息 = b"hamp/r" || U64(total) || root
+```
+
+奇数宽度的层把末节点复制后配对，树规则、摘要算法与兄弟收集完全沿用既有归属
+证明：自叶向根逐层、层内自左向右收集兄弟；同伴本身也是被披露节点（其束已在
+`bundles` 中）或当前节点是奇数尾（以自身配对）时不入 `siblings`，其余同伴
+恰好追加一次；故 `siblings` 的顺序与数量只由 `total` 与 `indices` 唯一确定。
+`make_hamp` 不查归档的外层签名（根消息由调用方经门限两轮流程自行签署），但
+每个归档项都必须结构合法（能被 `encode_smp_bundle` 编码）。非归档入参、
+`items` 非元组、元素非 `SMPBundle`、`indices` 非元组或下标非整数（含布尔）
+抛 `TypeError`；空归档、空下标、`total >= 2^64`、下标越界或非严格递增、嵌套
+束结构非法抛 `ValueError`。
+
+`check_hamp(proof, signature, key) -> bool` 先查根签名与 `key` 的结构（坏束
+不掩盖非法签名或密钥），再由各下标与 `bundles` 中各束的既有规范编码重算叶
+摘要，逐层按 `siblings` 重建根：同伴本身在当前层则直接取其摘要，奇数尾无同伴
+则复制自身配对，否则消费下一个 32 字节条目；宽度按 `(width+1)//2` 上收，须
+恰好用尽 `siblings` 并唯一到达根。随后按 `indices` 顺序对每个披露束调用
+`verify_smp_bundle`（束内披露封印及束自身根签名都须核验通过），再用 `key` 的
+群参数对 `b"hamp/r"||U64(total)||root` 验证根签名；全部一致才返回 `True`，
+结构合法但不匹配（束互换或改动、下标改动、`siblings` 缺失/多余/错位、摘要或
+签名不符、束数与下标数不符、换密钥核验等）返回 `False` 而非抛异常。非 `HAMP`
+或非 `AggregateSignature` 入参、字段类型错误（`indices`/`bundles`/`siblings`
+非元组、`total` 或下标非整数含布尔、`bundles` 元素非 `SMPBundle`、`siblings`
+元素非 bytes）或 `key` 类型错误抛 `TypeError`；`total` 非正或达到 `2^64`、
+空下标、下标越界或非严格递增、`siblings` 元素非恰 32 字节、签名或密钥
+结构非法抛 `ValueError`；束数与下标数不符、兄弟缺失或多余等数量不符均
+返回 `False` 而不抛异常。HAMP 不携带
+根签名，也不引入任何网络、存储或隐藏状态；其与根签名的规范传输见下文
+`HAMPB`，全部旧接口行为不变。
+
+HAMP 与其根签名另有自带根签名的规范传输，可作为一条自定界字节串跨实现交换
+与持久化：
+
+```python
+from thresholdsign import HAMPB, encode_hampb, decode_hampb
+
+blob = encode_hampb(HAMPB(proof, signature))   # 仅查字段与嵌套结构，不验签
+restored = decode_hampb(blob)                  # 仅恢复结构，规范往返
+assert encode_hampb(restored) == blob
+assert check_hamp(restored.proof, restored.signature, key)
+```
+
+`HAMPB(proof, signature)` 是冻结、可按位置构造、按值相等的数据类，字段依次为
+`proof: HAMP` 与 `signature: AggregateSignature`（证明根消息
+`b"hamp/r"||U64(total)||root` 上的门限 Schnorr 签名），均无默认，构造时不
+校验字段类型与结构。字节流以标签 `b"ts/hampb/v1"` 开头，各段顺序与口径照搬
+既有归属证明包的传输编码：
+
+```text
+b"ts/hampb/v1" || V(total) || U32(k) || Σ_j V(index_j)
+               || U32(束数) || Σ_j ( U32(len(E_j)) || E_j )
+               || U32(len(siblings)) || Σ sibling_j
+               || V(R) || V(z) || U32(k_s) || Σ V(id)
+```
+
+其中 `V` 沿用既有 VARINT（4 字节无符号大端长度加最短无符号大端值，零为单
+字节 `00`，正值无前导零），所有 `U32` 均为 4 字节无符号大端；`k =
+len(indices)` 为待证下标数，随后写 U32 束数及每帧 `U32(len(E))||E`，束数必须
+等于 `k`，嵌套帧体 `E_j` 换成各证明束的既有规范编码
+`encode_smp_bundle(bundles[j])`；`siblings` 编码为 U32 项数及原序 32 字节
+摘要，兄弟数量由 `total` 与下标唯一推导，不携带奇数尾自配或已披露同伴。末尾
+签名帧完全沿用既有口径：`V(R)||V(z)||U32(k_s)||ΣV(id)`，`R > 0`、`z ≥ 0`，
+`signer_ids` 为非空严格递增正整数。
+
+`encode_hampb` 只检查字段与嵌套结构（`indices` 非空递增、
+`0 <= i < total < 2^64`、束与下标等数、嵌套束可被既有编码接受、`siblings`
+各项恰 32 字节且数量与 `total`/`indices` 推导一致、签名帧结构合法），不验
+任何束或根签名，同一束的输出唯一且无状态。非 `HAMPB` 入参或 `proof` 非
+`HAMP` 抛 `TypeError`，其余结构非法或帧超长抛 `ValueError`。`decode_hampb`
+仅复原结构、不验真伪：嵌套束逐个经既有 `decode_smp_bundle` 恢复，兄弟摘要
+原样保留，根签名不核验；成功解码须逐字节重编码等于输入，结构合法但束或根
+签名错配的束仍正常返回（错配照常往返，由 `check_hamp` 判定）。非 `bytes`
+入参抛 `TypeError`；坏标签、`total` 越界、空或非递增/越界下标、束数不符、
+零长或超长帧、非法嵌套束、兄弟缺失或多余、兄弟非恰 32 字节、零 `R`、非规范
+整数（前导零或超长）、空或非递增签名者集合、截断及尾随字节均抛 `ValueError`。
+
 
 ## 命令行演示
 
@@ -2385,6 +2487,43 @@ python3 -m thresholdsign
   整数、空或非递增签名者、截断及尾随抛 `ValueError`；成功须逐字节重编码
   等于输入；结构合法但内层或外层签名错配仍返回对象（由
   `verify_smp_bundle_archive` 判定）；无状态
+- `HAMP(indices, total, bundles, siblings)` — 归档多束成员存在证明的冻结
+  数据类：非空严格递增不含布尔的下标元组、归档项总数、与下标逐项对应的
+  `SMPBundle` 元组、自叶向根各 32 字节的兄弟摘要元组（奇数尾自配与已披露
+  同伴不入列，数量由总数与下标唯一推导）；可按位置构造、按值相等，不含
+  网络、存储或隐藏状态，构造时不校验
+- `make_hamp(archive, indices) -> tuple[bytes, HAMP]` — 按原序取束构造
+  紧凑多束成员证明，返回根消息 `b"hamp/r"||U64(total)||root` 与证明；叶
+  `H(b"hamp/l"||U64(j)||H(E_j))`、节点
+  `H(b"hamp/n"||left||right)`，`E_j = encode_smp_bundle(archive.items[j])`，
+  奇数尾复制末节点配对，不查归档外签。非 `SMPBundleArchive` 入参、
+  `items` 非元组、元素非 `SMPBundle`、下标非元组或非整数（含布尔）抛
+  `TypeError`；空归档/空下标、`total >= 2^64`、下标越界或非严格递增、嵌套
+  束结构非法抛 `ValueError`
+- `check_hamp(proof, signature, key) -> bool` — 先查根签名与密钥结构，再
+  重算叶摘要并逐层消费 `siblings` 重建根（同伴在层直接取用、奇数尾自配、
+  否则消费一条 32 字节兄弟，恰好用尽），随后逐束 `verify_smp_bundle` 并
+  对根消息验签；全真才 `True`，篡改束/下标/兄弟/根签名、数量不符或换钥返
+  `False` 不抛异常。非 `HAMP`/`AggregateSignature` 入参或字段/密钥类型错
+  抛 `TypeError`；`total` 非正或达 `2^64`、空或非递增/越界下标、兄弟非 32
+  字节、嵌套束结构非法、签名或密钥结构非法抛 `ValueError`
+- `HAMPB(proof, signature)` — 冻结数据类，字段依次为 `proof: HAMP` 与根
+  消息上的 `signature: AggregateSignature`；可按位置构造、按值相等，不含
+  网络、存储或隐藏状态，构造时不校验
+- `encode_hampb(bundle) -> bytes` — HAMP 自带根签名的唯一无状态规范传输
+  编码：标签 `b"ts/hampb/v1"`、`V(total)`、U32 下标数与逐项 `V(index)`、
+  U32 束数与逐帧 `U32(len(E))||E`（`E = encode_smp_bundle(...)` 为各束
+  既有规范编码）、U32 兄弟数与原序 32 字节摘要，末尾为
+  `V(R)||V(z)||U32(k)||ΣV(id)` 签名帧；兄弟数由总数与下标唯一推导。只查
+  结构、不验签，输出唯一。非 `HAMPB`/`HAMP` 入参或嵌套字段类型错误抛
+  `TypeError`；空下标、越界或非递增、束数不符、兄弟非 32 字节或数量不符、
+  非法嵌套束或签名帧、帧超长抛 `ValueError`；无状态
+- `decode_hampb(blob) -> HAMPB` — 仅复原结构、不验真伪：嵌套束逐个经
+  `decode_smp_bundle` 恢复，兄弟原样保留，根签名不核验，成功重编码须逐
+  字节等于输入，错配照常往返。非 `bytes` 抛 `TypeError`；坏标签、非规范
+  整数、零长或超长帧、截断尾随、下标/束数/兄弟数不符、嵌套或签名帧非法
+  抛 `ValueError`；核验由 `check_hamp(bundle.proof, bundle.signature, key)`
+  完成；无状态
 
 ### 门限 Schnorr 群参数与边界
 
