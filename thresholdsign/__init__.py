@@ -79,7 +79,9 @@ encoding encode_hdsc / decode_hdsc and key-bound verifier verify_hdsc,
 and the compact multi-seal membership proofs over that chain HDSCProof /
 make_hdsc_proof / check_hdsc_proof that locate several seals at once
 behind one root signature, with their canonical transport encoding
-encode_hdsc_proof / decode_hdsc_proof, and the
+encode_hdsc_proof / decode_hdsc_proof, and the proof-plus-root-signature
+bundle HDSCProofBundle / encode_hdsc_proof_bundle /
+decode_hdsc_proof_bundle / verify_hdsc_proof_bundle, and the
 cross-key form RHE / encode_rhe / decode_rhe / check_rhe that ties the
 two root signatures to a non-empty RotationChain so the old and new
 roots may be signed by different threshold keys, publicly
@@ -309,6 +311,10 @@ __all__ = [
     "check_hdsc_proof",
     "encode_hdsc_proof",
     "decode_hdsc_proof",
+    "HDSCProofBundle",
+    "encode_hdsc_proof_bundle",
+    "decode_hdsc_proof_bundle",
+    "verify_hdsc_proof_bundle",
     "RHE",
     "encode_rhe",
     "decode_rhe",
@@ -15092,6 +15098,186 @@ def decode_hdsc_proof(blob: bytes) -> HDSCProof:
     if encode_hdsc_proof(proof) != blob:
         raise ValueError("non-canonical hdsc proof encoding")
     return proof
+
+
+# ---------------------------------------------------------------------------
+# Canonical HDSCProofBundle transport: an HDSCProof carried together with the
+# aggregate threshold-Schnorr signature over its root statement as one
+# self-delimiting, byte-for-byte reproducible byte string, mirroring the
+# single-proof bundles. Decoding restores structure only — the nested proof
+# goes through decode_hdsc_proof, its seals are not parsed for verification
+# and no signature is checked, so verify_hdsc_proof_bundle remains the sole
+# verifier afterwards.
+# ---------------------------------------------------------------------------
+
+HDSC_PROOF_BUNDLE_WIRE_TAG = b"ts/hdscpb/v1"
+
+
+@dataclass(frozen=True)
+class HDSCProofBundle:
+    """A compact multi-seal chain membership proof together with its root signature.
+
+    The fields, in order, are ``proof`` (an :class:`HDSCProof`) and
+    ``signature`` (the :class:`AggregateSignature` on the proof's
+    ``b"ts/hdscp/r1" || U64(total) || root`` statement). The dataclass
+    is frozen, positionally constructible and compared by value, and
+    carries no network, storage or hidden state. Field types and bounds
+    are not checked at construction time —
+    :func:`encode_hdsc_proof_bundle` checks the structure and
+    :func:`verify_hdsc_proof_bundle` is the way to test a bundle
+    afterwards.
+    """
+
+    proof: HDSCProof
+    signature: AggregateSignature
+
+
+def encode_hdsc_proof_bundle(bundle: HDSCProofBundle) -> bytes:
+    """Canonically encode an hdsc proof bundle for transport or persistence.
+
+    The encoding is, in order, the tag ``b"ts/hdscpb/v1"``, the 4-byte
+    unsigned big-endian length ``len(P)`` followed by
+    ``P = encode_hdsc_proof(bundle.proof)`` (never empty), and then the
+    signature frame: ``VARINT(R)``, ``VARINT(z)``, the 4-byte unsigned
+    big-endian signer count ``k`` and one ``VARINT(id)`` per ascending
+    signer id. A ``VARINT`` is a 4-byte unsigned big-endian body length
+    followed by the shortest unsigned big-endian value (zero is the
+    single byte ``00``, positive values carry no leading zero); ``R``
+    must be positive and ``z`` may be zero.
+
+    Only a structurally legal :class:`HDSCProofBundle` is accepted — a
+    non-bundle or non-:class:`HDSCProof` proof argument, or wrong
+    proof/signature field types, raise TypeError and illegal proof or
+    signature structure (the exact bounds of
+    :func:`encode_hdsc_proof`, a non-positive ``R``, a negative ``z``,
+    an empty or non-strictly-increasing signer id tuple) or an
+    over-long frame raises ValueError, exactly as
+    :func:`check_hdsc_proof`'s structural checks do — but the seals are
+    not verified and the signature is not checked against the root:
+    :func:`verify_hdsc_proof_bundle` stays the way to verify a bundle
+    afterwards. The output for a given bundle is unique and the
+    encoding carries no network, storage or hidden state.
+    """
+    if not isinstance(bundle, HDSCProofBundle):
+        raise TypeError("bundle must be an HDSCProofBundle instance")
+    if not isinstance(bundle.proof, HDSCProof):
+        raise TypeError("bundle.proof must be an HDSCProof instance")
+    encoded_proof = encode_hdsc_proof(bundle.proof)
+    signer_count = _check_history_proof_bundle_signature(bundle.signature)
+    if len(encoded_proof) > 0xFFFFFFFF:
+        raise ValueError("hdsc proof encoding too long")
+    if signer_count > 0xFFFFFFFF:
+        raise ValueError("too many signer ids")
+
+    buffer = bytearray(HDSC_PROOF_BUNDLE_WIRE_TAG)
+    buffer += len(encoded_proof).to_bytes(4, "big", signed=False)
+    buffer += encoded_proof
+    buffer += _encode_varint(bundle.signature.R)
+    buffer += _encode_varint(bundle.signature.z)
+    buffer += signer_count.to_bytes(4, "big", signed=False)
+    for signer_id in bundle.signature.signer_ids:
+        buffer += _encode_varint(signer_id)
+    return bytes(buffer)
+
+
+def decode_hdsc_proof_bundle(blob: bytes) -> HDSCProofBundle:
+    """Decode the canonical encoding produced by :func:`encode_hdsc_proof_bundle`.
+
+    Accepts only the single canonical form: the tag
+    ``b"ts/hdscpb/v1"``, a 4-byte non-zero frame length followed by
+    bytes that :func:`decode_hdsc_proof` accepts, the length-prefixed
+    integers ``R`` and ``z``, the 4-byte non-zero signer count ``k``
+    and then exactly ``k`` strictly increasing positive signer ids. A
+    non-bytes argument raises TypeError; a wrong or missing tag, a zero
+    or over-long proof frame length, a non-canonical nested proof, a
+    zero ``R``, a non-canonical integer (leading zero or over-long
+    length), a zero signer count, a non-positive or non-increasing
+    signer id, truncation, or trailing bytes raises ValueError. A
+    successfully decoded bundle re-encodes to exactly the input bytes.
+
+    Decoding only restores the structure: the nested proof is decoded
+    with :func:`decode_hdsc_proof` (which verifies no seal and judges
+    no signature) and the root signature is not checked. A
+    structurally legal bundle whose seals do not verify or whose
+    signature does not sign the root is returned normally, and
+    :func:`verify_hdsc_proof_bundle` reports it as ``False``.
+    """
+    if not isinstance(blob, bytes):
+        raise TypeError("blob must be bytes")
+    if not blob.startswith(HDSC_PROOF_BUNDLE_WIRE_TAG):
+        raise ValueError("bad hdsc proof bundle tag")
+    offset = len(HDSC_PROOF_BUNDLE_WIRE_TAG)
+
+    encoded_proof, offset = _read_audit_proof_block(
+        blob, offset, what="hdsc proof bundle proof"
+    )
+    proof = decode_hdsc_proof(encoded_proof)
+
+    R, offset = _read_varint(
+        blob, offset, what="hdsc proof bundle signature R"
+    )
+    z, offset = _read_varint(
+        blob, offset, what="hdsc proof bundle signature z"
+    )
+    if R == 0:
+        raise ValueError("hdsc proof bundle signature R must be positive")
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated hdsc proof bundle signer count")
+    signer_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    if signer_count == 0:
+        raise ValueError("hdsc proof bundle must name at least one signer")
+
+    signer_ids = []
+    for _ in range(signer_count):
+        signer_id, offset = _read_varint(
+            blob,
+            offset,
+            what="hdsc proof bundle signer id",
+        )
+        if signer_id == 0:
+            raise ValueError("hdsc proof bundle signer ids must be positive")
+        if signer_ids and signer_id <= signer_ids[-1]:
+            raise ValueError(
+                "hdsc proof bundle signer ids must be strictly "
+                "increasing and unique"
+            )
+        signer_ids.append(signer_id)
+    if offset != len(blob):
+        raise ValueError("trailing bytes after hdsc proof bundle")
+
+    bundle = HDSCProofBundle(
+        proof=proof,
+        signature=AggregateSignature(R=R, z=z, signer_ids=tuple(signer_ids)),
+    )
+    if encode_hdsc_proof_bundle(bundle) != blob:
+        raise ValueError("non-canonical hdsc proof bundle encoding")
+    return bundle
+
+
+def verify_hdsc_proof_bundle(
+    bundle: HDSCProofBundle, key: SigningDKGResult
+) -> bool:
+    """Verify a bundle exactly as :func:`check_hdsc_proof` would.
+
+    This is a convenience wrapper over
+    ``check_hdsc_proof(bundle.proof, bundle.signature, key)``: the
+    Merkle root is rebuilt from the proof, every disclosed seal
+    re-checked with :func:`verify_hds` against ``key`` and the
+    signature verified on
+    ``b"ts/hdscp/r1" || U64(total) || root``. Returns ``True`` only
+    when all of them hold; a well-formed bundle with a tampered seal,
+    index, sibling or signature, or one presented under another key,
+    returns ``False``.
+
+    A non-:class:`HDSCProofBundle` argument raises TypeError; illegal
+    nested proof, signature or key structure raises TypeError/ValueError,
+    exactly as :func:`check_hdsc_proof` does.
+    """
+    if not isinstance(bundle, HDSCProofBundle):
+        raise TypeError("bundle must be an HDSCProofBundle instance")
+    return check_hdsc_proof(bundle.proof, bundle.signature, key)
 
 
 # ---------------------------------------------------------------------------
