@@ -368,6 +368,13 @@ __all__ = [
     "verify_hampba",
     "encode_hampba",
     "decode_hampba",
+    "HBAP",
+    "make_hbap",
+    "check_hbap",
+    "HBAPB",
+    "encode_hbapb",
+    "decode_hbapb",
+    "verify_hbapb",
     "RHE",
     "encode_rhe",
     "decode_rhe",
@@ -17686,6 +17693,669 @@ def decode_hampba(blob: bytes) -> HAMPBArchive:
     if encode_hampba(archive) != blob:
         raise ValueError("non-canonical HAMPB archive encoding")
     return archive
+
+
+# ---------------------------------------------------------------------------
+# Compact multi-bundle membership proofs over the HAMPB archive: one root
+# signature covers any subset of the archive's HAMPB transport bundles. The
+# tree is isomorphic to the HAMP membership proof tree — leaves bind the
+# position to the bundle's canonical encode_hampb bytes, internal nodes are
+# ordered pairs and an odd-width level pairs its last node with itself — with
+# its own domain tags b"hbap/l", b"hbap/n" and b"hbap/r". The proof and the
+# proof-plus-signature transport bundle are plain frozen values, decoding
+# restores structure only and no state is kept: check_hbap and verify_hbapb
+# remain the sole verifiers.
+# ---------------------------------------------------------------------------
+
+HBAP_LEAF_TAG = b"hbap/l"
+HBAP_NODE_TAG = b"hbap/n"
+HBAP_ROOT_TAG = b"hbap/r"
+
+HBAP_DIGEST_SIZE = 32  # SHA256 width; every tree node is this wide
+
+
+def _hbap_u64(value: int) -> bytes:
+    """8-byte unsigned big-endian encoding of a non-negative integer < 2**64."""
+    return value.to_bytes(8, "big", signed=False)
+
+
+def _hbap_leaf(index: int, bundle: HAMPB) -> bytes:
+    """The index-bound leaf digest ``H(b"hbap/l" || U64(i) || H(encode_hampb(bundle)))``."""
+    return hashlib.sha256(
+        HBAP_LEAF_TAG
+        + _hbap_u64(index)
+        + hashlib.sha256(encode_hampb(bundle)).digest()
+    ).digest()
+
+
+def _hbap_node(left: bytes, right: bytes) -> bytes:
+    """The ordered internal digest ``H(b"hbap/n" || left || right)``."""
+    return hashlib.sha256(HBAP_NODE_TAG + left + right).digest()
+
+
+def _hbap_levels(
+    bundles: tuple[HAMPB, ...],
+) -> list[tuple[bytes, ...]]:
+    """Build the leaf level and every internal level up to the single root.
+
+    A level with an odd tail width is paired with its own last node
+    duplicated, so every level above the leaves has an even width.
+    """
+    levels: list[tuple[bytes, ...]] = [
+        tuple(
+            _hbap_leaf(index, bundle)
+            for index, bundle in enumerate(bundles)
+        )
+    ]
+    current = levels[0]
+    while len(current) > 1:
+        if len(current) % 2 == 1:
+            current = current + current[-1:]
+        current = tuple(
+            _hbap_node(current[index], current[index + 1])
+            for index in range(0, len(current), 2)
+        )
+        levels.append(current)
+    return levels
+
+
+def _check_hbap_archive_items(
+    items: object,
+) -> tuple[HAMPB, ...]:
+    """Type- and structure-check a non-empty ordered tuple of HAMPB bundles.
+
+    Mirrors the container and per-item checks the archive codec applies
+    to ``items``: a tuple of :class:`HAMPB` instances, non-empty, each
+    structurally legal through its own canonical encoder. The archive's
+    outer signature is deliberately outside the scope — the proof is
+    built from the bundles alone. Nothing here verifies any signature.
+    """
+    if not isinstance(items, tuple):
+        raise TypeError("items must be a tuple")
+    for item in items:
+        if not isinstance(item, HAMPB):
+            raise TypeError(
+                "each archive item must be an HAMPB instance"
+            )
+    if len(items) == 0:
+        raise ValueError("archive items must be a non-empty tuple")
+    # Encode every bundle first — each call raises TypeError/ValueError
+    # for an illegal bundle exactly as the bundle codec does — so a
+    # single illegal item aborts the whole proof.
+    for item in items:
+        encode_hampb(item)
+    return items
+
+
+@dataclass(frozen=True)
+class HBAP:
+    """A compact Merkle membership proof for several bundles of an HAMPB archive.
+
+    The fields, in order, are ``indices`` (the proven leaf positions as a
+    non-empty tuple of strictly increasing, unique non-negative integers),
+    ``total`` (the total, non-empty archive bundle count), ``bundles``
+    (the proven :class:`HAMPB` values, one per entry of ``indices``, in
+    the same order) and ``siblings`` (the 32-byte sibling digests consumed
+    from the leaf level up to the root, in ascending level order and left
+    to right within a level; the tuple is empty when no sibling digests
+    are needed). At a level whose width is odd, the last node pairs with
+    itself and no sibling is carried for it, and a companion that is
+    itself a disclosed node is never carried either; the number and order
+    of siblings are therefore fixed uniquely by ``total`` and ``indices``.
+    The dataclass is frozen, positionally constructible and compared by
+    value, and carries no network, storage or hidden state. Field types
+    and bounds are not checked at construction time — :func:`check_hbap`
+    is the way to test a proof afterwards.
+    """
+
+    indices: tuple[int, ...]
+    total: int
+    bundles: tuple[HAMPB, ...]
+    siblings: tuple[bytes, ...]
+
+
+def make_hbap(
+    archive: HAMPBArchive, indices: tuple[int, ...]
+) -> tuple[bytes, HBAP]:
+    """Build the root statement and a compact multi-bundle membership proof.
+
+    ``archive`` must be an :class:`HAMPBArchive` whose items are a
+    non-empty tuple of structurally legal :class:`HAMPB` values exactly
+    as :func:`encode_hampb` requires, and ``indices`` a non-empty tuple
+    of leaf positions to prove. Only the archive's structure and its
+    bundles are consulted: the archive's own outer signature is never
+    examined and no state is kept. The tree is built in archive order
+    with SHA256, exactly isomorphic to the HAMP membership proof tree:
+    leaves are ``H(b"hbap/l" || U64(i) || H(encode_hampb(bundle)))`` and
+    internal nodes ``H(b"hbap/n" || left || right)``; a level with an odd
+    tail width duplicates its last node for pairing, and positions and
+    counts are encoded as 8-byte unsigned big-endian integers. Returns
+    ``(message, proof)`` where ``message`` is
+    ``b"hbap/r" || U64(total) || root`` (the 8-byte unsigned big-endian
+    bundle count followed by the 32-byte root) — the bytes to be
+    threshold-signed through the caller's two-round signing flow — and
+    ``proof`` is the :class:`HBAP` whose ``bundles`` take the archive
+    items at ``indices`` in archive order, one to one. Its ``siblings``
+    are collected level by level, in ascending level order (leaves
+    upward) and left to right within a level, one entry per needed
+    companion: when the companion position is itself a proven node
+    carried in the proof, or the node is the last member of an odd-width
+    level (paired with itself), no sibling is appended; otherwise the
+    companion digest is. Proven nodes from lower levels feed the level
+    above exactly as in the tree, so no digest is sent twice. One
+    threshold signature over the statement covers every index subset of
+    the same archive.
+
+    Wrong argument types raise TypeError: a non-:class:`HAMPBArchive`
+    archive, a non-tuple ``archive.items`` field, an item that is not an
+    :class:`HAMPB`, a non-tuple index sequence or a non-integer
+    (including boolean) index. An empty archive or index tuple, a
+    structurally illegal nested bundle, a count at or above ``2**64``,
+    indices that are not strictly increasing and unique, or an index
+    outside ``0 <= i < total`` raises ValueError.
+    """
+    if not isinstance(archive, HAMPBArchive):
+        raise TypeError(
+            "archive must be an HAMPBArchive instance"
+        )
+    if not isinstance(indices, tuple):
+        raise TypeError("indices must be a tuple")
+    items = _check_hbap_archive_items(archive.items)
+    total = len(items)
+    if total > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("too many HAMPB archive items")
+    if len(indices) == 0:
+        raise ValueError("indices must be non-empty")
+    previous = -1
+    for index in indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("each index must be an integer")
+        if index <= previous:
+            raise ValueError("indices must be strictly increasing and unique")
+        if index < 0 or index >= total:
+            raise ValueError("index out of range")
+        previous = index
+
+    levels = _hbap_levels(items)
+
+    siblings: list[bytes] = []
+    positions = set(indices)
+    for level in levels[:-1]:
+        width = len(level)
+        padded = level if width % 2 == 0 else level + level[-1:]
+        next_positions = set()
+        for position in sorted(positions):
+            if width % 2 == 1 and position == width - 1:
+                # Odd tail with no companion: the tree pairs it with itself.
+                pass
+            elif (position ^ 1) in positions:
+                # The companion is itself a disclosed node; nothing to send.
+                pass
+            else:
+                siblings.append(padded[position ^ 1])
+            next_positions.add(position // 2)
+        positions = next_positions
+
+    root = levels[-1][0]
+    proof_bundles = tuple(items[index] for index in indices)
+    proof = HBAP(
+        indices=tuple(indices),
+        total=total,
+        bundles=proof_bundles,
+        siblings=tuple(siblings),
+    )
+    return HBAP_ROOT_TAG + _hbap_u64(total) + root, proof
+
+
+def _validate_hbap_structure(
+    proof: object,
+) -> tuple[
+    tuple[int, ...],
+    int,
+    tuple[HAMPB, ...],
+    tuple[bytes, ...],
+]:
+    """Type- and structure-check an HBAP, returning its fields.
+
+    Only the container structure is checked: the bundles themselves are
+    neither encoded nor verified here (encoding happens in the leaf
+    recomputation and verification is :func:`verify_hampb`'s job). The
+    bounds are ``0 < total < 2**64``, a non-empty ``indices`` tuple of
+    strictly increasing indices in ``0 <= i < total`` and a siblings
+    tuple whose entries are exactly 32 bytes. Wrong field types raise
+    TypeError; illegal bounds or shapes raise ValueError. The two count
+    couplings — bundles pairing one-to-one with indices and the sibling
+    count the compact walk derives from ``total`` and ``indices`` — are
+    not judged here: :func:`check_hbap` reports either mismatch as
+    ``False``.
+    """
+    if not isinstance(proof, HBAP):
+        raise TypeError("proof must be an HBAP instance")
+    indices = proof.indices
+    total = proof.total
+    bundles = proof.bundles
+    siblings = proof.siblings
+    if not isinstance(indices, tuple):
+        raise TypeError("proof.indices must be a tuple")
+    if not isinstance(total, int) or isinstance(total, bool):
+        raise TypeError("proof.total must be an integer")
+    if not isinstance(bundles, tuple):
+        raise TypeError("proof.bundles must be a tuple")
+    if not isinstance(siblings, tuple):
+        raise TypeError("proof.siblings must be a tuple")
+
+    if total <= 0:
+        raise ValueError("proof.total must be positive")
+    if total > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("too many HAMPB archive items")
+    if len(indices) == 0:
+        raise ValueError("proof.indices must be non-empty")
+
+    previous = -1
+    for index in indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("proof.indices entries must be integers")
+        if index <= previous:
+            raise ValueError(
+                "proof.indices must be strictly increasing and unique"
+            )
+        if index < 0 or index >= total:
+            raise ValueError("proof.indices entry out of range")
+        previous = index
+
+    for bundle in bundles:
+        if not isinstance(bundle, HAMPB):
+            raise TypeError(
+                "proof.bundles entries must be HAMPB instances"
+            )
+
+    for sibling in siblings:
+        if not isinstance(sibling, bytes):
+            raise TypeError("proof.siblings entries must be bytes")
+    for sibling in siblings:
+        if len(sibling) != HBAP_DIGEST_SIZE:
+            raise ValueError(
+                "proof.siblings entries must be exactly 32 bytes"
+            )
+    return indices, total, bundles, siblings
+
+
+def check_hbap(
+    proof: HBAP,
+    signature: AggregateSignature,
+    key: SigningDKGResult,
+) -> bool:
+    """Rebuild a proof's Merkle root and verify its bundles and root signature.
+
+    The root ``signature`` and ``key`` structures are checked first.
+    Each disclosed bundle's leaf digest is then recomputed from its
+    position and the bundle exactly as in :func:`make_hbap`, and the
+    root is rebuilt level by level while consuming ``proof.siblings`` in
+    ascending level order and left to right within a level: the current
+    level holds the digests of the proven nodes at their current
+    positions, paired left to right; when a companion is itself a
+    current-level node its digest is used directly, when the node is the
+    last member of an odd-width level it is paired with itself, and
+    otherwise the next 32-byte entry of ``siblings`` is consumed. The
+    current width contracts as ``(width + 1) // 2`` and the rebuild must
+    consume every sibling exactly. Every disclosed bundle is then
+    re-checked with :func:`verify_hampb` against ``key`` in index order,
+    so each bundle's inner HAMP proof and every archive proof bundle it
+    discloses must verify, and the statement
+    ``b"hbap/r" || U64(total) || root`` is finally checked as
+    ``signature``'s threshold Schnorr message via
+    :func:`verify_signature` with the key's group parameters. Returns
+    ``True`` only when the rebuild consumes every sibling exactly and
+    reaches the single signed root, every bundle verifies against the
+    key and the signature verifies; a well-formed proof whose bundles,
+    indices, siblings, root or signature was tampered with — bundles
+    swapped or altered, a bundle, index or sibling missing or extra, a
+    misplaced sibling — or which is presented under another key, returns
+    ``False`` rather than raising.
+
+    A non-:class:`HBAP` or non-:class:`AggregateSignature` argument or
+    any wrong field type (non-tuple indices/bundles/siblings, a
+    non-integer ``total`` or index including booleans, a non-:class:`HAMPB`
+    bundle or non-bytes sibling) raises TypeError; a non-positive or
+    over-64-bit ``total``, empty indices, an index out of range or not
+    strictly increasing, a sibling entry that is not exactly 32 bytes, or
+    a structurally illegal bundle, signature or ``key`` raises ValueError,
+    exactly as :func:`verify_hampb` and :func:`verify_signature` would.
+    """
+    indices, total, bundles, siblings = _validate_hbap_structure(proof)
+    if not isinstance(signature, AggregateSignature):
+        raise TypeError("signature must be an AggregateSignature instance")
+    _check_history_proof_bundle_signature(signature)
+
+    _result, public_key, field_prime, group_prime, generator = _check_signing_setup(key)
+    _check_signing_dkg_structure(key)
+
+    if len(bundles) != len(indices):
+        return False
+
+    nodes = {
+        index: _hbap_leaf(index, bundle)
+        for index, bundle in zip(indices, bundles)
+    }
+    pending = iter(siblings)
+    width = total
+    while width > 1:
+        next_nodes = {}
+        for position in sorted(nodes):
+            parent = position // 2
+            if parent in next_nodes:
+                continue
+            if width % 2 == 1 and position == width - 1:
+                # Odd tail with no companion: pair the node with itself.
+                next_nodes[parent] = _hbap_node(
+                    nodes[position], nodes[position]
+                )
+            elif (position ^ 1) in nodes:
+                left = position if position % 2 == 0 else position ^ 1
+                next_nodes[parent] = _hbap_node(
+                    nodes[left], nodes[left ^ 1]
+                )
+            else:
+                sibling = next(pending, None)
+                if sibling is None:
+                    # A sibling the walk needs is missing.
+                    return False
+                if position % 2 == 0:
+                    next_nodes[parent] = _hbap_node(
+                        nodes[position], sibling
+                    )
+                else:
+                    next_nodes[parent] = _hbap_node(
+                        sibling, nodes[position]
+                    )
+        nodes = next_nodes
+        width = (width + 1) // 2
+
+    if next(pending, None) is not None:
+        # The rebuild must consume every sibling exactly.
+        return False
+
+    for bundle in bundles:
+        if not verify_hampb(bundle, key):
+            return False
+
+    signed_message = (
+        HBAP_ROOT_TAG
+        + _hbap_u64(total)
+        + nodes[0]
+    )
+    return verify_signature(
+        signed_message,
+        signature,
+        public_key,
+        group_prime=group_prime,
+        generator=generator,
+        prime=field_prime,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Canonical HBAPB transport: an HBAP carried together with the aggregate
+# threshold-Schnorr signature over its root statement — the same
+# b"hbap/r" || U64(total) || root message make_hbap returns — as one
+# self-delimiting, byte-for-byte reproducible byte string, mirroring the
+# proof-plus-signature bundles. Decoding restores structure only — the nested
+# bundles go through decode_hampb, no bundle or signature is checked and no
+# state is kept, so verify_hbapb remains the sole verifier afterwards.
+# ---------------------------------------------------------------------------
+
+HBAPB_WIRE_TAG = b"ts/hbapb/v1"
+
+
+@dataclass(frozen=True)
+class HBAPB:
+    """A compact multi-bundle archive membership proof with its root signature.
+
+    The fields, in order, are ``proof`` (an :class:`HBAP`) and
+    ``signature`` (the :class:`AggregateSignature` on the proof's
+    ``b"hbap/r" || U64(total) || root`` statement, the exact message
+    :func:`make_hbap` returns). The dataclass is frozen, positionally
+    constructible and compared by value, and carries no network, storage
+    or hidden state. Field types and bounds are not checked at
+    construction time — :func:`encode_hbapb` checks the structure and
+    :func:`verify_hbapb` is the way to test a bundle afterwards.
+    """
+
+    proof: HBAP
+    signature: AggregateSignature
+
+
+def encode_hbapb(bundle: HBAPB) -> bytes:
+    """Canonically encode an hbap bundle for transport or persistence.
+
+    The encoding is the direct concatenation, in order, of the tag
+    ``b"ts/hbapb/v1"``, ``VARINT(total)``, the index count as a 4-byte
+    unsigned big-endian integer, one ``VARINT(index)`` per proven leaf in
+    the proof's strictly increasing order, the bundle count as a 4-byte
+    unsigned big-endian integer, one frame per bundle — the 4-byte
+    unsigned big-endian length ``len(E)`` followed by the raw bytes
+    ``E = encode_hampb(bundle_value)`` (never empty) — the sibling count
+    as a 4-byte unsigned big-endian integer followed by the raw 32-byte
+    sibling digests in their original leaf-to-root, left-to-right order,
+    and finally the signature frame: ``VARINT(R)``, ``VARINT(z)``, the
+    4-byte unsigned big-endian signer count and one ``VARINT(id)`` per
+    ascending signer id. A ``VARINT`` is a 4-byte unsigned big-endian
+    body length followed by the shortest unsigned big-endian value (zero
+    is the single byte ``00``, positive values carry no leading zero);
+    ``R`` must be positive and ``z`` may be zero. The indices must be
+    non-empty, strictly increasing, unique and within ``0 <= i < total``,
+    the bundle count must equal the index count, and the sibling count
+    must be the unique one derived from ``total`` and the indices by the
+    compact multi-proof walk.
+
+    Only a structurally legal :class:`HBAPB` is accepted — a non-bundle
+    or non-:class:`HBAP` proof argument, or wrong proof/signature field
+    types, raise TypeError and illegal bounds, an empty index tuple, a
+    bundle tuple that does not pair one-to-one with the indices, a
+    sibling that is not exactly 32 bytes, a sibling count other than the
+    one ``total`` and the indices determine, a structurally illegal
+    nested bundle or signature (a non-positive ``R``, a negative ``z``,
+    an empty or non-strictly-increasing signer id tuple) or an over-long
+    frame raises ValueError — but the bundles are not verified and the
+    signature is not checked against the root: :func:`verify_hbapb` stays
+    the way to verify a bundle afterwards. The output for a given bundle
+    is unique and the encoding carries no network, storage or hidden
+    state.
+    """
+    if not isinstance(bundle, HBAPB):
+        raise TypeError("bundle must be an HBAPB instance")
+    if not isinstance(bundle.proof, HBAP):
+        raise TypeError("bundle.proof must be an HBAP instance")
+    indices, total, bundles, siblings = _validate_hbap_structure(
+        bundle.proof
+    )
+    if len(bundles) != len(indices):
+        raise ValueError(
+            "proof.bundles must pair one-to-one with proof.indices"
+        )
+    required_siblings = _required_history_multi_proof_siblings(
+        total, indices
+    )
+    if len(siblings) != required_siblings:
+        raise ValueError(
+            "proof.siblings count is not the one determined by total "
+            "and indices"
+        )
+    if len(indices) > 0xFFFFFFFF:
+        raise ValueError("too many indices")
+    if len(siblings) > 0xFFFFFFFF:
+        raise ValueError("too many siblings")
+    signer_count = _check_history_proof_bundle_signature(bundle.signature)
+    if signer_count > 0xFFFFFFFF:
+        raise ValueError("too many signer ids")
+
+    encoded_bundles = []
+    for position, bundle_value in enumerate(bundles):
+        encoded_bundle = encode_hampb(bundle_value)
+        if len(encoded_bundle) > 0xFFFFFFFF:
+            raise ValueError(
+                f"hbap bundle {position + 1} encoding too long"
+            )
+        encoded_bundles.append(encoded_bundle)
+
+    buffer = bytearray(HBAPB_WIRE_TAG)
+    buffer += _encode_varint(total)
+    buffer += len(indices).to_bytes(4, "big", signed=False)
+    for index in indices:
+        buffer += _encode_varint(index)
+    buffer += len(encoded_bundles).to_bytes(4, "big", signed=False)
+    for encoded_bundle in encoded_bundles:
+        buffer += len(encoded_bundle).to_bytes(4, "big", signed=False)
+        buffer += encoded_bundle
+    buffer += len(siblings).to_bytes(4, "big", signed=False)
+    for sibling in siblings:
+        buffer += sibling
+    buffer += _encode_varint(bundle.signature.R)
+    buffer += _encode_varint(bundle.signature.z)
+    buffer += signer_count.to_bytes(4, "big", signed=False)
+    for signer_id in bundle.signature.signer_ids:
+        buffer += _encode_varint(signer_id)
+    return bytes(buffer)
+
+
+def decode_hbapb(blob: bytes) -> HBAPB:
+    """Decode the canonical encoding produced by :func:`encode_hbapb`.
+
+    Accepts only the single canonical form: the tag ``b"ts/hbapb/v1"``,
+    the length-prefixed integer ``total`` (a 4-byte unsigned big-endian
+    length followed by its shortest unsigned big-endian value, zero
+    encoded as the single byte ``00``), the 4-byte non-zero index count
+    followed by one canonical ``VARINT`` per strictly increasing index,
+    the 4-byte bundle count (which must equal the index count) followed
+    by that many non-empty bundle frames (a 4-byte non-zero length
+    followed by bytes that :func:`decode_hampb` accepts), the 4-byte
+    sibling count followed by exactly that many raw 32-byte sibling
+    digests, where the count must be the unique one derived from
+    ``total`` and the disclosed indices, and finally the signature frame:
+    the length-prefixed integers ``R`` and ``z`` with ``R`` positive, the
+    4-byte non-zero signer count and exactly that many strictly
+    increasing positive signer ids. A non-bytes argument raises
+    TypeError; a wrong or missing tag, an empty index list, a
+    non-positive or over-64-bit ``total``, an index outside
+    ``0 <= i < total``, indices that are not strictly increasing and
+    unique, a bundle count that does not match the index count, an empty,
+    truncated or non-canonical bundle frame, a missing or extra sibling
+    relative to the count ``total`` and the indices require, a sibling
+    that is not exactly 32 bytes, a zero ``R``, a non-canonical integer
+    (leading zero or over-long length), a zero signer count, a
+    non-positive or non-increasing signer id, truncation, or trailing
+    bytes raises ValueError. A successfully decoded bundle re-encodes to
+    exactly the input bytes.
+
+    Decoding only restores the structure: each nested bundle is decoded
+    with :func:`decode_hampb` (which verifies no bundle and checks no
+    signature) and the root signature is not checked. A structurally
+    legal bundle whose nested bundles do not verify or whose signature
+    does not sign the root is returned normally, and
+    :func:`verify_hbapb` reports it as ``False``.
+    """
+    if not isinstance(blob, bytes):
+        raise TypeError("blob must be bytes")
+    if not blob.startswith(HBAPB_WIRE_TAG):
+        raise ValueError("bad HAMPB archive proof bundle tag")
+    offset = len(HBAPB_WIRE_TAG)
+
+    total, offset = _read_varint(blob, offset, what="HAMPB archive proof total")
+    if total <= 0:
+        raise ValueError("HAMPB archive proof total must be positive")
+    if total > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("HAMPB archive proof total too large")
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated HAMPB archive proof index count")
+    index_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    if index_count == 0:
+        raise ValueError("HAMPB archive proof indices must be non-empty")
+    indices = []
+    for _ in range(index_count):
+        index, offset = _read_varint(
+            blob, offset, what="HAMPB archive proof index"
+        )
+        indices.append(index)
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated HAMPB archive proof bundle count")
+    bundle_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    if bundle_count != index_count:
+        raise ValueError(
+            "HAMPB archive proof bundle count must match the index count"
+        )
+    bundles = []
+    for position in range(bundle_count):
+        encoded_bundle, offset = _read_audit_proof_block(
+            blob,
+            offset,
+            what=f"HAMPB archive proof bundle {position + 1}",
+        )
+        bundles.append(decode_hampb(encoded_bundle))
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated HAMPB archive proof sibling count")
+    sibling_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    required_siblings = _required_history_multi_proof_siblings(
+        total, tuple(indices)
+    )
+    if sibling_count != required_siblings:
+        raise ValueError(
+            "HAMPB archive proof sibling count is not the one determined "
+            "by total and indices"
+        )
+    siblings = []
+    for _ in range(sibling_count):
+        if offset + HBAP_DIGEST_SIZE > len(blob):
+            raise ValueError("truncated HAMPB archive proof sibling")
+        siblings.append(
+            bytes(blob[offset:offset + HBAP_DIGEST_SIZE])
+        )
+        offset += HBAP_DIGEST_SIZE
+
+    signature, offset = _read_bundle_signature_frame(
+        blob, offset, what="HAMPB archive proof"
+    )
+    if offset != len(blob):
+        raise ValueError("trailing bytes after HAMPB archive proof bundle")
+
+    proof = HBAP(
+        indices=tuple(indices),
+        total=total,
+        bundles=tuple(bundles),
+        siblings=tuple(siblings),
+    )
+    _validate_hbap_structure(proof)
+    bundle = HBAPB(proof=proof, signature=signature)
+    if encode_hbapb(bundle) != blob:
+        raise ValueError("non-canonical HAMPB archive proof bundle encoding")
+    return bundle
+
+
+def verify_hbapb(bundle: HBAPB, key: SigningDKGResult) -> bool:
+    """Verify a bundle exactly as :func:`check_hbap` would.
+
+    This is a convenience wrapper over
+    ``check_hbap(bundle.proof, bundle.signature, key)``: the Merkle root
+    is rebuilt from the proof, every disclosed bundle is re-checked with
+    :func:`verify_hampb` against ``key`` and the signature verified on
+    the exact statement :func:`make_hbap` returns,
+    ``b"hbap/r" || U64(total) || root``. Returns ``True`` only when all
+    of them hold; a well-formed bundle with a tampered bundle, index,
+    sibling or signature, a bundle swapped or altered, a missing or extra
+    sibling, or one presented under another key, returns ``False``.
+
+    A non-:class:`HBAPB` argument raises TypeError; illegal nested proof,
+    bundle, signature or key structure raises TypeError/ValueError,
+    exactly as :func:`check_hbap` does.
+    """
+    if not isinstance(bundle, HBAPB):
+        raise TypeError("bundle must be an HBAPB instance")
+    return check_hbap(bundle.proof, bundle.signature, key)
 
 
 # ---------------------------------------------------------------------------
