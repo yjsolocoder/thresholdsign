@@ -321,6 +321,24 @@ class MakeHBPTest(unittest.TestCase):
             make_hbp(archive, (0,))
 
 
+    def test_total_at_2_pow_64_boundary_raises_value_error(self):
+        # A count at or above 2**64 is a plain ValueError on every HBP
+        # construction path, never an OverflowError leaking from a bare
+        # len()/U64 conversion.
+        class HugeTuple(tuple):
+            def __len__(self):
+                return 2 ** 64
+
+        huge_archive = HBAPBArchive(
+            HugeTuple((self.archive.items[0],)),
+            self.archive.signature,
+        )
+        with self.assertRaises(ValueError):
+            make_hbp(huge_archive, (0,))
+        with self.assertRaises(ValueError):
+            make_hbp(self.archive, HugeTuple((0,)))
+
+
 class CheckHBPTest(unittest.TestCase):
     def setUp(self):
         self.key = make_key()
@@ -515,6 +533,32 @@ class CheckHBPTest(unittest.TestCase):
             with self.assertRaises(ValueError, msg=repr(bad)):
                 check_hbp(bad, signature, self.key)
 
+    def test_count_at_2_pow_64_boundary_raises_value_error(self):
+        # Every count at or above 2**64 surfaces as ValueError, whether
+        # it arrives through the plain integer field or a tuple subclass
+        # whose len() reports 2**64 (which would leak OverflowError from
+        # a bare len()).
+        class HugeTuple(tuple):
+            def __len__(self):
+                return 2 ** 64
+
+        proof, signature = signed_proof(self.archive, (0, 2), self.key)
+        integer_boundary = (
+            HBP((0,), 2 ** 64, proof.bundles[:1], ()),
+            HBP((0,), 2 ** 64 + 1, proof.bundles[:1], ()),
+        )
+        for bad in integer_boundary:
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                check_hbp(bad, signature, self.key)
+        huge_fields = (
+            HBP(HugeTuple((0, 2)), 8, proof.bundles, proof.siblings),
+            HBP((0, 2), 8, HugeTuple(proof.bundles), proof.siblings),
+            HBP((0, 2), 8, proof.bundles, HugeTuple(proof.siblings)),
+        )
+        for bad in huge_fields:
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                check_hbp(bad, signature, self.key)
+
 
 class HBPBDataTest(unittest.TestCase):
     def test_field_order_and_positional_construction(self):
@@ -647,6 +691,30 @@ class EncodeHBPBTest(unittest.TestCase):
         proof, _ = signed_proof(self.archive, (0, 2), self.key)
         bundle = HBPB(proof, DUMMY_OUTER_SIGNATURE)
         self.assertEqual(encode_hbpb(bundle), build_wire(bundle))
+
+    def test_count_at_2_pow_64_boundary_raises_value_error(self):
+        # An over-64-bit count is a plain ValueError on the encode path,
+        # whether it arrives through the integer field or a tuple
+        # subclass whose len() reports 2**64.
+        class HugeTuple(tuple):
+            def __len__(self):
+                return 2 ** 64
+
+        bundle = signed_hbpb(self.archive, (0, 2), self.key)
+        proof = bundle.proof
+        integer_boundary = HBP(
+            proof.indices, 2 ** 64, proof.bundles, proof.siblings
+        )
+        with self.assertRaises(ValueError):
+            encode_hbpb(HBPB(integer_boundary, bundle.signature))
+        huge_fields = (
+            HBP(HugeTuple(proof.indices), proof.total, proof.bundles, proof.siblings),
+            HBP(proof.indices, proof.total, HugeTuple(proof.bundles), proof.siblings),
+            HBP(proof.indices, proof.total, proof.bundles, HugeTuple(proof.siblings)),
+        )
+        for bad_proof in huge_fields:
+            with self.assertRaises(ValueError, msg=repr(bad_proof)):
+                encode_hbpb(HBPB(bad_proof, bundle.signature))
 
 
 class DecodeHBPBTest(unittest.TestCase):
