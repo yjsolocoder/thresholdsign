@@ -387,6 +387,11 @@ __all__ = [
     "encode_hbpb",
     "decode_hbpb",
     "verify_hbpb",
+    "HBPBArchive",
+    "hbpba_message",
+    "verify_hbpba",
+    "encode_hbpba",
+    "decode_hbpba",
     "RHE",
     "encode_rhe",
     "decode_rhe",
@@ -18780,7 +18785,11 @@ def _check_hbp_archive_items(
             raise TypeError(
                 "each archive item must be an HBAPB instance"
             )
-    if len(items) == 0:
+    try:
+        item_count = len(items)
+    except OverflowError:
+        raise ValueError("too many HBAPB archive items") from None
+    if item_count == 0:
         raise ValueError("archive items must be a non-empty tuple")
     # Encode every bundle first — each call raises TypeError/ValueError
     # for an illegal bundle exactly as the bundle codec does — so a
@@ -19361,6 +19370,324 @@ def verify_hbpb(bundle: HBPB, key: SigningDKGResult) -> bool:
     if not isinstance(bundle, HBPB):
         raise TypeError("bundle must be an HBPB instance")
     return check_hbp(bundle.proof, bundle.signature, key)
+
+
+# ---------------------------------------------------------------------------
+# Non-empty order-preserving archives of whole HBPB transport bundles,
+# authenticated by one outer threshold-Schnorr signature. The signed message
+# commits to the verifying public key and to the SHA256 digest of the exact
+# canonical framing of the bundle sequence, so deleting, inserting,
+# reordering or substituting a bundle — or presenting the archive under
+# another key — all invalidate the outer signature. The library keeps no
+# state: the archive is a plain frozen value, every bundle is re-checked
+# with verify_hbpb on verification, and encoding restores structure only.
+# ---------------------------------------------------------------------------
+
+HBPBA_MESSAGE_TAG = b"ts/hbpba/m1"
+HBPBA_WIRE_TAG = b"ts/hbpba/w1"
+
+
+@dataclass(frozen=True)
+class HBPBArchive:
+    """A non-empty ordered archive of HBPB bundles with one outer signature.
+
+    The fields, in order, are ``items`` — a non-empty tuple of
+    :class:`HBPB` values in archive order — and ``signature`` — the
+    threshold Schnorr :class:`AggregateSignature` on
+    :func:`hbpba_message` of the items and the verifying public key.
+    The dataclass is frozen, positionally constructible and compared by
+    value; neither field has a default, the items keep their order and
+    the archive carries no network, storage or hidden state. Neither
+    field is checked at construction time — :func:`hbpba_message`
+    requires structurally legal items and :func:`verify_hbpba` is the
+    way to test an archive against a key afterwards.
+    """
+
+    items: tuple[HBPB, ...]
+    signature: AggregateSignature
+
+
+def hbpba_message(
+    items: tuple[HBPB, ...], public_key: int
+) -> bytes:
+    """Encode the canonical message the threshold key signs for an archive.
+
+    The message is, in order, the tag ``b"ts/hbpba/m1"``, the 32-byte
+    ``SHA256`` digest of the canonical framing ``C`` and
+    ``V(public_key)`` — a 4-byte unsigned big-endian length followed by
+    the shortest unsigned big-endian value (zero is the single byte
+    ``00``, positive values carry no leading zero). With
+    ``E_i = encode_hbpb(items[i])`` and ``n`` the item count, ``C`` is
+    built in tuple order as ``U32(n) || Σ(U32(len(E_i)) || E_i)``;
+    every ``U32`` is a 4-byte unsigned big-endian integer and ``E_i`` is
+    the existing canonical transport encoding of the bundle. The
+    message carries no signature and keeps no state, and can be taken
+    through the two-round threshold signing flow as is.
+
+    ``items`` must be a non-empty tuple of structurally legal
+    :class:`HBPB` values exactly as :func:`encode_hbpb` requires and
+    ``public_key`` a non-boolean non-negative integer. Wrong field or
+    nested field types raise TypeError — a non-tuple items sequence, an
+    item that is not an :class:`HBPB`, or a non-integer (including
+    boolean) public key; an empty items tuple, an illegal nested
+    bundle, a negative public key or an over-long encoding raises
+    ValueError.
+    """
+    if not isinstance(items, tuple):
+        raise TypeError("items must be a tuple")
+    for item in items:
+        if not isinstance(item, HBPB):
+            raise TypeError("each archive item must be an HBPB instance")
+    if not isinstance(public_key, int) or isinstance(public_key, bool):
+        raise TypeError("public_key must be an integer")
+
+    try:
+        item_count = len(items)
+    except OverflowError:
+        raise ValueError("too many HBPB archive items") from None
+    if item_count == 0:
+        raise ValueError("archive items must be a non-empty tuple")
+    if item_count > 0xFFFFFFFF:
+        raise ValueError("too many HBPB archive items")
+
+    # Encode every bundle first — each call raises TypeError/ValueError
+    # for an illegal bundle exactly as the bundle codec does — and only
+    # then frame the results, so a single illegal item aborts the whole
+    # message.
+    frames = []
+    for index, item in enumerate(items):
+        encoded = encode_hbpb(item)
+        if len(encoded) > 0xFFFFFFFF:
+            raise ValueError(
+                f"HBPB archive item {index + 1} encoding too long"
+            )
+        frames.append(encoded)
+
+    framing = bytearray(item_count.to_bytes(4, "big", signed=False))
+    for encoded in frames:
+        framing += len(encoded).to_bytes(4, "big", signed=False)
+        framing += encoded
+    return (
+        HBPBA_MESSAGE_TAG
+        + hashlib.sha256(bytes(framing)).digest()
+        + _encode_varint(public_key)
+    )
+
+
+def verify_hbpba(
+    archive: HBPBArchive, key: SigningDKGResult
+) -> bool:
+    """Verify an archive of HBPB bundles against the threshold key.
+
+    ``archive`` must be a structurally legal :class:`HBPBArchive` and
+    ``key`` a legal :class:`SigningDKGResult`. The outer signature and
+    the key structure are checked first, as is the structure of every
+    item, so an illegal outer signature or key is never masked by a bad
+    nested bundle: a non-:class:`HBPBArchive` argument, a non-tuple
+    ``items`` field, a non-:class:`HBPB` element or a
+    non-:class:`SigningDKGResult` ``key`` raises TypeError, and an
+    empty items tuple, an illegal outer signature structure, an illegal
+    key structure or any structurally illegal nested bundle raises
+    ValueError.
+
+    Every bundle is then passed to :func:`verify_hbpb` in archive
+    order, so each disclosed HBP proof and its root signature must
+    verify under ``key``; the canonical :func:`hbpba_message` of the
+    items and ``key.public_key`` is finally checked as the outer
+    signature's threshold Schnorr message via :func:`verify_signature`
+    with the key's group parameters. Returns ``True`` only when every
+    per-bundle check and the outer signature check pass; a structurally
+    legal archive whose nested bundle or outer signature does not match
+    — including deleting, inserting, reordering or substituting a
+    bundle, tampering with the outer signature, or presenting the
+    archive under another key — returns ``False`` rather than raising.
+    The function is stateless.
+    """
+    if not isinstance(archive, HBPBArchive):
+        raise TypeError(
+            "archive must be an HBPBArchive instance"
+        )
+    items = archive.items
+    if not isinstance(items, tuple):
+        raise TypeError("items must be a tuple")
+    for item in items:
+        if not isinstance(item, HBPB):
+            raise TypeError("each archive item must be an HBPB instance")
+    # Check the outer signature and the key before any nested bundle is
+    # examined, so a bad bundle can never mask an illegal outer
+    # signature or key; structurally validate every nested bundle too,
+    # exactly as the single-bundle verifier validates its proof.
+    _check_history_proof_bundle_signature(archive.signature)
+    _result, public_key, field_prime, group_prime, generator = _check_signing_setup(key)
+    _check_signing_dkg_structure(key)
+    try:
+        item_count = len(items)
+    except OverflowError:
+        raise ValueError("too many HBPB archive items") from None
+    if item_count == 0:
+        raise ValueError("archive items must be a non-empty tuple")
+    for item in items:
+        encode_hbpb(item)
+
+    if not all(verify_hbpb(item, key) for item in items):
+        return False
+    message = hbpba_message(items, public_key)
+    return verify_signature(
+        message,
+        archive.signature,
+        public_key,
+        group_prime=group_prime,
+        generator=generator,
+        prime=field_prime,
+    )
+
+
+def encode_hbpba(archive: HBPBArchive) -> bytes:
+    """Canonically encode a non-empty ordered archive of HBPB bundles as
+    one self-delimiting object for transport or persistence.
+
+    The encoding is, in order, the tag ``b"ts/hbpba/w1"``, the 4-byte
+    unsigned big-endian item count (never zero), then one frame per
+    bundle in tuple order — each the 4-byte unsigned big-endian byte
+    length (never zero) followed by the exact bytes of
+    :func:`encode_hbpb` for that item, with no further separators —
+    and finally the outer signature frame an :class:`AuditProofBundle`
+    carries: ``VARINT(R)``, ``VARINT(z)``, the 4-byte unsigned
+    big-endian signer count ``k`` and one ``VARINT(id)`` per ascending
+    signer id. Every U32 is a 4-byte unsigned big-endian integer; a
+    ``VARINT`` is a 4-byte unsigned big-endian body length followed by
+    the shortest unsigned big-endian value (zero is the single byte
+    ``00``, positive values carry no leading zero); ``R`` must be
+    positive, ``z`` may be zero and the signer ids are a non-empty
+    strictly increasing tuple of positive integers.
+
+    Only the archive container, each individual bundle and the outer
+    signature are checked structurally — the items are not sorted or
+    otherwise reordered, the outer signature is not matched against the
+    bundles, no inner or outer signature is checked and no state is
+    read: :func:`verify_hbpba` stays the way to test an archive
+    against a key afterwards. A non-:class:`HBPBArchive` argument, a
+    non-tuple ``items`` field or a non-:class:`HBPB` element raises
+    TypeError, as do wrong field types nested inside a bundle and a
+    non-:class:`AggregateSignature` outer signature or one with wrong
+    field types. An empty items tuple, an over-long count or frame,
+    any structural error a bundle would raise on its own, or an
+    illegal outer signature structure raises ValueError. The output
+    for a given archive is unique and the encoding carries no
+    network, storage or hidden state.
+    """
+    if not isinstance(archive, HBPBArchive):
+        raise TypeError(
+            "archive must be an HBPBArchive instance"
+        )
+    items = archive.items
+    if not isinstance(items, tuple):
+        raise TypeError("items must be a tuple")
+    for item in items:
+        if not isinstance(item, HBPB):
+            raise TypeError("each archive item must be an HBPB instance")
+    try:
+        item_count = len(items)
+    except OverflowError:
+        raise ValueError("too many HBPB archive items") from None
+    if item_count == 0:
+        raise ValueError("archive items must be a non-empty tuple")
+    if item_count > 0xFFFFFFFF:
+        raise ValueError("too many HBPB archive items")
+    signer_count = _check_history_proof_bundle_signature(archive.signature)
+    if signer_count > 0xFFFFFFFF:
+        raise ValueError("too many signer ids")
+
+    # Encode every item first — each call raises TypeError/ValueError
+    # for an illegal bundle exactly as the single-bundle codec does —
+    # and only then frame the results, so a single illegal item aborts
+    # the whole archive.
+    frames = []
+    for index, item in enumerate(items):
+        encoded = encode_hbpb(item)
+        if len(encoded) > 0xFFFFFFFF:
+            raise ValueError(
+                f"HBPB archive item {index + 1} encoding too long"
+            )
+        frames.append(encoded)
+
+    buffer = bytearray(HBPBA_WIRE_TAG)
+    buffer += item_count.to_bytes(4, "big", signed=False)
+    for encoded in frames:
+        buffer += len(encoded).to_bytes(4, "big", signed=False)
+        buffer += encoded
+    buffer += _encode_varint(archive.signature.R)
+    buffer += _encode_varint(archive.signature.z)
+    buffer += signer_count.to_bytes(4, "big", signed=False)
+    for signer_id in archive.signature.signer_ids:
+        buffer += _encode_varint(signer_id)
+    return bytes(buffer)
+
+
+def decode_hbpba(blob: bytes) -> HBPBArchive:
+    """Decode the canonical encoding produced by :func:`encode_hbpba`.
+
+    Accepts only the single canonical form: the tag
+    ``b"ts/hbpba/w1"``, a 4-byte unsigned big-endian non-zero item
+    count ``n``, then exactly ``n`` frames, each a 4-byte unsigned
+    big-endian non-zero byte length followed by the exact canonical
+    encoding of one :class:`HBPB` that :func:`decode_hbpb` accepts,
+    and finally the outer signature frame: the length-prefixed integers
+    ``R`` and ``z`` with ``R`` positive, the 4-byte non-zero signer
+    count ``k`` and then exactly ``k`` strictly increasing positive
+    signer ids. The bundles are restored in their original order as a
+    tuple; they are neither sorted nor matched against one another or
+    against the outer signature, and no signature is verified —
+    :func:`verify_hbpba` judges the archive afterwards. A non-bytes
+    argument raises TypeError; a wrong or missing tag, a zero item
+    count, a zero or over-long frame length, a declared count that does
+    not match the number of frames, a nested bundle encoding that is
+    illegal or non-canonical (including a frame that would not
+    re-encode byte for byte), a zero ``R``, a non-canonical integer
+    (leading zero or over-long length), a zero signer count, a
+    non-positive or non-increasing signer id, truncation, or trailing
+    bytes raises ValueError. A successfully decoded archive re-encodes
+    to exactly the input bytes.
+
+    Decoding only restores structure: every nested bundle is decoded
+    with :func:`decode_hbpb` (which verifies no bundle and checks no
+    signature) and the outer signature is not checked. A structurally
+    legal archive whose bundles do not verify or whose outer signature
+    does not sign the bundles is returned normally, and
+    :func:`verify_hbpba` reports it as ``False``.
+    """
+    if not isinstance(blob, bytes):
+        raise TypeError("blob must be bytes")
+    if not blob.startswith(HBPBA_WIRE_TAG):
+        raise ValueError("bad HBPB archive tag")
+    offset = len(HBPBA_WIRE_TAG)
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated HBPB archive item count")
+    item_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    if item_count == 0:
+        raise ValueError("HBPB archive items must be non-empty")
+
+    items = []
+    for index in range(item_count):
+        frame, offset = _read_audit_proof_block(
+            blob,
+            offset,
+            what=f"HBPB archive item {index + 1}",
+        )
+        items.append(decode_hbpb(frame))
+
+    signature, offset = _read_bundle_signature_frame(
+        blob, offset, what="HBPB archive"
+    )
+    if offset != len(blob):
+        raise ValueError("trailing bytes after HBPB archive")
+
+    archive = HBPBArchive(items=tuple(items), signature=signature)
+    if encode_hbpba(archive) != blob:
+        raise ValueError("non-canonical HBPB archive encoding")
+    return archive
 
 
 # ---------------------------------------------------------------------------

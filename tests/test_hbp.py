@@ -320,6 +320,17 @@ class MakeHBPTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             make_hbp(archive, (0,))
 
+    def test_count_at_two_pow_64_raises_value_error(self):
+        class HugeTuple(tuple):
+            def __len__(self):
+                return 2 ** 64
+
+        archive = HBAPBArchive(
+            HugeTuple((self.archive.items[0],)), self.archive.signature
+        )
+        with self.assertRaises(ValueError):
+            make_hbp(archive, (0,))
+
 
 class CheckHBPTest(unittest.TestCase):
     def setUp(self):
