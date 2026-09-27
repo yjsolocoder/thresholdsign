@@ -423,6 +423,12 @@ __all__ = [
     "HPAPBP",
     "make_hpapbp",
     "check_hpapbp",
+    "encode_hpapbp",
+    "decode_hpapbp",
+    "HPAPBPB",
+    "encode_hpapbpb",
+    "decode_hpapbpb",
+    "verify_hpapbpb",
     "RHE",
     "encode_rhe",
     "decode_rhe",
@@ -21904,11 +21910,11 @@ def decode_hpapba(blob: bytes) -> HPAPBArchive:
 # one layer down — SHA256 with domain-separated leaf/node tags, an odd tail
 # paired with itself — over the bundles' existing canonical transport
 # encoding, and the root statement to sign is
-# ``b"hpapbp/r" || U64(total) || root``. No transport encoding or
-# proof-plus-signature bundle is defined for this proof: make_hpapbp and
-# check_hpapbp are the whole interface, and check_hpapbp re-runs
-# verify_hpapb on every disclosed bundle, so a proof certifies both
-# membership and the bundles themselves.
+# ``b"hpapbp/r" || U64(total) || root``. The proof has its own canonical
+# transport encoding (encode_hpapbp/decode_hpapbp) and a proof-plus-root-
+# signature bundle (HPAPBPB with encode_hpapbpb/decode_hpapbpb/
+# verify_hpapbpb); check_hpapbp re-runs verify_hpapb on every disclosed
+# bundle, so a proof certifies both membership and the bundles themselves.
 # ---------------------------------------------------------------------------
 
 HPAPBP_LEAF_TAG = b"hpapbp/l"
@@ -22316,6 +22322,347 @@ def check_hpapbp(
         generator=generator,
         prime=field_prime,
     )
+
+
+# ---------------------------------------------------------------------------
+# Canonical HPAPBP transport encoding: the proof exactly as check_hpapbp
+# consumes it — total, the disclosed indices, each disclosed HPAPB bundle in
+# its existing canonical frame and the raw sibling digests — self-delimiting
+# under one tag. Mirrors encode_hpap/decode_hpap one layer down: encoding
+# checks structure only and decoding restores structure only, so neither
+# verifies a bundle or signature and no state is kept.
+# ---------------------------------------------------------------------------
+
+HPAPBP_WIRE_TAG = b"ts/hpapbp/v1"
+
+
+def encode_hpapbp(proof: HPAPBP) -> bytes:
+    """Canonically encode an HPAPBP membership proof for transport or persistence.
+
+    The encoding is the direct concatenation, in order, of the tag
+    ``b"ts/hpapbp/v1"``, ``VARINT(total)``, the index count as a 4-byte
+    unsigned big-endian integer, one ``VARINT(index)`` per proven leaf in
+    the proof's strictly increasing order, the bundle count as a 4-byte
+    unsigned big-endian integer, one frame per bundle — the 4-byte
+    unsigned big-endian length ``len(E)`` followed by the raw bytes
+    ``E = encode_hpapb(bundle)`` (never empty) — and a 4-byte unsigned
+    big-endian sibling item count followed by the raw 32-byte sibling
+    digests concatenated directly in their original leaf-to-root,
+    left-to-right order. A ``VARINT`` is a 4-byte unsigned big-endian body
+    length followed by the shortest unsigned big-endian value (zero is the
+    single byte ``00``, positive values carry no leading zero). The
+    integer and frame conventions are exactly those of :func:`encode_hpap`.
+    The indices must be non-empty, strictly increasing, unique and within
+    ``0 <= i < total``, the bundle count must equal the index count, and
+    the sibling count must be the unique one derived from ``total`` and
+    the indices by the compact multi-proof walk.
+
+    Only a structurally legal :class:`HPAPBP` is accepted — a
+    non-:class:`HPAPBP` argument or wrong field types raise TypeError and
+    illegal bounds, an empty index tuple, a bundle tuple that does not
+    pair one-to-one with the indices, a sibling that is not exactly 32
+    bytes, a sibling count other than the one ``total`` and the indices
+    determine, a structurally illegal nested bundle or an over-long frame
+    raises ValueError — but the bundles are not verified and no signature
+    is involved: :func:`check_hpapbp` stays the way to verify a proof
+    afterwards. The output for a given proof is unique and the encoding
+    carries no network, storage or hidden state.
+    """
+    indices, total, bundles, siblings = _validate_hpapbp_structure(proof)
+    try:
+        if len(bundles) != len(indices):
+            raise ValueError(
+                "proof.bundles must pair one-to-one with proof.indices"
+            )
+    except OverflowError:
+        raise ValueError("too many HPAPB archive proof bundles") from None
+    required_siblings = _required_history_multi_proof_siblings(
+        total, indices
+    )
+    if len(siblings) != required_siblings:
+        raise ValueError(
+            "proof.siblings count is not the one determined by total "
+            "and indices"
+        )
+    if len(indices) > 0xFFFFFFFF:
+        raise ValueError("too many indices")
+    if len(siblings) > 0xFFFFFFFF:
+        raise ValueError("too many siblings")
+
+    encoded_bundles = []
+    for position, bundle in enumerate(bundles):
+        encoded_bundle = encode_hpapb(bundle)
+        if len(encoded_bundle) > 0xFFFFFFFF:
+            raise ValueError(
+                f"hpapbp bundle {position + 1} encoding too long"
+            )
+        encoded_bundles.append(encoded_bundle)
+
+    buffer = bytearray(HPAPBP_WIRE_TAG)
+    buffer += _encode_varint(total)
+    buffer += len(indices).to_bytes(4, "big", signed=False)
+    for index in indices:
+        buffer += _encode_varint(index)
+    buffer += len(encoded_bundles).to_bytes(4, "big", signed=False)
+    for encoded_bundle in encoded_bundles:
+        buffer += len(encoded_bundle).to_bytes(4, "big", signed=False)
+        buffer += encoded_bundle
+    buffer += len(siblings).to_bytes(4, "big", signed=False)
+    for sibling in siblings:
+        buffer += sibling
+    return bytes(buffer)
+
+
+def decode_hpapbp(blob: bytes) -> HPAPBP:
+    """Decode the canonical encoding produced by :func:`encode_hpapbp`.
+
+    Accepts only the single canonical form: the tag ``b"ts/hpapbp/v1"``,
+    the length-prefixed integer ``total`` (a 4-byte unsigned big-endian
+    length followed by its shortest unsigned big-endian value, zero
+    encoded as the single byte ``00``), the 4-byte non-zero index count
+    followed by one canonical ``VARINT`` per strictly increasing index,
+    the 4-byte bundle count (which must equal the index count) followed
+    by that many non-empty bundle frames (a 4-byte non-zero length
+    followed by bytes that :func:`decode_hpapb` accepts), and the 4-byte
+    sibling item count followed by exactly that many raw 32-byte sibling
+    digests concatenated with no further framing, where the count must be
+    the unique one derived from ``total`` and the disclosed indices. A
+    non-bytes argument raises TypeError; a wrong or missing tag, an empty
+    index list, a non-positive or over-64-bit ``total``, an index outside
+    ``0 <= i < total``, indices that are not strictly increasing and
+    unique, a bundle count that does not match the index count, an empty,
+    truncated or non-canonical bundle frame, a missing or extra sibling
+    relative to the count ``total`` and the indices require, a sibling
+    section whose width is not exactly 32 bytes per item, a non-canonical
+    integer (leading zero or over-long length), truncation, or trailing
+    bytes raises ValueError. A successfully decoded proof re-encodes to
+    exactly the input bytes.
+
+    Decoding only restores the structure: each nested bundle is decoded
+    with :func:`decode_hpapb` (which verifies no bundle and checks no
+    signature). A structurally legal proof whose nested bundles do not
+    verify is returned normally, and :func:`check_hpapbp` reports it as
+    ``False``.
+    """
+    if not isinstance(blob, bytes):
+        raise TypeError("blob must be bytes")
+    if not blob.startswith(HPAPBP_WIRE_TAG):
+        raise ValueError("bad HPAPBP proof tag")
+    offset = len(HPAPBP_WIRE_TAG)
+
+    total, offset = _read_varint(blob, offset, what="hpapbp proof total")
+    if total <= 0:
+        raise ValueError("hpapbp proof total must be positive")
+    if total > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("hpapbp proof total too large")
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated hpapbp proof index count")
+    index_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    if index_count == 0:
+        raise ValueError("hpapbp proof indices must be non-empty")
+    indices = []
+    for _ in range(index_count):
+        index, offset = _read_varint(blob, offset, what="hpapbp proof index")
+        indices.append(index)
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated hpapbp proof bundle count")
+    bundle_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    if bundle_count != index_count:
+        raise ValueError(
+            "hpapbp proof bundle count must match the index count"
+        )
+    bundles = []
+    for position in range(bundle_count):
+        encoded_bundle, offset = _read_archive_block(
+            blob,
+            offset,
+            what=f"hpapbp proof bundle {position + 1}",
+        )
+        bundles.append(decode_hpapb(encoded_bundle))
+
+    if offset + 4 > len(blob):
+        raise ValueError("truncated hpapbp proof sibling count")
+    sibling_count = int.from_bytes(blob[offset:offset + 4], "big")
+    offset += 4
+    required_siblings = _required_history_multi_proof_siblings(
+        total, tuple(indices)
+    )
+    if sibling_count != required_siblings:
+        raise ValueError(
+            "hpapbp proof sibling count is not the one determined by "
+            "total and indices"
+        )
+    siblings = []
+    for _ in range(sibling_count):
+        if offset + HPAPBP_DIGEST_SIZE > len(blob):
+            raise ValueError("truncated hpapbp proof sibling")
+        siblings.append(
+            bytes(blob[offset:offset + HPAPBP_DIGEST_SIZE])
+        )
+        offset += HPAPBP_DIGEST_SIZE
+
+    if offset != len(blob):
+        raise ValueError("trailing bytes after HPAPBP proof")
+
+    proof = HPAPBP(
+        indices=tuple(indices),
+        total=total,
+        bundles=tuple(bundles),
+        siblings=tuple(siblings),
+    )
+    _validate_hpapbp_structure(proof)
+    if encode_hpapbp(proof) != blob:
+        raise ValueError("non-canonical hpapbp proof encoding")
+    return proof
+
+
+# ---------------------------------------------------------------------------
+# HPAPBP bundle: a compact multi-bundle membership proof together with the
+# aggregate root signature over its ``b"hpapbp/r" || U64(total) || root``
+# statement, as one self-delimiting byte string. Mirrors the HPAPB bundle
+# one layer down: the value is frozen and stateless, encoding checks
+# structure only, decoding restores structure only, and verify_hpapbpb
+# delegates to check_hpapbp for the whole judgement.
+# ---------------------------------------------------------------------------
+
+HPAPBPB_WIRE_TAG = b"ts/hpapbpb/v1"
+
+
+@dataclass(frozen=True)
+class HPAPBPB:
+    """A compact multi-bundle membership proof with its root signature.
+
+    The fields, in order, are ``proof`` (an :class:`HPAPBP`) and
+    ``signature`` (the :class:`AggregateSignature` on the proof's
+    ``b"hpapbp/r" || U64(total) || root`` statement, the exact message
+    :func:`make_hpapbp` returns). The dataclass is frozen, positionally
+    constructible and compared by value, and carries no network, storage
+    or hidden state. Field types and bounds are not checked at
+    construction time — :func:`encode_hpapbpb` checks the structure and
+    :func:`verify_hpapbpb` is the way to test a bundle afterwards.
+    """
+
+    proof: HPAPBP
+    signature: AggregateSignature
+
+
+def encode_hpapbpb(bundle: HPAPBPB) -> bytes:
+    """Canonically encode an hpapbp bundle for transport or persistence.
+
+    The encoding is the direct concatenation, in order, of the tag
+    ``b"ts/hpapbpb/v1"``, one 4-byte unsigned big-endian length frame
+    whose body is exactly ``encode_hpapbp(bundle.proof)`` (never empty),
+    and then the existing signature frame: ``VARINT(R)``, ``VARINT(z)``,
+    the 4-byte unsigned big-endian signer count and one ``VARINT(id)``
+    per ascending signer id — the same frame :func:`encode_hpapb`
+    appends. A ``VARINT`` is a 4-byte unsigned big-endian body length
+    followed by the shortest unsigned big-endian value (zero is the
+    single byte ``00``, positive values carry no leading zero); ``R``
+    must be positive and ``z`` may be zero.
+
+    Only a structurally legal :class:`HPAPBPB` is accepted — a non-bundle
+    or non-:class:`HPAPBP` proof argument, or wrong proof/signature field
+    types, raise TypeError and illegal proof structure (the exact bounds
+    of :func:`encode_hpapbp`), a structurally illegal signature (a
+    non-positive ``R``, a negative ``z``, an empty or
+    non-strictly-increasing signer id tuple) or an over-long frame
+    raises ValueError — but the proof is not verified and the signature
+    is not checked against the root: :func:`verify_hpapbpb` stays the way
+    to verify a bundle afterwards. The output for a given bundle is
+    unique, stateless and does not parse the nested bundle frames.
+    """
+    if not isinstance(bundle, HPAPBPB):
+        raise TypeError("bundle must be an HPAPBPB instance")
+    if not isinstance(bundle.proof, HPAPBP):
+        raise TypeError("bundle.proof must be an HPAPBP instance")
+    encoded_proof = encode_hpapbp(bundle.proof)
+    signer_count = _check_history_proof_bundle_signature(bundle.signature)
+    if len(encoded_proof) > 0xFFFFFFFF:
+        raise ValueError("hpapbp proof encoding too long")
+    if signer_count > 0xFFFFFFFF:
+        raise ValueError("too many signer ids")
+
+    buffer = bytearray(HPAPBPB_WIRE_TAG)
+    buffer += len(encoded_proof).to_bytes(4, "big", signed=False)
+    buffer += encoded_proof
+    buffer += _encode_varint(bundle.signature.R)
+    buffer += _encode_varint(bundle.signature.z)
+    buffer += signer_count.to_bytes(4, "big", signed=False)
+    for signer_id in bundle.signature.signer_ids:
+        buffer += _encode_varint(signer_id)
+    return bytes(buffer)
+
+
+def decode_hpapbpb(blob: bytes) -> HPAPBPB:
+    """Decode the canonical encoding produced by :func:`encode_hpapbpb`.
+
+    Accepts only the single canonical form: the tag
+    ``b"ts/hpapbpb/v1"``, a 4-byte non-zero frame length followed by
+    bytes that :func:`decode_hpapbp` accepts, and then the signature
+    frame: the length-prefixed integers ``R`` and ``z`` with ``R``
+    positive, the 4-byte non-zero signer count and exactly that many
+    strictly increasing positive signer ids. A non-bytes argument raises
+    TypeError; a wrong or missing tag, a zero or over-long proof frame
+    length, a non-canonical nested proof, a zero ``R``, a non-canonical
+    integer (leading zero or over-long length), a zero signer count, a
+    non-positive or non-increasing signer id, truncation, or trailing
+    bytes raises ValueError. A successfully decoded bundle re-encodes to
+    exactly the input bytes.
+
+    Decoding only restores the structure: the nested proof is decoded
+    with :func:`decode_hpapbp` (which verifies no bundle and checks no
+    signature) and the root signature is not checked. A structurally
+    legal bundle whose nested bundles do not verify or whose signature
+    does not sign the root is returned normally, and
+    :func:`verify_hpapbpb` reports it as ``False``.
+    """
+    if not isinstance(blob, bytes):
+        raise TypeError("blob must be bytes")
+    if not blob.startswith(HPAPBPB_WIRE_TAG):
+        raise ValueError("bad hpapbp bundle tag")
+    offset = len(HPAPBPB_WIRE_TAG)
+
+    encoded_proof, offset = _read_archive_block(
+        blob, offset, what="HPAPBPB proof"
+    )
+    proof = decode_hpapbp(encoded_proof)
+
+    signature, offset = _read_bundle_signature_frame(
+        blob, offset, what="HPAPBPB"
+    )
+    if offset != len(blob):
+        raise ValueError("trailing bytes after HPAPBPB")
+
+    bundle = HPAPBPB(proof=proof, signature=signature)
+    if encode_hpapbpb(bundle) != blob:
+        raise ValueError("non-canonical hpapbp bundle encoding")
+    return bundle
+
+
+def verify_hpapbpb(bundle: HPAPBPB, key: SigningDKGResult) -> bool:
+    """Verify a bundle exactly as :func:`check_hpapbp` would.
+
+    This is a convenience wrapper over
+    ``check_hpapbp(bundle.proof, bundle.signature, key)``: the Merkle
+    root is rebuilt from the proof, every disclosed bundle is re-checked
+    with :func:`verify_hpapb` against ``key`` and the signature verified
+    on the exact statement :func:`make_hpapbp` returns,
+    ``b"hpapbp/r" || U64(total) || root``. Returns ``True`` only when all
+    of them hold; a well-formed bundle with a tampered bundle, index,
+    sibling or signature, a bundle swapped or altered, a missing or extra
+    sibling, or one presented under another key, returns ``False``.
+
+    A non-:class:`HPAPBPB` argument raises TypeError; illegal nested
+    proof, bundle, signature or key structure raises
+    TypeError/ValueError, exactly as :func:`check_hpapbp` does.
+    """
+    if not isinstance(bundle, HPAPBPB):
+        raise TypeError("bundle must be an HPAPBPB instance")
+    return check_hpapbp(bundle.proof, bundle.signature, key)
 
 
 # ---------------------------------------------------------------------------
