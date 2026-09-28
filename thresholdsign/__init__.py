@@ -434,6 +434,9 @@ __all__ = [
     "verify_hpapbpba",
     "encode_hpapbpba",
     "decode_hpapbpba",
+    "HPAPBPBP",
+    "make_hpapbpbp",
+    "check_hpapbpbp",
     "RHE",
     "encode_rhe",
     "decode_rhe",
@@ -22996,6 +22999,430 @@ def decode_hpapbpba(blob: bytes) -> HPAPBPBArchive:
     if encode_hpapbpba(archive) != blob:
         raise ValueError("non-canonical HPAPBPB archive encoding")
     return archive
+
+
+# ---------------------------------------------------------------------------
+# Compact multi-bundle membership proofs over an HPAPBPB archive: one root
+# signature certifies that several disclosed HPAPBPB membership-proof
+# bundles sit at fixed positions in the exact non-empty ordered sequence an
+# HPAPBPBArchive carries. The tree is exactly isomorphic to the HPAPBP
+# membership proof tree one layer down (and to the HPAP tree below that) —
+# SHA256 with domain-separated leaf/node tags, an odd tail paired with
+# itself — over the bundles' existing canonical transport encoding, and the
+# root statement to sign is ``b"hpapbpbp/r" || U64(total) || root``. This
+# layer adds no transport encoding and no proof-plus-root-signature bundle:
+# check_hpapbpbp re-runs verify_hpapbpb on every disclosed bundle, so a
+# proof certifies both membership and the bundles themselves, each of which
+# already carries its own root signature.
+# ---------------------------------------------------------------------------
+
+HPAPBPBP_LEAF_TAG = b"hpapbpbp/l"
+HPAPBPBP_NODE_TAG = b"hpapbpbp/n"
+HPAPBPBP_ROOT_TAG = b"hpapbpbp/r"
+
+HPAPBPBP_DIGEST_SIZE = 32  # SHA256 width; every tree node is this wide
+
+
+def _hpapbpbp_leaf(index: int, bundle: HPAPBPB) -> bytes:
+    """The index-bound leaf digest ``H(b"hpapbpbp/l" || U64(i) || H(encode_hpapbpb(bundle)))``."""
+    return hashlib.sha256(
+        HPAPBPBP_LEAF_TAG
+        + _hp_u64(index)
+        + hashlib.sha256(encode_hpapbpb(bundle)).digest()
+    ).digest()
+
+
+def _hpapbpbp_node(left: bytes, right: bytes) -> bytes:
+    """The ordered internal digest ``H(b"hpapbpbp/n" || left || right)``."""
+    return hashlib.sha256(HPAPBPBP_NODE_TAG + left + right).digest()
+
+
+def _hpapbpbp_levels(
+    bundles: tuple[HPAPBPB, ...],
+) -> list[tuple[bytes, ...]]:
+    """Build the leaf level and every internal level up to the single root.
+
+    A level with an odd tail width is paired with its own last node
+    duplicated, so every level above the leaves has an even width.
+    """
+    levels: list[tuple[bytes, ...]] = [
+        tuple(
+            _hpapbpbp_leaf(index, bundle)
+            for index, bundle in enumerate(bundles)
+        )
+    ]
+    current = levels[0]
+    while len(current) > 1:
+        if len(current) % 2 == 1:
+            current = current + current[-1:]
+        current = tuple(
+            _hpapbpbp_node(current[index], current[index + 1])
+            for index in range(0, len(current), 2)
+        )
+        levels.append(current)
+    return levels
+
+
+def _check_hpapbpbp_archive_items(
+    items: object,
+) -> tuple[HPAPBPB, ...]:
+    """Type- and structure-check a non-empty ordered tuple of HPAPBPB bundles.
+
+    Mirrors the container and per-item checks the archive codec applies
+    to ``items``: a tuple of :class:`HPAPBPB` instances, non-empty, each
+    structurally legal through its own canonical encoder. The archive's
+    outer signature is deliberately outside the scope — the proof is
+    built from the bundles alone. Nothing here verifies any signature.
+    """
+    if not isinstance(items, tuple):
+        raise TypeError("items must be a tuple")
+    for item in items:
+        if not isinstance(item, HPAPBPB):
+            raise TypeError(
+                "each archive item must be an HPAPBPB instance"
+            )
+    try:
+        count = len(items)
+    except OverflowError:
+        raise ValueError("too many HPAPBPB archive items") from None
+    if count == 0:
+        raise ValueError("archive items must be a non-empty tuple")
+    # Encode every bundle first — each call raises TypeError/ValueError
+    # for an illegal bundle exactly as the bundle codec does — so a
+    # single illegal item aborts the whole proof.
+    for item in items:
+        encode_hpapbpb(item)
+    return items
+
+
+@dataclass(frozen=True)
+class HPAPBPBP:
+    """A compact Merkle membership proof for several bundles of an HPAPBPB archive.
+
+    The fields, in order, are ``indices`` (the proven leaf positions as a
+    non-empty tuple of strictly increasing, unique non-negative integers),
+    ``total`` (the total, non-empty archive bundle count), ``bundles``
+    (the proven :class:`HPAPBPB` values, one per entry of ``indices``, in
+    the same order) and ``siblings`` (the 32-byte sibling digests consumed
+    from the leaf level up to the root, in ascending level order and left
+    to right within a level; the tuple is empty when no sibling digests
+    are needed). At a level whose width is odd, the last node pairs with
+    itself and no sibling is carried for it, and a companion that is
+    itself a disclosed node is never carried either; the number and order
+    of siblings are therefore fixed uniquely by ``total`` and ``indices``.
+    The dataclass is frozen, positionally constructible and compared by
+    value, and carries no network, storage or hidden state. Field types
+    and bounds are not checked at construction time — :func:`check_hpapbpbp`
+    is the way to test a proof afterwards.
+    """
+
+    indices: tuple[int, ...]
+    total: int
+    bundles: tuple[HPAPBPB, ...]
+    siblings: tuple[bytes, ...]
+
+
+def make_hpapbpbp(
+    archive: HPAPBPBArchive, indices: tuple[int, ...]
+) -> tuple[bytes, HPAPBPBP]:
+    """Build the root statement and a compact multi-bundle membership proof.
+
+    ``archive`` must be an :class:`HPAPBPBArchive` whose items are a
+    non-empty tuple of structurally legal :class:`HPAPBPB` values exactly
+    as :func:`encode_hpapbpb` requires, and ``indices`` a non-empty tuple
+    of leaf positions to prove. Only the archive's structure and its
+    bundles are consulted: the archive's own outer signature and the
+    signatures nested in the bundles are never examined and no state is
+    kept. The tree is built in archive order with SHA256, exactly
+    isomorphic to the HPAPBP membership proof tree one layer down: leaves
+    are ``H(b"hpapbpbp/l" || U64(i) || H(encode_hpapbpb(bundle)))`` and
+    internal nodes ``H(b"hpapbpbp/n" || left || right)``; a level with an
+    odd tail width duplicates its last node for pairing, and positions and
+    counts are encoded as 8-byte unsigned big-endian integers. Returns
+    ``(message, proof)`` where ``message`` is
+    ``b"hpapbpbp/r" || U64(total) || root`` (the 8-byte unsigned
+    big-endian bundle count followed by the 32-byte root) — the bytes to
+    be threshold-signed through the caller's two-round signing flow — and
+    ``proof`` is the :class:`HPAPBPBP` whose ``bundles`` take the archive
+    items at ``indices`` in archive order, one to one. Its ``siblings``
+    are collected level by level, in ascending level order (leaves
+    upward) and left to right within a level, one entry per needed
+    companion: when the companion position is itself a proven node
+    carried in the proof, or the node is the last member of an odd-width
+    level (paired with itself), no sibling is appended; otherwise the
+    companion digest is. Proven nodes from lower levels feed the level
+    above exactly as in the tree, so no digest is sent twice. One
+    threshold signature over the statement covers every index subset of
+    the same archive — the statement binds the bundle count and the root,
+    never the disclosed positions.
+
+    Wrong argument types raise TypeError: a non-:class:`HPAPBPBArchive`
+    archive, a non-tuple ``archive.items`` field, an item that is not an
+    :class:`HPAPBPB`, a non-tuple index sequence or a non-integer
+    (including boolean) index. An empty archive or index tuple, a
+    structurally illegal nested bundle, a count at or above ``2**64``,
+    indices that are not strictly increasing and unique, or an index
+    outside ``0 <= i < total`` raises ValueError.
+    """
+    if not isinstance(archive, HPAPBPBArchive):
+        raise TypeError(
+            "archive must be an HPAPBPBArchive instance"
+        )
+    if not isinstance(indices, tuple):
+        raise TypeError("indices must be a tuple")
+    items = _check_hpapbpbp_archive_items(archive.items)
+    try:
+        total = len(items)
+    except OverflowError:
+        raise ValueError("too many HPAPBPB archive items") from None
+    if total > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("too many HPAPBPB archive items")
+    try:
+        index_count = len(indices)
+    except OverflowError:
+        raise ValueError("too many indices") from None
+    if index_count == 0:
+        raise ValueError("indices must be non-empty")
+    previous = -1
+    for index in indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("each index must be an integer")
+        if index <= previous:
+            raise ValueError("indices must be strictly increasing and unique")
+        if index < 0 or index >= total:
+            raise ValueError("index out of range")
+        previous = index
+
+    levels = _hpapbpbp_levels(items)
+
+    siblings: list[bytes] = []
+    positions = set(indices)
+    for level in levels[:-1]:
+        width = len(level)
+        padded = level if width % 2 == 0 else level + level[-1:]
+        next_positions = set()
+        for position in sorted(positions):
+            if width % 2 == 1 and position == width - 1:
+                # Odd tail with no companion: the tree pairs it with itself.
+                pass
+            elif (position ^ 1) in positions:
+                # The companion is itself a disclosed node; nothing to send.
+                pass
+            else:
+                siblings.append(padded[position ^ 1])
+            next_positions.add(position // 2)
+        positions = next_positions
+
+    root = levels[-1][0]
+    proof_bundles = tuple(items[index] for index in indices)
+    proof = HPAPBPBP(
+        indices=tuple(indices),
+        total=total,
+        bundles=proof_bundles,
+        siblings=tuple(siblings),
+    )
+    return HPAPBPBP_ROOT_TAG + _hp_u64(total) + root, proof
+
+
+def _validate_hpapbpbp_structure(
+    proof: object,
+) -> tuple[
+    tuple[int, ...],
+    int,
+    tuple[HPAPBPB, ...],
+    tuple[bytes, ...],
+]:
+    """Type- and structure-check an HPAPBPBP, returning its fields.
+
+    Only the container structure is checked: the bundles themselves are
+    neither encoded nor verified here (encoding happens in the leaf
+    recomputation and verification is :func:`verify_hpapbpb`'s job). The
+    bounds are ``0 < total < 2**64``, a non-empty ``indices`` tuple of
+    strictly increasing indices in ``0 <= i < total`` and a siblings
+    tuple whose entries are exactly 32 bytes. Wrong field types raise
+    TypeError; illegal bounds or shapes raise ValueError. The two count
+    couplings — bundles pairing one-to-one with indices and the sibling
+    count the compact walk derives from ``total`` and ``indices`` — are
+    not judged here: :func:`check_hpapbpbp` reports either mismatch as
+    ``False``.
+    """
+    if not isinstance(proof, HPAPBPBP):
+        raise TypeError("proof must be an HPAPBPBP instance")
+    indices = proof.indices
+    total = proof.total
+    bundles = proof.bundles
+    siblings = proof.siblings
+    if not isinstance(indices, tuple):
+        raise TypeError("proof.indices must be a tuple")
+    if not isinstance(total, int) or isinstance(total, bool):
+        raise TypeError("proof.total must be an integer")
+    if not isinstance(bundles, tuple):
+        raise TypeError("proof.bundles must be a tuple")
+    if not isinstance(siblings, tuple):
+        raise TypeError("proof.siblings must be a tuple")
+
+    if total <= 0:
+        raise ValueError("proof.total must be positive")
+    if total > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("too many HPAPBPB archive items")
+    try:
+        index_count = len(indices)
+    except OverflowError:
+        raise ValueError("too many indices") from None
+    if index_count == 0:
+        raise ValueError("proof.indices must be non-empty")
+
+    previous = -1
+    for index in indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("proof.indices entries must be integers")
+        if index <= previous:
+            raise ValueError(
+                "proof.indices must be strictly increasing and unique"
+            )
+        if index < 0 or index >= total:
+            raise ValueError("proof.indices entry out of range")
+        previous = index
+
+    for bundle in bundles:
+        if not isinstance(bundle, HPAPBPB):
+            raise TypeError(
+                "proof.bundles entries must be HPAPBPB instances"
+            )
+
+    for sibling in siblings:
+        if not isinstance(sibling, bytes):
+            raise TypeError("proof.siblings entries must be bytes")
+    try:
+        len(siblings)
+    except OverflowError:
+        raise ValueError("too many siblings") from None
+    for sibling in siblings:
+        if len(sibling) != HPAPBPBP_DIGEST_SIZE:
+            raise ValueError(
+                "proof.siblings entries must be exactly 32 bytes"
+            )
+    return indices, total, bundles, siblings
+
+
+def check_hpapbpbp(
+    proof: HPAPBPBP,
+    signature: AggregateSignature,
+    key: SigningDKGResult,
+) -> bool:
+    """Rebuild a proof's Merkle root and verify its bundles and root signature.
+
+    The root ``signature`` and ``key`` structures are checked first.
+    Each disclosed bundle's leaf digest is then recomputed from its
+    position and the bundle exactly as in :func:`make_hpapbpbp`, and the
+    root is rebuilt level by level while consuming ``proof.siblings`` in
+    ascending level order and left to right within a level: the current
+    level holds the digests of the proven nodes at their current
+    positions, paired left to right; when a companion is itself a
+    current-level node its digest is used directly, when the node is the
+    last member of an odd-width level it is paired with itself, and
+    otherwise the next 32-byte entry of ``siblings`` is consumed. The
+    current width contracts as ``(width + 1) // 2`` and the rebuild must
+    consume every sibling exactly. Every disclosed bundle is then
+    re-checked with :func:`verify_hpapbpb` against ``key`` in index
+    order, so each bundle's nested membership proof, its disclosed
+    transport bundles and its own root signature must verify, and the
+    statement ``b"hpapbpbp/r" || U64(total) || root`` is finally checked
+    as ``signature``'s threshold Schnorr message via
+    :func:`verify_signature` with the key's group parameters. Returns
+    ``True`` only when the rebuild consumes every sibling exactly and
+    reaches the single signed root, every bundle verifies against the
+    key and the signature verifies; a well-formed proof whose bundles,
+    indices, siblings, root or signature was tampered with — bundles
+    swapped or altered, a bundle, index or sibling missing or extra, a
+    misplaced sibling, a nested bundle that does not verify or one whose
+    own root signature fails — or which is presented under another key,
+    returns ``False`` rather than raising.
+
+    A non-:class:`HPAPBPBP` or non-:class:`AggregateSignature` argument
+    or any wrong field type (non-tuple indices/bundles/siblings, a
+    non-integer ``total`` or index including booleans, a
+    non-:class:`HPAPBPB` bundle or non-bytes sibling) raises TypeError;
+    a non-positive or over-64-bit ``total``, empty indices, an index out
+    of range or not strictly increasing, a sibling entry that is not
+    exactly 32 bytes, or a structurally illegal bundle, signature or
+    ``key`` raises ValueError, exactly as :func:`verify_hpapbpb` and
+    :func:`verify_signature` would. A bad bundle never masks an illegal
+    root signature or key: those structures are checked first.
+    """
+    indices, total, bundles, siblings = _validate_hpapbpbp_structure(proof)
+    if not isinstance(signature, AggregateSignature):
+        raise TypeError("signature must be an AggregateSignature instance")
+    _check_history_proof_bundle_signature(signature)
+
+    _result, public_key, field_prime, group_prime, generator = _check_signing_setup(key)
+    _check_signing_dkg_structure(key)
+
+    try:
+        if len(bundles) != len(indices):
+            return False
+    except OverflowError:
+        raise ValueError("too many HPAPBPB archive proof bundles") from None
+
+    nodes = {
+        index: _hpapbpbp_leaf(index, bundle)
+        for index, bundle in zip(indices, bundles)
+    }
+    pending = iter(siblings)
+    width = total
+    while width > 1:
+        next_nodes = {}
+        for position in sorted(nodes):
+            parent = position // 2
+            if parent in next_nodes:
+                continue
+            if width % 2 == 1 and position == width - 1:
+                # Odd tail with no companion: pair the node with itself.
+                next_nodes[parent] = _hpapbpbp_node(
+                    nodes[position], nodes[position]
+                )
+            elif (position ^ 1) in nodes:
+                left = position if position % 2 == 0 else position ^ 1
+                next_nodes[parent] = _hpapbpbp_node(
+                    nodes[left], nodes[left ^ 1]
+                )
+            else:
+                sibling = next(pending, None)
+                if sibling is None:
+                    # A sibling the walk needs is missing.
+                    return False
+                if position % 2 == 0:
+                    next_nodes[parent] = _hpapbpbp_node(
+                        nodes[position], sibling
+                    )
+                else:
+                    next_nodes[parent] = _hpapbpbp_node(
+                        sibling, nodes[position]
+                    )
+        nodes = next_nodes
+        width = (width + 1) // 2
+
+    if next(pending, None) is not None:
+        # The rebuild must consume every sibling exactly.
+        return False
+
+    for bundle in bundles:
+        if not verify_hpapbpb(bundle, key):
+            return False
+
+    signed_message = (
+        HPAPBPBP_ROOT_TAG
+        + _hp_u64(total)
+        + nodes[0]
+    )
+    return verify_signature(
+        signed_message,
+        signature,
+        public_key,
+        group_prime=group_prime,
+        generator=generator,
+        prime=field_prime,
+    )
 
 
 # ---------------------------------------------------------------------------
