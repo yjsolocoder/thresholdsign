@@ -11,7 +11,10 @@ DKGRejection / create_dkg_contribution / verify_dkg_received_share /
 aggregate_dkg. The signing extension adds SigningContribution /
 SigningDKGResult / create_signing_contribution / aggregate_signing_dkg,
 proactive share refresh via create_refresh / refresh, member resharing via
-create_reshare / reshare, and the two-round
+create_reshare / reshare, and the canonical confidential-channel
+transport encodings encode_dkg_contribution / decode_dkg_contribution and
+encode_signing_contribution / decode_signing_contribution (the same
+format carries refresh and reshare contributions), and the two-round
 threshold Schnorr protocol: SigningNonceCommitment /
 SigningRound / SignatureShare / SignatureShareRejection / AggregateSignature /
 create_signing_nonce_commitment / create_signing_round / create_signature_share
@@ -239,6 +242,10 @@ __all__ = [
     "refresh",
     "create_reshare",
     "reshare",
+    "encode_dkg_contribution",
+    "decode_dkg_contribution",
+    "encode_signing_contribution",
+    "decode_signing_contribution",
     "SigningNonceCommitment",
     "SigningRound",
     "SignatureShare",
@@ -2345,6 +2352,417 @@ def reshare(
         public_key=key.public_key,
         verification_shares=verification_shares,
     )
+
+
+# ---------------------------------------------------------------------------
+# Canonical transport encoding of (signing) DKG contributions. The two
+# aggregators already combine contribution objects directly; these codecs
+# only exist so a caller can hand a contribution to a confidential,
+# authenticated channel and reconstruct the very same object on the other
+# side. A contribution carries every participant's double share, so the
+# encoding is secret material: it is neither encrypted nor authenticated,
+# must not be persisted, and the library keeps no state for it.
+# ---------------------------------------------------------------------------
+
+DKG_CONTRIBUTION_TAG = b"thresholdsign/dkg-contribution/v1"
+SIGNING_CONTRIBUTION_TAG = b"thresholdsign/signing-contribution/v1"
+
+
+def _check_codec_double_shares(
+    shares: tuple[Share, ...],
+    blinding_shares: tuple[Share, ...],
+    field_prime: int,
+) -> None:
+    """Type- and range-check the double shares of a contribution for encoding.
+
+    The coordinate alignment with ``participant_ids`` is deliberately *not*
+    checked: a misaddressed double share is a well-formed, cryptographically
+    failing contribution that aggregation reports as a DKGRejection, and the
+    codec must preserve that verdict.
+    """
+    for name, checked in (("shares", shares), ("blinding_shares", blinding_shares)):
+        for index, share in enumerate(checked):
+            if not isinstance(share.x, int) or isinstance(share.x, bool):
+                raise TypeError(f"{name}[{index}].x must be an integer")
+            if not isinstance(share.y, int) or isinstance(share.y, bool):
+                raise TypeError(f"{name}[{index}].y must be an integer")
+            if not 0 < share.x < field_prime:
+                raise ValueError(
+                    f"{name}[{index}].x must satisfy 0 < x < field_prime"
+                )
+            if not 0 <= share.y < field_prime:
+                raise ValueError(
+                    f"{name}[{index}].y must satisfy 0 <= y < field_prime"
+                )
+
+
+def _check_dkg_contribution_for_codec(contribution: DKGContribution) -> None:
+    """Full type/structure validation of an encodable DKG contribution."""
+    _check_dkg_contribution_types(contribution)
+    _check_dkg_contribution_structure(contribution)
+    commitment = contribution.commitment
+    _validate_commitment_setup(
+        commitment.values,
+        commitment.field_prime,
+        commitment.group_prime,
+        (commitment.generator, commitment.blinding_generator),
+    )
+    _check_codec_double_shares(
+        contribution.shares, contribution.blinding_shares, commitment.field_prime
+    )
+
+
+def _check_signing_contribution_for_codec(contribution: SigningContribution) -> None:
+    """Full type/structure validation of an encodable SigningContribution."""
+    _check_signing_contribution_types(contribution)
+    _check_signing_contribution_structure(contribution)
+    # The signing structure checker validates the Feldman setup but leaves
+    # the nested Pedersen setup and the double-share ranges to the plain
+    # DKG checks; both are part of the encodable structure.
+    _check_dkg_contribution_for_codec(contribution.contribution)
+
+
+def _encode_commitment_fields(
+    values: tuple[int, ...],
+    field_prime: int,
+    group_prime: int,
+    generator: int,
+    blinding_generator: int | None = None,
+) -> bytes:
+    """Encode one commitment: value count/values then the public parameters.
+
+    Both commitment families write the 4-byte value count, one canonical
+    VARINT per value (constant term first) and then ``field_prime``,
+    ``group_prime`` and ``generator`` in that order; a Pedersen commitment
+    appends ``blinding_generator`` last.
+    """
+    if len(values) > 0xFFFFFFFF:
+        raise ValueError("too many commitment values")
+    buffer = bytearray(len(values).to_bytes(4, "big", signed=False))
+    for value in values:
+        buffer += _encode_varint(value)
+    for parameter in (field_prime, group_prime, generator):
+        buffer += _encode_varint(parameter)
+    if blinding_generator is not None:
+        buffer += _encode_varint(blinding_generator)
+    return bytes(buffer)
+
+
+def _read_codec_count(stream: bytes, offset: int, *, what: str) -> tuple[int, int]:
+    """Read one 4-byte unsigned big-endian, non-zero element count."""
+    if offset + 4 > len(stream):
+        raise ValueError(f"truncated {what} count")
+    count = int.from_bytes(stream[offset:offset + 4], "big")
+    offset += 4
+    if count == 0:
+        raise ValueError(f"{what} count must be non-zero")
+    return count, offset
+
+
+def _read_codec_id_list(
+    stream: bytes, offset: int, *, what: str
+) -> tuple[tuple[int, ...], int]:
+    """Read a 4-byte-counted, strictly increasing, duplicate-free id list."""
+    count, offset = _read_codec_count(stream, offset, what=what)
+    ids = []
+    for _ in range(count):
+        member_id, offset = _read_varint(stream, offset, what=what)
+        if member_id == 0:
+            raise ValueError(f"{what} must be positive")
+        if ids and member_id <= ids[-1]:
+            raise ValueError(f"{what} must be strictly increasing and unique")
+        ids.append(member_id)
+    return tuple(ids), offset
+
+
+def _read_codec_share(stream: bytes, offset: int, *, what: str) -> tuple[Share, int]:
+    """Read one ``VARINT(x) || VARINT(y)`` share."""
+    x, offset = _read_varint(stream, offset, what=f"{what} x coordinate")
+    y, offset = _read_varint(stream, offset, what=f"{what} y coordinate")
+    return Share(x=x, y=y), offset
+
+
+def _read_codec_commitment_fields(
+    stream: bytes, offset: int, *, what: str, pedersen: bool
+) -> tuple[tuple[int, ...], int, int, int, int | None, int]:
+    """Read the common commitment encoding (see _encode_commitment_fields).
+
+    Returns ``(values, field_prime, group_prime, generator,
+    blinding_generator, offset)`` with ``blinding_generator`` ``None`` for a
+    Feldman commitment.
+    """
+    count, offset = _read_codec_count(stream, offset, what=f"{what} value")
+    values = []
+    for _ in range(count):
+        value, offset = _read_varint(stream, offset, what=f"{what} value")
+        values.append(value)
+    field_prime, offset = _read_varint(
+        stream, offset, what=f"{what} field_prime"
+    )
+    group_prime, offset = _read_varint(
+        stream, offset, what=f"{what} group_prime"
+    )
+    generator, offset = _read_varint(stream, offset, what=f"{what} generator")
+    blinding_generator = None
+    if pedersen:
+        blinding_generator, offset = _read_varint(
+            stream, offset, what=f"{what} blinding_generator"
+        )
+    return tuple(values), field_prime, group_prime, generator, blinding_generator, offset
+
+
+def encode_dkg_contribution(contribution: DKGContribution) -> bytes:
+    """Canonically encode a plain DKG contribution for confidential transport.
+
+    The encoding starts with the tag
+    ``b"thresholdsign/dkg-contribution/v1"`` and then writes, in order,
+    ``sender_id`` (a VARINT), the 4-byte unsigned big-endian participant
+    count followed by one canonical VARINT per strictly increasing
+    participant id, the 4-byte share count followed by ``VARINT(x) ||
+    VARINT(y)`` per share in participant order, the same again for the
+    blinding shares, and finally the Pedersen commitment: the 4-byte value
+    count, one VARINT per commitment value (constant term first) and then
+    ``field_prime``, ``group_prime``, ``generator`` and
+    ``blinding_generator`` as VARINTs. A VARINT is a 4-byte unsigned
+    big-endian body length followed by the shortest unsigned big-endian
+    value: zero is the single byte ``00`` and positive values carry no
+    leading zero.
+
+    Only a structurally valid :class:`DKGContribution` is accepted: a
+    non-contribution argument raises TypeError, and wrong field types or
+    an illegal participant set, sender, share-count/threshold combination,
+    double-share range or commitment setup raise ValueError. A
+    well-formed contribution whose double shares do not match its
+    commitment (including a misaddressed share) still encodes — that is a
+    cryptographic verdict for :func:`aggregate_dkg`, not a structural one.
+    The output for a given contribution is unique. The encoding contains
+    the double shares in the clear: it is meant for a confidential
+    authenticated channel only, is not encrypted or authenticated, must
+    not be written to disk, and the library keeps no state for it.
+    """
+    if not isinstance(contribution, DKGContribution):
+        raise TypeError("contribution must be a DKGContribution instance")
+    _check_dkg_contribution_for_codec(contribution)
+
+    participant_ids = contribution.participant_ids
+    commitment = contribution.commitment
+    if len(participant_ids) > 0xFFFFFFFF:
+        raise ValueError("too many participant ids")
+    buffer = bytearray(DKG_CONTRIBUTION_TAG)
+    buffer += _encode_varint(contribution.sender_id)
+    buffer += len(participant_ids).to_bytes(4, "big", signed=False)
+    for participant_id in participant_ids:
+        buffer += _encode_varint(participant_id)
+    for name, shares in (
+        ("share", contribution.shares),
+        ("blinding share", contribution.blinding_shares),
+    ):
+        buffer += len(shares).to_bytes(4, "big", signed=False)
+        for share in shares:
+            buffer += _encode_varint(share.x)
+            buffer += _encode_varint(share.y)
+    buffer += _encode_commitment_fields(
+        commitment.values,
+        commitment.field_prime,
+        commitment.group_prime,
+        commitment.generator,
+        commitment.blinding_generator,
+    )
+    return bytes(buffer)
+
+
+def decode_dkg_contribution(payload: bytes) -> DKGContribution:
+    """Decode the canonical encoding produced by :func:`encode_dkg_contribution`.
+
+    Accepts only the single canonical form tagged
+    ``b"thresholdsign/dkg-contribution/v1"``. A non-bytes argument raises
+    TypeError; a wrong or missing tag, truncation, trailing bytes, a count
+    or VARINT frame length that does not match the stream, a
+    non-canonical integer (a zero-length or over-long body, or a leading
+    zero), a zero, non-increasing or duplicate participant id, a share or
+    commitment-value count that does not match the participant count, a
+    ``sender_id`` outside the participant set, share coordinates outside
+    the field or an illegal commitment setup raises ValueError. A
+    successfully decoded contribution re-encodes to exactly the input
+    bytes.
+
+    Decoding does not check the cryptographic relation between the double
+    shares and the commitment: a contribution whose shares do not verify
+    is returned normally and :func:`aggregate_dkg` keeps producing its
+    usual :class:`DKGRejection` list for it.
+    """
+    if not isinstance(payload, bytes):
+        raise TypeError("payload must be bytes")
+    if not payload.startswith(DKG_CONTRIBUTION_TAG):
+        raise ValueError("bad DKG contribution tag")
+    offset = len(DKG_CONTRIBUTION_TAG)
+
+    sender_id, offset = _read_varint(payload, offset, what="DKG contribution sender id")
+    participant_ids, offset = _read_codec_id_list(
+        payload, offset, what="DKG contribution participant id"
+    )
+
+    share_count, offset = _read_codec_count(
+        payload, offset, what="DKG contribution share"
+    )
+    if share_count != len(participant_ids):
+        raise ValueError("DKG contribution share count must match the participant count")
+    shares = []
+    for _ in range(share_count):
+        share, offset = _read_codec_share(payload, offset, what="DKG contribution share")
+        shares.append(share)
+
+    blinding_count, offset = _read_codec_count(
+        payload, offset, what="DKG contribution blinding share"
+    )
+    if blinding_count != len(participant_ids):
+        raise ValueError(
+            "DKG contribution blinding share count must match the participant count"
+        )
+    blinding_shares = []
+    for _ in range(blinding_count):
+        share, offset = _read_codec_share(
+            payload, offset, what="DKG contribution blinding share"
+        )
+        blinding_shares.append(share)
+
+    (
+        values,
+        field_prime,
+        group_prime,
+        generator,
+        blinding_generator,
+        offset,
+    ) = _read_codec_commitment_fields(
+        payload, offset, what="DKG contribution Pedersen commitment", pedersen=True
+    )
+    if offset != len(payload):
+        raise ValueError("trailing bytes after DKG contribution")
+
+    contribution = DKGContribution(
+        sender_id=sender_id,
+        participant_ids=participant_ids,
+        shares=tuple(shares),
+        blinding_shares=tuple(blinding_shares),
+        commitment=PedersenCommitment(
+            values=values,
+            field_prime=field_prime,
+            group_prime=group_prime,
+            generator=generator,
+            blinding_generator=blinding_generator,
+        ),
+    )
+    _check_dkg_contribution_for_codec(contribution)
+    if encode_dkg_contribution(contribution) != payload:
+        raise ValueError("non-canonical DKG contribution encoding")
+    return contribution
+
+
+def encode_signing_contribution(contribution: SigningContribution) -> bytes:
+    """Canonically encode a signing DKG contribution for confidential transport.
+
+    The encoding starts with the tag
+    ``b"thresholdsign/signing-contribution/v1"`` and then writes the
+    4-byte unsigned big-endian length of the embedded plain contribution
+    followed by the exact bytes of
+    ``encode_dkg_contribution(contribution.contribution)`` (the ordinary
+    contribution, Pedersen commitment and double shares included), and
+    finally the Feldman commitment: the 4-byte value count, one VARINT per
+    commitment value (constant term first) and then ``field_prime``,
+    ``group_prime`` and ``generator`` as VARINTs. The Feldman commitment
+    shares the public parameters of the embedded Pedersen commitment and
+    has exactly as many values (the same threshold).
+
+    Only a structurally valid :class:`SigningContribution` is accepted: a
+    non-contribution argument raises TypeError and wrong field types, an
+    illegal nested contribution or commitment, or group/threshold
+    disagreement between the two commitments raises ValueError. The
+    cryptographic binding between the Feldman commitment and the shares is
+    not checked — :func:`aggregate_signing_dkg`, :func:`refresh` and
+    :func:`reshare` keep their existing verdicts for such an object. The
+    output is unique. The encoding contains the double shares in the
+    clear: it is meant for a confidential authenticated channel only, is
+    not encrypted or authenticated, must not be written to disk, and the
+    library keeps no state for it. Refresh and reshare contributions use
+    the very same format.
+    """
+    if not isinstance(contribution, SigningContribution):
+        raise TypeError("contribution must be a SigningContribution instance")
+    _check_signing_contribution_for_codec(contribution)
+
+    encoded_nested = encode_dkg_contribution(contribution.contribution)
+    if len(encoded_nested) > 0xFFFFFFFF:
+        raise ValueError("embedded DKG contribution encoding too long")
+    feldman = contribution.feldman_commitment
+    buffer = bytearray(SIGNING_CONTRIBUTION_TAG)
+    buffer += len(encoded_nested).to_bytes(4, "big", signed=False)
+    buffer += encoded_nested
+    buffer += _encode_commitment_fields(
+        feldman.values, feldman.field_prime, feldman.group_prime, feldman.generator
+    )
+    return bytes(buffer)
+
+
+def decode_signing_contribution(payload: bytes) -> SigningContribution:
+    """Decode the canonical encoding produced by :func:`encode_signing_contribution`.
+
+    Accepts only the single canonical form tagged
+    ``b"thresholdsign/signing-contribution/v1"``: a 4-byte non-zero frame
+    length followed by exactly that many bytes accepted by
+    :func:`decode_dkg_contribution`, then the Feldman commitment fields.
+    A non-bytes argument raises TypeError; a wrong or missing tag, a zero
+    or over-long nested frame length, truncation inside or after the
+    frame, trailing bytes, a non-canonical nested contribution, a Feldman
+    commitment whose public parameters differ from the Pedersen
+    commitment's or whose value count differs from the Pedersen value
+    count (threshold mismatch), or any other illegal structure raises
+    ValueError. A successfully decoded contribution re-encodes to exactly
+    the input bytes.
+
+    Decoding restores the structure only: neither the double shares
+    against the Pedersen commitment nor the shares against the Feldman
+    commitment are verified, and the refresh/reshare constant-term rules
+    are not applied. Such an object is returned normally and
+    :func:`aggregate_signing_dkg`, :func:`refresh` and :func:`reshare`
+    keep their existing success, rejection or ValueError behaviour.
+    """
+    if not isinstance(payload, bytes):
+        raise TypeError("payload must be bytes")
+    if not payload.startswith(SIGNING_CONTRIBUTION_TAG):
+        raise ValueError("bad signing contribution tag")
+    offset = len(SIGNING_CONTRIBUTION_TAG)
+
+    encoded_nested, offset = _read_archive_block(
+        payload, offset, what="signing contribution embedded DKG contribution"
+    )
+    nested = decode_dkg_contribution(encoded_nested)
+
+    (
+        values,
+        field_prime,
+        group_prime,
+        generator,
+        _blinding_generator,
+        offset,
+    ) = _read_codec_commitment_fields(
+        payload, offset, what="signing contribution Feldman commitment", pedersen=False
+    )
+    if offset != len(payload):
+        raise ValueError("trailing bytes after signing contribution")
+
+    contribution = SigningContribution(
+        contribution=nested,
+        feldman_commitment=FeldmanCommitment(
+            values=values,
+            field_prime=field_prime,
+            group_prime=group_prime,
+            generator=generator,
+        ),
+    )
+    _check_signing_contribution_for_codec(contribution)
+    if encode_signing_contribution(contribution) != payload:
+        raise ValueError("non-canonical signing contribution encoding")
+    return contribution
 
 
 # ---------------------------------------------------------------------------

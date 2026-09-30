@@ -1256,6 +1256,28 @@ python3 -m thresholdsign
   `SigningDKGResult`：新常数项之和即旧联合秘密，`public_key` 不变（旧签名仍有效），
   新份额立即可用于签名，`verification_shares` 由新份额重算为 `g^{s_i}`。库不保存
   隐藏状态，新份额分发与旧份额销毁由调用方负责
+- `encode_dkg_contribution(contribution)` / `decode_dkg_contribution(payload)` —
+  `DKGContribution` 的唯一字节编码：标签 `thresholdsign/dkg-contribution/v1` 后依次
+  写 `sender_id`、参与者计数与严格递增无重复的参与者编号、份额计数与各份额
+  `(x, y)`、盲化份额计数与各盲化份额、Pedersen 承诺（值计数、各值、`field_prime`、
+  `group_prime`、`generator`、`blinding_generator`）。计数为 4 字节无符号大端，整数
+  为 4 字节长度加最短无符号大端正文（零为单字节 `00`，正数无前导零）。encode 对非
+  对应数据类抛 `TypeError`，字段类型或结构非法抛 `ValueError`；decode 对非 bytes
+  抛 `TypeError`，坏标签、截断、尾随、计数或帧长不符、非规范整数、编号为零或乱序
+  重复、份额数量不符、sender 不在成员集合、非法承诺均抛 `ValueError`。成功解码的
+  对象重编码逐字节等于输入。解码不验证双份额与承诺的密码学关系——结构合法但密码学
+  不匹配的对象正常返回，由 `aggregate_dkg` 沿用既有判定（返回拒绝列表）
+- `encode_signing_contribution(contribution)` / `decode_signing_contribution(payload)`
+  — `SigningContribution` 的唯一字节编码，refresh 与 reshare 的签名贡献复用同一格式：
+  标签 `thresholdsign/signing-contribution/v1` 后写嵌入普通贡献的 4 字节帧长和
+  `encode_dkg_contribution` 的原样字节，再写 Feldman 承诺（值计数、各值、
+  `field_prime`、`group_prime`、`generator`）。Feldman 与嵌入的 Pedersen 承诺同参
+  同 threshold（值数量一致），否则 decode 抛 `ValueError`；其余错误边界与重编码
+  唯一性同普通贡献编解码。解码不验证 share 与两类承诺的密码学绑定，也不应用
+  refresh/reshare 的常数项规则——结构合法但密码学不匹配的对象正常返回，由
+  `aggregate_signing_dkg` / `refresh` / `reshare` 沿用既有判定
+- 贡献交换本身仍由调用方处理：两类编码都以明文承载双份额，只用于保密认证通道，
+  不加密、不认证、不落盘、不保存状态；库不对其做任何持久化或网络处理
 - `SigningNonceCommitment(signer_id, commitment)` — 冻结数据类；第一轮随机数承诺
   `R_i = g^r_i mod group_prime`，非数本身不出现
 - `create_signing_nonce_commitment(signer_id, *, group_prime, generator, prime=DEFAULT_PRIME, randbelow=secrets.randbelow)`
