@@ -11,7 +11,10 @@ DKGRejection / create_dkg_contribution / verify_dkg_received_share /
 aggregate_dkg. The signing extension adds SigningContribution /
 SigningDKGResult / create_signing_contribution / aggregate_signing_dkg,
 proactive share refresh via create_refresh / refresh, member resharing via
-create_reshare / reshare, and the two-round
+create_reshare / reshare, and the canonical confidential-channel
+transport encodings encode_dkg_contribution / decode_dkg_contribution and
+encode_signing_contribution / decode_signing_contribution (the latter is
+shared by refresh and reshare contributions), and the two-round
 threshold Schnorr protocol: SigningNonceCommitment /
 SigningRound / SignatureShare / SignatureShareRejection / AggregateSignature /
 create_signing_nonce_commitment / create_signing_round / create_signature_share
@@ -239,6 +242,10 @@ __all__ = [
     "refresh",
     "create_reshare",
     "reshare",
+    "encode_dkg_contribution",
+    "decode_dkg_contribution",
+    "encode_signing_contribution",
+    "decode_signing_contribution",
     "SigningNonceCommitment",
     "SigningRound",
     "SignatureShare",
@@ -2345,6 +2352,449 @@ def reshare(
         public_key=key.public_key,
         verification_shares=verification_shares,
     )
+
+
+# ---------------------------------------------------------------------------
+# Canonical transport encodings of the two contribution objects. The encodings
+# contain the double shares (including their secret coordinates), so they are
+# only meant to travel over a confidential, mutually authenticated channel:
+# they are neither encrypted nor authenticated and never persisted or cached.
+# ---------------------------------------------------------------------------
+
+DKG_CONTRIBUTION_WIRE_TAG = b"thresholdsign/dkg-contribution/v1"
+SIGNING_CONTRIBUTION_WIRE_TAG = b"thresholdsign/signing-contribution/v1"
+
+
+def _check_contribution_wire_types(contribution: DKGContribution) -> None:
+    """Type-check every plain-contribution field for the wire codec (TypeError).
+
+    Stricter than :func:`_check_dkg_contribution_types` in that every share
+    coordinate and every commitment element is checked and ``bool`` is never
+    accepted as an integer.
+    """
+    if not isinstance(contribution.sender_id, int) or isinstance(
+        contribution.sender_id, bool
+    ):
+        raise TypeError("sender_id must be an integer")
+    if not isinstance(contribution.participant_ids, tuple):
+        raise TypeError("participant_ids must be a tuple")
+    for participant_id in contribution.participant_ids:
+        if not isinstance(participant_id, int) or isinstance(participant_id, bool):
+            raise TypeError("participant ids must be integers")
+    for name, shares in (
+        ("shares", contribution.shares),
+        ("blinding_shares", contribution.blinding_shares),
+    ):
+        if not isinstance(shares, tuple):
+            raise TypeError(f"{name} must be a tuple")
+        for share in shares:
+            if not isinstance(share, Share):
+                raise TypeError(f"{name} must contain Share instances")
+            if not isinstance(share.x, int) or isinstance(share.x, bool):
+                raise TypeError(f"{name} share x must be an integer")
+            if not isinstance(share.y, int) or isinstance(share.y, bool):
+                raise TypeError(f"{name} share y must be an integer")
+    commitment = contribution.commitment
+    if not isinstance(commitment, PedersenCommitment):
+        raise TypeError("commitment must be a PedersenCommitment instance")
+    if not isinstance(commitment.values, tuple):
+        raise TypeError("commitment values must be a tuple")
+    for value in commitment.values:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError("commitment values must be integers")
+    for name, value in (
+        ("field_prime", commitment.field_prime),
+        ("group_prime", commitment.group_prime),
+        ("generator", commitment.generator),
+        ("blinding_generator", commitment.blinding_generator),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"{name} must be an integer")
+
+
+def _check_contribution_wire_structure(contribution: DKGContribution) -> None:
+    """Validate the full plain-contribution structure for the wire codec (ValueError).
+
+    Beyond :func:`_check_dkg_contribution_structure` every share coordinate
+    must name its addressed participant id and every share value and
+    commitment must satisfy the same bounds aggregation enforces.
+    """
+    _check_dkg_contribution_structure(contribution)
+    ids = contribution.participant_ids
+    field_prime = contribution.commitment.field_prime
+    for index, participant_id in enumerate(ids):
+        share = contribution.shares[index]
+        blinding_share = contribution.blinding_shares[index]
+        for name, checked_share in (("share", share), ("blinding share", blinding_share)):
+            if checked_share.x != participant_id:
+                raise ValueError(f"{name} x must equal the addressed participant id")
+            if not 0 <= checked_share.y < field_prime:
+                raise ValueError(f"{name} y must satisfy 0 <= y < field_prime")
+    commitment = contribution.commitment
+    _validate_commitment_setup(
+        commitment.values,
+        commitment.field_prime,
+        commitment.group_prime,
+        (commitment.generator, commitment.blinding_generator),
+    )
+
+
+def _check_signing_contribution_wire_structure(item: SigningContribution) -> None:
+    """Validate a signing contribution's plain part and both commitments (ValueError)."""
+    dealing = item.contribution
+    _check_contribution_wire_structure(dealing)
+    feldman = item.feldman_commitment
+    pedersen = dealing.commitment
+    if not isinstance(feldman, FeldmanCommitment):
+        raise TypeError("feldman_commitment must be a FeldmanCommitment instance")
+    if not isinstance(feldman.values, tuple):
+        raise TypeError("feldman commitment values must be a tuple")
+    for value in feldman.values:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError("feldman commitment values must be integers")
+    for name, value in (
+        ("field_prime", feldman.field_prime),
+        ("group_prime", feldman.group_prime),
+        ("generator", feldman.generator),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"{name} must be an integer")
+    if (
+        feldman.field_prime != pedersen.field_prime
+        or feldman.group_prime != pedersen.group_prime
+        or feldman.generator != pedersen.generator
+    ):
+        raise ValueError("the two commitments must share the same group parameters")
+    if len(feldman.values) != len(pedersen.values):
+        raise ValueError("the two commitments must share the same threshold")
+    _validate_commitment_setup(
+        feldman.values, feldman.field_prime, feldman.group_prime, (feldman.generator,)
+    )
+
+
+def _encode_feldman_commitment_body(commitment: FeldmanCommitment) -> bytes:
+    """Encode a commitment in its public field order: values then group parameters."""
+    buffer = bytearray()
+    buffer += len(commitment.values).to_bytes(4, "big", signed=False)
+    for value in commitment.values:
+        buffer += _encode_varint(value)
+    buffer += _encode_varint(commitment.field_prime)
+    buffer += _encode_varint(commitment.group_prime)
+    buffer += _encode_varint(commitment.generator)
+    return bytes(buffer)
+
+
+def _encode_pedersen_commitment_body(commitment: PedersenCommitment) -> bytes:
+    """Encode a Pedersen commitment like a Feldman one, with ``h`` written last."""
+    buffer = bytearray(
+        _encode_feldman_commitment_body(
+            FeldmanCommitment(
+                values=commitment.values,
+                field_prime=commitment.field_prime,
+                group_prime=commitment.group_prime,
+                generator=commitment.generator,
+            )
+        )
+    )
+    buffer += _encode_varint(commitment.blinding_generator)
+    return bytes(buffer)
+
+
+def _encode_dkg_contribution_body(contribution: DKGContribution) -> bytes:
+    """The tag-free field sequence shared by the plain and signing encodings."""
+    buffer = bytearray()
+    buffer += _encode_varint(contribution.sender_id)
+    participant_ids = contribution.participant_ids
+    buffer += len(participant_ids).to_bytes(4, "big", signed=False)
+    for participant_id in participant_ids:
+        buffer += _encode_varint(participant_id)
+    for shares in (contribution.shares, contribution.blinding_shares):
+        buffer += len(shares).to_bytes(4, "big", signed=False)
+        for share in shares:
+            buffer += _encode_varint(share.x)
+            buffer += _encode_varint(share.y)
+    buffer += _encode_pedersen_commitment_body(contribution.commitment)
+    return bytes(buffer)
+
+
+def encode_dkg_contribution(contribution: DKGContribution) -> bytes:
+    """Canonically encode one plain :class:`DKGContribution` as ``bytes``.
+
+    The encoding starts with the tag ``b"thresholdsign/dkg-contribution/v1"``
+    and then writes, in order, ``sender_id``; the 4-byte unsigned big-endian
+    participant count followed by the strictly increasing participant ids;
+    the 4-byte share counts followed by the double shares (each share two
+    length-prefixed integers ``x`` then ``y``) — first ``shares``, then
+    ``blinding_shares``; and finally the Pedersen commitment. Both
+    commitments are encoded in their public field order: the 4-byte value
+    count and values, then ``field_prime``, ``group_prime`` and
+    ``generator``; the Pedersen commitment writes ``blinding_generator``
+    last. Every integer is a 4-byte unsigned big-endian length followed by
+    its shortest unsigned big-endian body: zero is the single body byte
+    ``00`` and positive values carry no leading zero.
+
+    The bytes contain the double shares, including their secret
+    coordinates, so they must only travel over a confidential, mutually
+    authenticated channel: the encoding is neither encrypted nor
+    authenticated, is never written to disk, and the library keeps no
+    state. A non-:class:`DKGContribution` argument raises TypeError;
+    wrong field types raise TypeError and any illegal structure — empty
+    or non-increasing participant ids, a sender outside the member set, a
+    share count or coordinate mismatch, an out-of-range value, an illegal
+    commitment — raises ValueError. The cryptographic relation between
+    shares and commitment is not checked. The output for a given
+    contribution is unique.
+    """
+    if not isinstance(contribution, DKGContribution):
+        raise TypeError("contribution must be a DKGContribution instance")
+    _check_contribution_wire_types(contribution)
+    _check_contribution_wire_structure(contribution)
+    return DKG_CONTRIBUTION_WIRE_TAG + _encode_dkg_contribution_body(contribution)
+
+
+def _read_contribution_id_list(
+    stream: bytes, offset: int, *, what: str
+) -> tuple[tuple[int, ...], int]:
+    """Read a U32-counted, non-empty strictly increasing list of positive ids."""
+    if offset + 4 > len(stream):
+        raise ValueError(f"truncated {what} participant count")
+    count = int.from_bytes(stream[offset:offset + 4], "big")
+    offset += 4
+    if count == 0:
+        raise ValueError(f"{what} participant ids must not be empty")
+    ids = []
+    for _ in range(count):
+        participant_id, offset = _read_varint(stream, offset, what=f"{what} participant id")
+        if participant_id == 0:
+            raise ValueError(f"{what} participant ids must be positive")
+        if ids and participant_id <= ids[-1]:
+            raise ValueError(
+                f"{what} participant ids must be strictly increasing and unique"
+            )
+        ids.append(participant_id)
+    return tuple(ids), offset
+
+
+def _read_contribution_shares(
+    stream: bytes, offset: int, participant_ids: tuple[int, ...], *, what: str
+) -> tuple[tuple[Share, ...], int]:
+    """Read one U32-counted share list whose coordinates name the participant ids."""
+    if offset + 4 > len(stream):
+        raise ValueError(f"truncated {what} share count")
+    count = int.from_bytes(stream[offset:offset + 4], "big")
+    offset += 4
+    if count != len(participant_ids):
+        raise ValueError(f"{what} share count must match the participant count")
+    shares = []
+    for participant_id in participant_ids:
+        x, offset = _read_varint(stream, offset, what=f"{what} share x")
+        y, offset = _read_varint(stream, offset, what=f"{what} share y")
+        if x != participant_id:
+            raise ValueError(f"{what} share x must equal the addressed participant id")
+        shares.append(Share(x=x, y=y))
+    return tuple(shares), offset
+
+
+def _read_feldman_commitment_body(
+    stream: bytes, offset: int, *, what: str
+) -> tuple[FeldmanCommitment, int]:
+    """Read a Feldman commitment body (values first, group parameters last)."""
+    if offset + 4 > len(stream):
+        raise ValueError(f"truncated {what} commitment value count")
+    count = int.from_bytes(stream[offset:offset + 4], "big")
+    offset += 4
+    if count == 0:
+        raise ValueError(f"{what} commitment must contain at least one value")
+    values = []
+    for _ in range(count):
+        value, offset = _read_varint(stream, offset, what=f"{what} commitment value")
+        values.append(value)
+    field_prime, offset = _read_varint(stream, offset, what=f"{what} field_prime")
+    group_prime, offset = _read_varint(stream, offset, what=f"{what} group_prime")
+    generator, offset = _read_varint(stream, offset, what=f"{what} generator")
+    return (
+        FeldmanCommitment(
+            values=tuple(values),
+            field_prime=field_prime,
+            group_prime=group_prime,
+            generator=generator,
+        ),
+        offset,
+    )
+
+
+def _read_pedersen_commitment_body(
+    stream: bytes, offset: int, *, what: str
+) -> tuple[PedersenCommitment, int]:
+    """Read a Pedersen commitment body (a Feldman body plus a trailing ``h``)."""
+    feldman, offset = _read_feldman_commitment_body(stream, offset, what=what)
+    blinding_generator, offset = _read_varint(
+        stream, offset, what=f"{what} blinding_generator"
+    )
+    return (
+        PedersenCommitment(
+            values=feldman.values,
+            field_prime=feldman.field_prime,
+            group_prime=feldman.group_prime,
+            generator=feldman.generator,
+            blinding_generator=blinding_generator,
+        ),
+        offset,
+    )
+
+
+def decode_dkg_contribution(payload: bytes) -> DKGContribution:
+    """Decode the canonical encoding produced by :func:`encode_dkg_contribution`.
+
+    Accepts only the single canonical form: the tag
+    ``b"thresholdsign/dkg-contribution/v1"`` followed by ``sender_id``, the
+    participant ids, the two share lists and the Pedersen commitment, all as
+    written by :func:`encode_dkg_contribution`. A non-bytes argument raises
+    TypeError; a bad or missing tag, truncation, trailing bytes, a count or
+    integer-frame length mismatch, a non-canonical integer (leading zero or
+    over-long length), a zero, unordered or duplicate id, a share count or
+    coordinate mismatch, a sender outside the member set or an illegal
+    commitment raises ValueError. A successfully decoded contribution
+    re-encodes to exactly the input bytes.
+
+    Decoding restores the structure without verifying any cryptographic
+    relation between the double shares and the commitment: a well-formed
+    contribution whose shares do not match its commitment is returned
+    normally and keeps producing a :class:`DKGRejection` through
+    :func:`aggregate_dkg`, exactly as an object built in memory would.
+    """
+    if not isinstance(payload, bytes):
+        raise TypeError("payload must be bytes")
+    if not payload.startswith(DKG_CONTRIBUTION_WIRE_TAG):
+        raise ValueError("bad DKG contribution tag")
+    offset = len(DKG_CONTRIBUTION_WIRE_TAG)
+    sender_id, offset = _read_varint(
+        payload, offset, what="DKG contribution sender_id"
+    )
+    participant_ids, offset = _read_contribution_id_list(
+        payload, offset, what="DKG contribution"
+    )
+    shares, offset = _read_contribution_shares(
+        payload, offset, participant_ids, what="DKG contribution"
+    )
+    blinding_shares, offset = _read_contribution_shares(
+        payload, offset, participant_ids, what="DKG contribution blinding"
+    )
+    commitment, offset = _read_pedersen_commitment_body(
+        payload, offset, what="DKG contribution"
+    )
+    if offset != len(payload):
+        raise ValueError("trailing bytes after DKG contribution")
+    contribution = DKGContribution(
+        sender_id=sender_id,
+        participant_ids=participant_ids,
+        shares=shares,
+        blinding_shares=blinding_shares,
+        commitment=commitment,
+    )
+    _check_contribution_wire_structure(contribution)
+    return contribution
+
+
+def encode_signing_contribution(contribution: SigningContribution) -> bytes:
+    """Canonically encode one :class:`SigningContribution` as ``bytes``.
+
+    The encoding starts with the tag
+    ``b"thresholdsign/signing-contribution/v1"`` and then embeds the plain
+    contribution exactly as :func:`encode_dkg_contribution` lays out its
+    fields (``sender_id``, participant ids, both double-share lists and the
+    Pedersen commitment, with ``blinding_generator`` last), followed by the
+    Feldman commitment in the same public field order (value count and
+    values, then ``field_prime``, ``group_prime`` and ``generator``). The
+    two commitments must share their group parameters and carry the same
+    number of values (the same threshold). Counts are 4-byte unsigned
+    big-endian and integers are canonical length-prefixed values, exactly as
+    in :func:`encode_dkg_contribution`.
+
+    The same confidentiality warning applies: the bytes contain the double
+    shares and must only cross a confidential, mutually authenticated
+    channel; they are neither encrypted nor authenticated, never persisted,
+    and no state is kept. Refresh and reshare contributions reuse this very
+    format. A non-:class:`SigningContribution` argument raises TypeError;
+    wrong field types raise TypeError and any illegal structure — including
+    disagreeing commitment parameters or thresholds — raises ValueError.
+    The cryptographic relation between the shares and the commitments is
+    not checked. The output for a given contribution is unique.
+    """
+    if not isinstance(contribution, SigningContribution):
+        raise TypeError("contribution must be a SigningContribution instance")
+    if not isinstance(contribution.contribution, DKGContribution):
+        raise TypeError("contribution.contribution must be a DKGContribution instance")
+    if not isinstance(contribution.feldman_commitment, FeldmanCommitment):
+        raise TypeError("feldman_commitment must be a FeldmanCommitment instance")
+    _check_contribution_wire_types(contribution.contribution)
+    _check_signing_contribution_wire_structure(contribution)
+    return (
+        SIGNING_CONTRIBUTION_WIRE_TAG
+        + _encode_dkg_contribution_body(contribution.contribution)
+        + _encode_feldman_commitment_body(contribution.feldman_commitment)
+    )
+
+
+def decode_signing_contribution(payload: bytes) -> SigningContribution:
+    """Decode the canonical encoding produced by :func:`encode_signing_contribution`.
+
+    Accepts only the single canonical form: the tag
+    ``b"thresholdsign/signing-contribution/v1"``, the embedded plain
+    contribution (sender id, participant ids, both share lists and the
+    Pedersen commitment) and then the Feldman commitment, whose group
+    parameters and value count must match the Pedersen commitment's. A
+    non-bytes argument raises TypeError; a bad or missing tag, truncation,
+    trailing bytes, a count or frame-length mismatch, a non-canonical
+    integer, zero or unordered/duplicate ids, a share count or coordinate
+    mismatch, a sender outside the member set, an illegal commitment, or
+    disagreeing commitment parameters/thresholds raises ValueError. A
+    successfully decoded contribution re-encodes to exactly the input
+    bytes.
+
+    Decoding does not verify that the shares match either commitment: a
+    structurally legal contribution with mismatched cryptography is
+    returned normally, and :func:`aggregate_signing_dkg`, :func:`refresh`
+    and :func:`reshare` keep applying their existing rejection and
+    mismatch rules to the restored object unchanged.
+    """
+    if not isinstance(payload, bytes):
+        raise TypeError("payload must be bytes")
+    if not payload.startswith(SIGNING_CONTRIBUTION_WIRE_TAG):
+        raise ValueError("bad signing contribution tag")
+    offset = len(SIGNING_CONTRIBUTION_WIRE_TAG)
+    sender_id, offset = _read_varint(
+        payload, offset, what="signing contribution sender_id"
+    )
+    participant_ids, offset = _read_contribution_id_list(
+        payload, offset, what="signing contribution"
+    )
+    shares, offset = _read_contribution_shares(
+        payload, offset, participant_ids, what="signing contribution"
+    )
+    blinding_shares, offset = _read_contribution_shares(
+        payload, offset, participant_ids, what="signing contribution blinding"
+    )
+    pedersen, offset = _read_pedersen_commitment_body(
+        payload, offset, what="signing contribution Pedersen"
+    )
+    feldman, offset = _read_feldman_commitment_body(
+        payload, offset, what="signing contribution Feldman"
+    )
+    if offset != len(payload):
+        raise ValueError("trailing bytes after signing contribution")
+    contribution = DKGContribution(
+        sender_id=sender_id,
+        participant_ids=participant_ids,
+        shares=shares,
+        blinding_shares=blinding_shares,
+        commitment=pedersen,
+    )
+    item = SigningContribution(
+        contribution=contribution, feldman_commitment=feldman
+    )
+    _check_signing_contribution_wire_structure(item)
+    return item
 
 
 # ---------------------------------------------------------------------------
