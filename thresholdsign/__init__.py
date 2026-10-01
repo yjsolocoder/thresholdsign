@@ -19,7 +19,11 @@ transport encodings encode_dkg_contribution / decode_dkg_contribution and
 encode_signing_contribution / decode_signing_contribution (the same
 format carries refresh and reshare contributions), and the two-round
 threshold Schnorr protocol: SigningNonceCommitment /
-SigningRound / SignatureShare / SignatureShareRejection / AggregateSignature /
+SigningCommitmentFault / diagnose_signing_nonce_commitments (the
+stateless pre-round diagnoser that names every unexpected, duplicated,
+out-of-range, non-subgroup or copied R_i commitment and every expected
+signer missing from the round-one batch) / SigningRound /
+SignatureShare / SignatureShareRejection / AggregateSignature /
 create_signing_nonce_commitment / create_signing_round / create_signature_share
 / verify_signature_share / aggregate_signature / verify_signature, signing
 audit receipts: SigningAudit / create_audit / check_audit, the stateless
@@ -254,6 +258,8 @@ __all__ = [
     "encode_signing_contribution",
     "decode_signing_contribution",
     "SigningNonceCommitment",
+    "SigningCommitmentFault",
+    "diagnose_signing_nonce_commitments",
     "SigningRound",
     "SignatureShare",
     "SignatureShareRejection",
@@ -3106,6 +3112,28 @@ class SigningNonceCommitment:
 
 
 @dataclass(frozen=True)
+class SigningCommitmentFault:
+    """One failing round-one nonce commitment, located before round creation.
+
+    The fields, in order, are ``signer_id`` (the commitment's signer) and
+    ``check`` (the check that failed: ``"unexpected"`` when the commitment's
+    id is not one of the expected signing ids, ``"duplicate"`` when that id
+    publishes more than once, ``"range"`` when its ``R_i`` is not a
+    non-identity residue (``1 < R_i < group_prime`` fails, including
+    ``R_i == 1``), ``"subgroup"`` when ``R_i`` is in range but is not an
+    order-``field_prime`` element (``R_i ** field_prime mod group_prime != 1``),
+    ``"duplicate_value"`` when distinct valid signers publish the same
+    ``R_i``, or ``"missing"`` for an expected signer who published nothing).
+    Each signer contributes at most one fault; the dataclass is frozen,
+    positionally constructible and compared by value, and carries no
+    network, storage or hidden state.
+    """
+
+    signer_id: int
+    check: str
+
+
+@dataclass(frozen=True)
 class SigningRound:
     """The agreed round-one material that fixes one signing instance.
 
@@ -3457,6 +3485,167 @@ def _validate_signing_round(
     if not 0 <= round_info.challenge < field_prime:
         raise ValueError("round challenge must satisfy 0 <= c < field_prime")
     return ids
+
+
+def _check_commitment_diagnosis_ids(
+    signer_ids: Iterable[int],
+    participant_ids: Sequence[int],
+    threshold: int,
+    field_prime: int,
+) -> tuple[int, ...]:
+    """Validate the expected signing set of a commitment diagnosis.
+
+    The same integer, in-field-range, non-empty, strictly-increasing,
+    no-duplicate, DKG-participant and at-least-threshold constraints as
+    :func:`create_signing_round` apply; wrong element types raise TypeError
+    and every structural violation raises ValueError.
+    """
+    if isinstance(signer_ids, (str, bytes)):
+        raise TypeError("signer_ids must be an iterable of integers")
+    ids = tuple(signer_ids)
+    for signer_id in ids:
+        if not isinstance(signer_id, int) or isinstance(signer_id, bool):
+            raise TypeError("signer ids must be integers")
+        if not 0 < signer_id < field_prime:
+            raise ValueError("signer ids must satisfy 1 <= id <= field_prime - 1")
+    if not ids:
+        raise ValueError("at least one signer is required")
+    if len(set(ids)) != len(ids):
+        raise ValueError("signer ids must be unique")
+    if ids != tuple(sorted(ids)):
+        raise ValueError("signer ids must be strictly increasing")
+    if any(signer_id not in participant_ids for signer_id in ids):
+        raise ValueError("every signer must be a DKG participant")
+    if len(ids) < threshold:
+        raise ValueError("at least threshold signers are required")
+    return ids
+
+
+def diagnose_signing_nonce_commitments(
+    signer_ids: Iterable[int],
+    nonce_commitments: Iterable[SigningNonceCommitment],
+    dkg_result: SigningDKGResult,
+) -> tuple[SigningCommitmentFault, ...]:
+    """Locate every failing round-one commitment before :func:`create_signing_round`.
+
+    ``signer_ids`` must satisfy exactly the same constraints as in
+    :func:`create_signing_round`: unique integers, strictly increasing, every
+    one a DKG participant and numbering at least ``threshold``; ``nonce_commitments``
+    may arrive in any order and are matched to signers by their ``signer_id``.
+    A non-iterable ``signer_ids`` or ``nonce_commitments``, a
+    non-:class:`SigningNonceCommitment` element, a wrong element or field
+    type (a boolean is never an integer), or a
+    non-:class:`SigningDKGResult` ``dkg_result`` raises TypeError; a violated
+    signing-set constraint or an illegal DKG structure, group parameter or
+    numeric value raises ValueError, exactly as at the round-creation
+    boundary. Such inputs are never reported as faults.
+
+    For type-correct commitments, each item keeps at most one fault, checked
+    in this order: an id outside the expected signing set is ``"unexpected"``;
+    an id appearing on several commitments makes every such item
+    ``"duplicate"``; otherwise ``R_i`` outside ``1 < R_i < group_prime``
+    (including ``R_i == 1``) is ``"range"``; an in-range value outside the
+    order-``field_prime`` subgroup (``R_i ** field_prime mod group_prime != 1``)
+    is ``"subgroup"``; the remaining valid items are grouped by ``R_i`` and a
+    value shared by two or more distinct signers makes all of them
+    ``"duplicate_value"``. After the items are examined, every expected id
+    with no commitment of its own contributes one ``"missing"`` fault.
+
+    Faults are returned sorted by ``signer_id`` regardless of the input
+    order (duplicate ids keep adjacent, in the order encountered), and the
+    diagnosis never mutates its inputs or keeps any state. The returned
+    tuple is empty if and only if :func:`create_signing_round` accepts the
+    same commitment set (with any message); faults never block signing,
+    verification, aggregation or auditing elsewhere.
+    """
+    result, _public_key, field_prime, group_prime, _generator = _check_signing_setup(
+        dkg_result
+    )
+    _check_signing_dkg_structure(dkg_result)
+    threshold = len(result.commitment.values)
+    expected_ids = _check_commitment_diagnosis_ids(
+        signer_ids, result.participant_ids, threshold, field_prime
+    )
+    expected = set(expected_ids)
+
+    if isinstance(nonce_commitments, (str, bytes)):
+        raise TypeError(
+            "nonce_commitments must be an iterable of SigningNonceCommitment"
+        )
+    items = list(nonce_commitments)
+    for commitment in items:
+        if not isinstance(commitment, SigningNonceCommitment):
+            raise TypeError(
+                "nonce_commitments must contain SigningNonceCommitment instances"
+            )
+        if not isinstance(commitment.signer_id, int) or isinstance(
+            commitment.signer_id, bool
+        ):
+            raise TypeError("nonce commitment signer_id must be an integer")
+        if not isinstance(commitment.commitment, int) or isinstance(
+            commitment.commitment, bool
+        ):
+            raise TypeError("nonce commitment value must be an integer")
+
+    faults: list[tuple[int, SigningCommitmentFault]] = []
+    # Count items per id before the per-item checks so every repeated
+    # publication is named, not merely the ones after the first.
+    counts: dict[int, int] = {}
+    for commitment in items:
+        counts[commitment.signer_id] = counts.get(commitment.signer_id, 0) + 1
+
+    # Only items that survive every earlier check compete over R_i, matching
+    # the precedence unexpected > duplicate > range > subgroup > duplicate.
+    valid_items: list[SigningNonceCommitment] = []
+    for commitment in items:
+        signer_id = commitment.signer_id
+        value = commitment.commitment
+        if signer_id not in expected:
+            faults.append(
+                (signer_id, SigningCommitmentFault(signer_id, "unexpected"))
+            )
+            continue
+        if counts[signer_id] > 1:
+            faults.append(
+                (signer_id, SigningCommitmentFault(signer_id, "duplicate"))
+            )
+            continue
+        if not 1 < value < group_prime:
+            faults.append((signer_id, SigningCommitmentFault(signer_id, "range")))
+            continue
+        if pow(value, field_prime, group_prime) != 1:
+            faults.append(
+                (signer_id, SigningCommitmentFault(signer_id, "subgroup"))
+            )
+            continue
+        valid_items.append(commitment)
+
+    value_signers: dict[int, list[int]] = {}
+    for commitment in valid_items:
+        value_signers.setdefault(commitment.commitment, []).append(
+            commitment.signer_id
+        )
+    copied_values = {
+        value for value, signers in value_signers.items() if len(signers) > 1
+    }
+    for commitment in valid_items:
+        if commitment.commitment in copied_values:
+            faults.append(
+                (
+                    commitment.signer_id,
+                    SigningCommitmentFault(commitment.signer_id, "duplicate_value"),
+                )
+            )
+
+    # A duplicated id cannot also be missing: missing means no item at all.
+    for signer_id in expected_ids:
+        if signer_id not in counts:
+            faults.append((signer_id, SigningCommitmentFault(signer_id, "missing")))
+
+    # Sort by signer id; equal ids (duplicates) retain encounter order, which
+    # is stable under Python's sort.
+    faults.sort(key=lambda entry: entry[0])
+    return tuple(fault for _signer_id, fault in faults)
 
 
 def create_signing_round(

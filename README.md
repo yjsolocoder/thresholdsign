@@ -1353,6 +1353,26 @@ python3 -m thresholdsign
   — 以注入的 `randbelow` 在 `prime - 1` 个值（`0..prime-2`）上抽取并加一，保证非数
   `1 <= r_i <= prime-1` 非零；返回 `(SigningNonceCommitment, r_i)`，非数只交给本人，
   禁止跨消息/轮次复用
+- `SigningCommitmentFault(signer_id, check)` — 冻结数据类，可按位置构造、按值相等；
+  记录一个失败的第一轮承诺：`check` 为 `"unexpected"`（承诺编号不在预期签名者
+  集合）、`"duplicate"`（同一编号多次提交）、`"range"`（`R_i` 不满足
+  `1 < R_i < group_prime`，含 `R_i = 1` 或越界）、`"subgroup"`（范围合法但
+  `R_i ** field_prime mod group_prime != 1`）、`"duplicate_value"`（不同签名者
+  公布相同 `R_i`，复制双方都被定位）或 `"missing"`（预期签名者未提交承诺）；
+  不含网络、存储或隐藏状态
+- `diagnose_signing_nonce_commitments(signer_ids, nonce_commitments, dkg_result)` —
+  `create_signing_round` 之前的第一轮承诺批次诊断，无消息参数、无状态、不生成
+  `SigningRound`。`signer_ids` 沿用 `create_signing_round` 的整数、严格递增、无
+  重复、均为 DKG 参与者且不少于 `threshold` 约束，`nonce_commitments` 可乱序。
+  `nonce_commitments` 不可迭代、元素或字段类型错误（含布尔冒充整数）或
+  `dkg_result` 类型错误抛 `TypeError`；`signer_ids` 违反任一约束、DKG 结构、群
+  参数或数值非法抛 `ValueError`，绝不以诊断记录掩盖非法输入。对类型正确的提交，
+  每项按 unexpected → duplicate → range → subgroup → duplicate_value 的次序至多
+  保留一条故障（重复编号的各项均记 duplicate；仅其余有效项参与相同 `R_i` 冲突
+  判定），预期编号完全未提交补一条 missing。全部故障按 `signer_id` 升序返回，
+  结果与承诺顺序无关且不修改输入；无故障（空元组）当且仅当
+  `create_signing_round` 接受同一承诺集合，有故障也不影响既有签名、验证、聚合
+  与审计流程
 - `SigningRound(message, signer_ids, nonce_commitments, R, challenge)` — 冻结数据类；
   固定一次签名实例的第一轮材料：`signer_ids` 严格递增、唯一、均为 DKG 参与者且不少于
   `threshold`，`nonce_commitments` 与编号一一对应且 `R_i` 互异、属于阶 `field_prime`
