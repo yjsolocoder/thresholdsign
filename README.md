@@ -155,6 +155,40 @@ assert verify_signature(
 支持 `threshold = 1`。一次性随机数由可注入的 `randbelow` 在 `prime - 1` 个值上
 抽取并自动排除零（返回值加一），复用防护需要调用方保证——本实现不保存任何状态。
 
+### 可独立流转的签名凭证
+
+门限签名的持有方可以把一次签名打包成自包含的 `SignatureReceipt`：凭证冻结记录
+`message`、沿用 `AggregateSignature` 语义的 `signature(R, z, signer_ids)`、联合公钥
+`public_key` 以及群参数 `field_prime`、`group_prime`、`generator`。接收方只凭凭证
+即可验签，完全不接触 DKG 结果、秘密份额、nonce 或任何隐藏状态：
+
+```python
+from thresholdsign import (
+    create_signature_receipt, encode_signature_receipt,
+    decode_signature_receipt, verify_signature_receipt,
+)
+
+# signature 是 aggregate_signature 的成功结果，key 是 aggregate_signing_dkg 的结果
+receipt = create_signature_receipt(message, signature, key)
+assert verify_signature_receipt(receipt)          # 与 verify_signature 结论一致
+
+blob = encode_signature_receipt(receipt)          # bytes，无秘密、无状态、唯一编码
+restored = decode_signature_receipt(blob)
+assert encode_signature_receipt(restored) == blob  # 成功解码必可逐字节复现
+assert verify_signature_receipt(restored)
+```
+
+`create_signature_receipt` 只接受对给定消息与 DKG 公钥实际验签通过的签名，签名不
+匹配抛 `ValueError`。凭证编码以标签 `b"thresholdsign/signature-receipt/v1"` 开头，
+随后依次写 4 字节无符号大端消息长度与原始消息字节、`field_prime`、`group_prime`、
+`generator`、`public_key`、签名的 `R` 与 `z`，最后写 4 字节签名者计数与各
+`signer_id`；每个整数都是 4 字节长度加最短无符号大端正文（零为单字节 `00`，正数
+无前导零）。`decode_signature_receipt` 只校验结构而不验签——坏标签、截断、尾随字节、
+非规范整数、重复或乱序签名者编号、越界 `R`/`z`/公钥、非法素数或群参数抛
+`ValueError`，非 bytes 入参抛 `TypeError`；结构合法但签名不匹配的凭证照常返回，
+由 `verify_signature_receipt` 返回 `False`。篡改 message、公钥、群参数、`R`、`z`
+或签名者编号、或换用另一把密钥的凭证均验签失败。
+
 ### 主动份额刷新
 
 签名密钥长期使用时，可用主动份额刷新（proactive refresh）在不改变联合秘密与
@@ -1369,6 +1403,29 @@ python3 -m thresholdsign
   — 用 `signature.signer_ids` 重建挑战并校验 `g^z = R·Y^c`；合法签名返回 `True`，
   签名被篡改或与消息/公钥/签名者集合不匹配返回 `False`，非法参数抛
   `TypeError`/`ValueError`
+- `SignatureReceipt(message, signature, public_key, field_prime, group_prime, generator)`
+  — 冻结数据类，可按位置构造、按值相等；可独立流转的门限 Schnorr 签名凭证：
+  `message` 为被签名字节串，`signature` 是 `AggregateSignature(R, z, signer_ids)`，
+  其余四个字段给出联合公钥与群参数；不含 DKG 结果、秘密份额、nonce 或隐藏状态
+- `create_signature_receipt(message, signature, dkg_result)` — 从
+  `SigningDKGResult` 取公钥与群参数打包凭证，并调用 `verify_signature` 确认签名对
+  消息与公钥成立；参数类型错误（布尔不视为整数）抛 `TypeError`，密钥或群参数非法、
+  签名不匹配抛 `ValueError`
+- `encode_signature_receipt(receipt)` / `decode_signature_receipt(payload)` —
+  凭证的唯一字节编码：标签 `b"thresholdsign/signature-receipt/v1"` 后依次写 4 字节
+  无符号大端消息长度与原始消息、`field_prime`、`group_prime`、`generator`、
+  `public_key`、`R`、`z`，再写 4 字节签名者计数与各 `signer_id`；每个整数为 4 字节
+  长度加最短无符号大端正文（零为单字节 `00`，正数无前导零）。encode 对非
+  `SignatureReceipt` 或字段类型错误抛 `TypeError`，越界值、非法素数或群参数抛
+  `ValueError`，但不要求签名匹配；decode 对非 bytes 抛 `TypeError`，坏标签、截断、
+  尾随字节、消息长度不符、非规范整数、签名者编号为空/非正/重复/乱序、越界
+  `R`/`z`/公钥、非法素数或群参数抛 `ValueError`，且只校验结构不验签。成功解码的
+  凭证重编码逐字节等于输入
+- `verify_signature_receipt(receipt)` — 仅凭凭证自身的字段重建 Fiat-Shamir 挑战并
+  校验 `g^z = R·Y^c`，结论与对同组参数调用 `verify_signature` 一致；有效凭证返回
+  `True`，篡改 message、公钥、群参数、`R`、`z`、签名者编号或换钥后的凭证返回
+  `False`；非 `SignatureReceipt` 或字段类型错误抛 `TypeError`，越界或结构非法抛
+  `ValueError`
 - `SigningAudit(payload)` — 冻结数据类，仅含 `payload` 一个字段；一次签名轮次第
   二轮校验的审计回执，自包含的字节编码中不含 nonce、秘密份额或系数
 - `create_audit(message, shares, round_info, dkg_result)` — `message` 必须与轮次
