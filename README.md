@@ -1271,6 +1271,27 @@ python3 -m thresholdsign
   `SigningDKGResult`：新常数项之和即旧联合秘密，`public_key` 不变（旧签名仍有效），
   新份额立即可用于签名，`verification_shares` 由新份额重算为 `g^{s_i}`。库不保存
   隐藏状态，新份额分发与旧份额销毁由调用方负责
+- `ReshareFault(sender_id, check, receiver_id)` — 冻结数据类，可按位置构造、按值相等；
+  记录重共享贡献中一处失败的检查：`check` 为 `"pedersen"`（某新成员位置的双份额不满足
+  dealer 的 Pedersen 承诺）、`"feldman"`（该位置份额不满足 dealer 的 Feldman 承诺），
+  此时 `receiver_id` 为该位置的新成员编号；或 `"binding"`（Feldman 常数项承诺不等于
+  该 dealer 旧验证份额的 dealer Lagrange 权重幂），此时 `receiver_id` 为 `None`；
+  不含网络、存储或隐藏状态
+- `diagnose_reshare_contributions(contributions, dealers, key)` — `reshare` 的聚合前
+  诊断：接受与 `reshare` 完全相同的参数，返回 `tuple[ReshareFault, ...]`。类型边界与
+  `reshare` 完全一致：`key`、contribution 或 dealer 元素类型错误抛 `TypeError`；空或
+  内部不一致的 contribution、dealer 为空/重复/乱序/少于旧门限/不属于旧参与者、新成员、
+  门限或群参数不一致、dealer 缺失，以及份额或承诺数值与结构越界抛 `ValueError`（绝不
+  以诊断记录掩盖）。对结构合法的输入，按 `sender_id` 升序处理 dealer、按新成员顺序处理
+  receiver；每个位置的 Pedersen 双份额配对与 Feldman 份额检查各自独立记录、互不遮蔽
+  （同位置两项都失败产生两条，Pedersen 在前），再独立检查 Feldman 常数项是否等于该
+  dealer 旧验证份额 `Y_i` 的 dealer Lagrange 权重幂，失败产生一条 `check="binding"`、
+  `receiver_id=None` 的记录并排在该 dealer 全部位置记录之后。同一 dealer 的失败全部
+  返回；结果顺序为 dealer 内先 receiver、同位置先 pedersen 后 feldman、binding 最后，
+  只由排序确定而与输入顺序无关。函数不生成新密钥或份额、不修改输入，也不改变
+  `reshare`、`create_reshare`、`diagnose_signing_contributions`、编解码与签名入口的
+  返回值与异常；返回空元组当且仅当 `reshare` 对同一输入返回 `SigningDKGResult`，被
+  `reshare` 拒绝的 dealer 会列出其全部失败
 - `encode_dkg_contribution(contribution)` / `decode_dkg_contribution(payload)` —
   `DKGContribution` 的唯一字节编码：标签 `thresholdsign/dkg-contribution/v1` 后依次
   写 `sender_id`、参与者计数与严格递增无重复的参与者编号、份额计数与各份额

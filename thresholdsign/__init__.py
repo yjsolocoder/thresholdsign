@@ -247,6 +247,8 @@ __all__ = [
     "refresh",
     "create_reshare",
     "reshare",
+    "ReshareFault",
+    "diagnose_reshare_contributions",
     "encode_dkg_contribution",
     "decode_dkg_contribution",
     "encode_signing_contribution",
@@ -2490,6 +2492,170 @@ def reshare(
         public_key=key.public_key,
         verification_shares=verification_shares,
     )
+
+
+@dataclass(frozen=True)
+class ReshareFault:
+    """One failing check in a dealer's resharing contribution.
+
+    The fields, in order, are ``sender_id`` (the contribution's dealer),
+    ``check`` (the check that failed: ``"pedersen"`` for the double share
+    pairing against the dealer's Pedersen commitment, ``"feldman"`` for the
+    share against the dealer's Feldman commitment — the two checks behind a
+    :class:`DKGRejection` in :func:`reshare` — or ``"binding"`` for the
+    Feldman constant-term commitment not equalling the dealer's old
+    verification share raised to its Lagrange weight) and ``receiver_id``
+    (the new-member id the failing position is addressed to, in the
+    contribution's own new-member order; ``None`` for a ``"binding"`` fault,
+    which is not tied to a receiver position). The dataclass is frozen,
+    positionally constructible and compared by value, and carries no
+    network, storage or hidden state.
+    """
+
+    sender_id: int
+    check: str
+    receiver_id: int | None
+
+
+def diagnose_reshare_contributions(
+    contributions: Iterable[SigningContribution],
+    dealers: Iterable[int],
+    key: SigningDKGResult,
+) -> tuple[ReshareFault, ...]:
+    """Locate every failing check in resharing contributions before aggregation.
+
+    Accepts exactly the same arguments as :func:`reshare` — one
+    :class:`SigningContribution` per dealer, the strictly increasing dealer
+    quorum and the old :class:`SigningDKGResult` — and applies its validation
+    boundary unchanged: a wrong-typed ``key`` or contribution/dealer element
+    raises TypeError; an empty or internally inconsistent contribution, an
+    empty, duplicate, unsorted or too-small dealer quorum, a dealer outside
+    the old participants, disagreeing new-member ids, threshold or group
+    parameters, a missing or duplicated dealer, and any out-of-range share or
+    commitment value raise ValueError. Such inputs are never reported as
+    faults — they reject the whole call exactly as in :func:`reshare`.
+
+    For structurally legal contributions every dealer is examined in
+    ascending ``sender_id`` order regardless of input order, and within each
+    contribution the double-share positions are examined in the new-member
+    order of the contributions. At every position the double share is first
+    checked against the dealer's Pedersen commitment (the same
+    :func:`verify_dkg_received_share` check :func:`reshare` runs), then the
+    share alone against the dealer's Feldman commitment with
+    :func:`verify_share`; the two checks are independent, so one failure
+    never masks another and a position failing both yields two faults (the
+    Pedersen fault first). Independently of the positions, the Feldman
+    constant-term commitment must equal the dealer's old verification share
+    ``Y_i`` raised to that dealer's Lagrange weight over ``dealers``; a
+    mismatch yields one ``check="binding"`` fault with ``receiver_id=None``,
+    reported after all position faults of the dealer.
+
+    The result is a tuple ordered by dealer, then receiver position, then
+    ``"pedersen"`` before ``"feldman"``, with the dealer's ``"binding"``
+    fault last; every fault of every dealer that :func:`reshare` would
+    reject is listed. The tuple is empty if and only if :func:`reshare`
+    returns a :class:`SigningDKGResult` on the same input. The function
+    generates no key or shares, never mutates its input, and changes no
+    other entry point.
+    """
+    if not isinstance(key, SigningDKGResult):
+        raise TypeError("key must be a SigningDKGResult instance")
+    _check_signing_setup(key)
+    _check_signing_dkg_structure(key)
+
+    old_result = key.result
+    old_pedersen = old_result.commitment
+    old_ids = old_result.participant_ids
+    old_threshold = len(old_pedersen.values)
+    dealer_list = _check_reshare_dealers(dealers, old_ids, old_threshold)
+
+    materialised = list(contributions)
+    if not materialised:
+        raise ValueError("at least one contribution is required")
+    for contribution in materialised:
+        _check_signing_contribution_types(contribution)
+    for contribution in materialised:
+        _check_signing_contribution_structure(contribution)
+
+    # Structural consistency (new members, threshold, group parameters, one
+    # contribution per dealer) is validated exactly as in reshare, so the
+    # scan below only sees a legal contribution set.
+    dealings = [contribution.contribution for contribution in materialised]
+    first = dealings[0]
+    member_ids = first.participant_ids
+    threshold = len(first.commitment.values)
+    for dealing in dealings:
+        commitment = dealing.commitment
+        if dealing.participant_ids != member_ids:
+            raise ValueError("contributions must agree on the same participant ids")
+        if (
+            commitment.field_prime != old_pedersen.field_prime
+            or commitment.group_prime != old_pedersen.group_prime
+            or commitment.generator != old_pedersen.generator
+            or commitment.blinding_generator != old_pedersen.blinding_generator
+        ):
+            raise ValueError("contributions must share the same group parameters")
+        if len(commitment.values) != threshold:
+            raise ValueError("contributions must share the same threshold")
+    sender_ids = [dealing.sender_id for dealing in dealings]
+    if len(set(sender_ids)) != len(sender_ids):
+        raise ValueError("duplicate contribution from the same dealer")
+    if set(sender_ids) != set(dealer_list):
+        raise ValueError("each dealer must contribute exactly once")
+
+    # Sort by dealer so the reported order cannot depend on the input order.
+    ordered = sorted(materialised, key=lambda item: item.contribution.sender_id)
+    field_prime = old_pedersen.field_prime
+    group_prime = old_pedersen.group_prime
+    weights = {
+        dealer: _lagrange_weight(dealer, dealer_list, field_prime)
+        for dealer in dealer_list
+    }
+
+    faults: list[ReshareFault] = []
+    for item in ordered:
+        dealing = item.contribution
+        # Every receiver position: the Pedersen pairing and the Feldman
+        # pairing run independently, so one failure never masks another.
+        for index, receiver_id in enumerate(dealing.participant_ids):
+            received = DKGReceivedShare(
+                sender_id=dealing.sender_id,
+                receiver_id=receiver_id,
+                share=dealing.shares[index],
+                blinding_share=dealing.blinding_shares[index],
+            )
+            if not verify_dkg_received_share(received, dealing.commitment):
+                faults.append(
+                    ReshareFault(
+                        sender_id=dealing.sender_id,
+                        check="pedersen",
+                        receiver_id=receiver_id,
+                    )
+                )
+            if not verify_share(dealing.shares[index], item.feldman_commitment):
+                faults.append(
+                    ReshareFault(
+                        sender_id=dealing.sender_id,
+                        check="feldman",
+                        receiver_id=receiver_id,
+                    )
+                )
+        # The Feldman constant must commit to lambda_i * s_i: exactly the old
+        # verification share Y_i raised to the dealer's Lagrange weight.
+        expected_constant = pow(
+            key.verification_shares[old_ids.index(dealing.sender_id)],
+            weights[dealing.sender_id],
+            group_prime,
+        )
+        if item.feldman_commitment.values[0] != expected_constant:
+            faults.append(
+                ReshareFault(
+                    sender_id=dealing.sender_id,
+                    check="binding",
+                    receiver_id=None,
+                )
+            )
+    return tuple(faults)
 
 
 # ---------------------------------------------------------------------------
