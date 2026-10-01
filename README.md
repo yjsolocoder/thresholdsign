@@ -1329,6 +1329,22 @@ python3 -m thresholdsign
   校验，异常份额按 `signer_id` 排序返回 `list[SignatureShareRejection]`（顺序无关、
   绝不忽略）；全部通过时 `z = Σ z_i mod field_prime`，返回
   `AggregateSignature(R, z, signer_ids)`
+- `SignatureShareFault(signer_id, check)` — 冻结数据类，可按位置构造、按值相等；
+  记录一个验证失败的第二轮签名份额：`check` 为 `"commitment"`（份额的
+  `nonce_commitment` 与该签名者公布的轮次一承诺 `R_i` 不符）或 `"equation"`
+  （承诺相符，但 `g^z_i` 不等于 `R_i·Y_i^(c·λ_i)`，即份额方程失败，含手工篡改
+  轮次 `R`/`challenge` 的情形）；不含网络、存储或隐藏状态
+- `diagnose_signature_shares(shares, round_info, dkg_result)` —
+  `aggregate_signature` 之前的份额故障定位：接受与其相同的参数并沿用其整批校验边界——
+  空批次、轮次签名者缺失/多余、重复提交抛 `ValueError`，非 `SignatureShare` 元素或
+  份额、轮次、DKG 对象的字段类型错误（含布尔冒充整数）抛 `TypeError`，轮次、DKG
+  结构、群参数、标识或数值范围非法抛 `ValueError`，绝不以诊断记录掩盖整批非法输入。
+  合法批次中每名轮次签名者恰好一份，输入顺序不影响结果也不修改输入。按 `signer_id`
+  升序逐份检查：先比对该签名者的公开承诺，不符产生 `check="commitment"` 的故障；
+  承诺相符时重新推导轮次 `R` 与挑战并校验份额方程，不符产生 `check="equation"`
+  的故障。一个签名者至多一条故障（承诺检查优先），多个签名者的问题全部保留，全部
+  有效返回空元组；返回空元组当且仅当 `aggregate_signature` 对同一输入返回
+  `AggregateSignature`。该函数不改变签名结构、聚合结果或审计回执
 - `verify_signature(message, signature, public_key, *, group_prime, generator, prime=DEFAULT_PRIME)`
   — 用 `signature.signer_ids` 重建挑战并校验 `g^z = R·Y^c`；合法签名返回 `True`，
   签名被篡改或与消息/公钥/签名者集合不匹配返回 `False`，非法参数抛

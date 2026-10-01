@@ -255,6 +255,8 @@ __all__ = [
     "SigningRound",
     "SignatureShare",
     "SignatureShareRejection",
+    "SignatureShareFault",
+    "diagnose_signature_shares",
     "AggregateSignature",
     "create_signing_nonce_commitment",
     "create_signing_round",
@@ -2968,6 +2970,25 @@ class SignatureShareRejection:
 
 
 @dataclass(frozen=True)
+class SignatureShareFault:
+    """One failing round-two signature share, located before aggregation.
+
+    The fields, in order, are ``signer_id`` (the share's signer) and
+    ``check`` (the check that failed: ``"commitment"`` when the share's
+    ``nonce_commitment`` does not repeat that signer's round-one public
+    commitment ``R_i``, or ``"equation"`` when the commitments agree but
+    ``g ** z_i`` differs from ``R_i * Y_i ** (c * lambda_i)`` modulo
+    ``group_prime`` — the two checks :func:`verify_signature_share` combines).
+    Each signer contributes at most one fault; the dataclass is frozen,
+    positionally constructible and compared by value, and carries no
+    network, storage or hidden state.
+    """
+
+    signer_id: int
+    check: str
+
+
+@dataclass(frozen=True)
 class AggregateSignature:
     """The threshold Schnorr signature ``(R, z)`` on a fixed message.
 
@@ -3513,6 +3534,134 @@ def aggregate_signature(
         return rejections
 
     return AggregateSignature(R=round_info.R, z=z_total, signer_ids=round_info.signer_ids)
+
+
+def diagnose_signature_shares(
+    shares: Iterable[SignatureShare],
+    round_info: SigningRound,
+    dkg_result: SigningDKGResult,
+) -> tuple[SignatureShareFault, ...]:
+    """Locate every failing signature share before :func:`aggregate_signature`.
+
+    Accepts exactly the same arguments as :func:`aggregate_signature` and
+    applies its whole-batch validation boundary unchanged: an empty batch, a
+    missing or duplicated round signer, or a signer outside the round raises
+    ValueError; a non-:class:`SignatureShare` element or a wrong field type in
+    a share, the round or the DKG result raises TypeError; an illegal round,
+    DKG structure, group parameter, identifier or numeric range raises
+    ValueError. Such inputs are never reported as faults — they reject the
+    whole call just as in the aggregator. A legal batch therefore contains
+    exactly one share per round signer, in any order.
+
+    Shares are examined in ascending ``signer_id`` order regardless of input
+    order. Each share's ``nonce_commitment`` is first compared with that
+    signer's public round-one commitment: a mismatch yields one
+    :class:`SignatureShareFault` with ``check="commitment"``. When the
+    commitments agree, the round's ``R`` and challenge are re-derived from
+    its contents and the share equation
+    ``g ** z_i == R_i * Y_i ** (c * lambda_i) mod group_prime`` is checked
+    exactly as in :func:`verify_signature_share`; a mismatch (including a
+    hand-edited round ``R`` or challenge) yields one fault with
+    ``check="equation"``. A signer contributes at most one fault, the
+    commitment fault taking precedence, while faults of different signers are
+    all retained; shares that verify contribute nothing and an all-valid
+    batch returns the empty tuple. The function never mutates its input and
+    changes no other entry point: :func:`aggregate_signature`,
+    :func:`create_audit` and :func:`check_audit` keep their existing return
+    values and exception behaviour. The fault tuple is empty if and only if
+    :func:`aggregate_signature` would return an :class:`AggregateSignature`
+    on the same input.
+    """
+    result, public_key, field_prime, group_prime, generator = _check_signing_setup(dkg_result)
+    _check_signing_dkg_structure(dkg_result)
+    _validate_signing_round(
+        round_info,
+        field_prime,
+        group_prime,
+        result.participant_ids,
+        len(result.commitment.values),
+    )
+
+    materialised = list(shares)
+    if not materialised:
+        raise ValueError("at least one signature share is required")
+    for share in materialised:
+        if not isinstance(share, SignatureShare):
+            raise TypeError("shares must be SignatureShare instances")
+        if not isinstance(share.signer_id, int) or isinstance(share.signer_id, bool):
+            raise TypeError("share signer_id must be an integer")
+        if not isinstance(share.z, int) or isinstance(share.z, bool):
+            raise TypeError("share z must be an integer")
+        if not isinstance(share.nonce_commitment, int) or isinstance(share.nonce_commitment, bool):
+            raise TypeError("share nonce_commitment must be an integer")
+
+    share_ids = [share.signer_id for share in materialised]
+    if len(set(share_ids)) != len(share_ids):
+        raise ValueError("duplicate signature share from the same signer")
+    if set(share_ids) != set(round_info.signer_ids):
+        raise ValueError("each round signer must contribute exactly once")
+
+    # Sort by signer so the reported order cannot depend on the input order.
+    ordered = sorted(materialised, key=lambda share: share.signer_id)
+
+    # Numeric ranges are checked in the same signer-sorted order in which
+    # aggregate_signature runs verify_signature_share, so an out-of-range
+    # field rejects the call with the same boundary.
+    for share in ordered:
+        if not 0 < share.signer_id < field_prime:
+            raise ValueError("signer id must satisfy 1 <= id <= field_prime - 1")
+        if not 0 <= share.z < field_prime:
+            raise ValueError("signature share z must satisfy 0 <= z < field_prime")
+        if not 1 < share.nonce_commitment < group_prime:
+            raise ValueError("nonce commitment must satisfy 1 < R_i < group_prime")
+
+    R = 1
+    for commitment in round_info.nonce_commitments:
+        R = R * commitment.commitment % group_prime
+    challenge = schnorr_challenge(
+        round_info.message,
+        public_key,
+        R,
+        round_info.signer_ids,
+        field_prime=field_prime,
+        group_prime=group_prime,
+    )
+
+    faults: list[SignatureShareFault] = []
+    for share in ordered:
+        index = round_info.signer_ids.index(share.signer_id)
+        expected_commitment = round_info.nonce_commitments[index].commitment
+        # The commitment binding is checked first: a share that repeats
+        # someone else's R_i must not be diagnosed against an equation built
+        # on a different nonce. One signer contributes at most one fault.
+        if share.nonce_commitment != expected_commitment:
+            faults.append(
+                SignatureShareFault(signer_id=share.signer_id, check="commitment")
+            )
+            continue
+
+        # With the commitments agreeing, a tampered round R or challenge and
+        # a wrong z all surface as the same equation failure that
+        # verify_signature_share reports as False.
+        if R != round_info.R or challenge != round_info.challenge:
+            faults.append(
+                SignatureShareFault(signer_id=share.signer_id, check="equation")
+            )
+            continue
+
+        weight = _lagrange_weight(share.signer_id, round_info.signer_ids, field_prime)
+        share_index = result.participant_ids.index(share.signer_id)
+        Y_i = dkg_result.verification_shares[share_index]
+        expected = (
+            expected_commitment
+            * pow(Y_i, challenge * weight % field_prime, group_prime)
+            % group_prime
+        )
+        if pow(generator, share.z, group_prime) != expected:
+            faults.append(
+                SignatureShareFault(signer_id=share.signer_id, check="equation")
+            )
+    return tuple(faults)
 
 
 def verify_signature(
