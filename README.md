@@ -1229,6 +1229,21 @@ python3 -m thresholdsign
   threshold 且绑定同一条共享多项式（不一致为非法输入，抛 `ValueError`）；成功返回
   `SigningDKGResult`，其中 `Y` 为各常数项 Feldman 承诺之积、`Y_i` 为各承诺在 `i` 处
   求值之积
+- `ContributionFault(sender_id, receiver_id, check)` — 冻结数据类，可按位置构造、按值相等；
+  记录签名 DKG 贡献中一处失败的双份额配对：`check` 为 `"pedersen"`（双份额不满足发送者
+  Pedersen 承诺，即 `aggregate_signing_dkg` 产生 `DKGRejection` 的同一检查）或
+  `"feldman"`（份额不满足发送者 Feldman 承诺，即聚合器抛 `ValueError` 的绑定检查）；
+  不含网络、存储或隐藏状态
+- `diagnose_signing_contributions(contributions)` — `aggregate_signing_dkg` 的聚合前
+  诊断：接受相同的 `SigningContribution` 可迭代输入，返回
+  `tuple[ContributionFault, ...]`。类型边界与聚合器完全一致：元素或字段类型错误抛
+  `TypeError`，空输入、重复或缺失发送者、`participant_ids`/threshold/群参数不一致、
+  字段值越界或结构非法抛 `ValueError`（绝不以诊断记录掩盖）。对结构合法的贡献，按
+  `sender_id` 升序、各贡献 `participant_ids` 原序逐位置独立检查 Pedersen 与 Feldman
+  两项：一个发送者多处失败产生多条记录，同一位置两项都失败产生两条（Pedersen 在前），
+  全部通过返回空元组；顺序只由该排序确定，与输入顺序无关。函数不修改输入，也不改变
+  `aggregate_signing_dkg` 等任何既有入口的返回值与异常；返回空元组当且仅当
+  `aggregate_signing_dkg` 对同一输入聚合成功
 - `create_refresh(sender_id, key, *, randbelow=secrets.randbelow)` — 用既有
   `SigningDKGResult` `key` 的群参数、参与者编号与 threshold 创建一份主动刷新贡献
   `SigningContribution`；共享多项式常数项固定为 0 且不抽样（Feldman 常数项承诺为

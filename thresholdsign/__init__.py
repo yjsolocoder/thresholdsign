@@ -10,6 +10,9 @@ single-round Pedersen DKG: DKGContribution / DKGReceivedShare / DKGResult /
 DKGRejection / create_dkg_contribution / verify_dkg_received_share /
 aggregate_dkg. The signing extension adds SigningContribution /
 SigningDKGResult / create_signing_contribution / aggregate_signing_dkg,
+plus ContributionFault / diagnose_signing_contributions, the stateless
+pre-aggregation diagnoser that reports every failing Pedersen or Feldman
+double-share pairing without one bad pairing masking the others,
 proactive share refresh via create_refresh / refresh, member resharing via
 create_reshare / reshare, and the canonical confidential-channel
 transport encodings encode_dkg_contribution / decode_dkg_contribution and
@@ -238,6 +241,8 @@ __all__ = [
     "SigningDKGResult",
     "create_signing_contribution",
     "aggregate_signing_dkg",
+    "ContributionFault",
+    "diagnose_signing_contributions",
     "create_refresh",
     "refresh",
     "create_reshare",
@@ -1909,6 +1914,137 @@ def aggregate_signing_dkg(
         public_key=public_key,
         verification_shares=tuple(verification_shares),
     )
+
+
+@dataclass(frozen=True)
+class ContributionFault:
+    """One failing double-share pairing in a signing DKG contribution.
+
+    The fields, in order, are ``sender_id`` (the contribution's sender),
+    ``receiver_id`` (the participant id the failing double share position is
+    addressed to, in the contribution's own ``participant_ids`` order) and
+    ``check`` (the commitment the pairing failed against: ``"pedersen"`` for
+    the double share against the sender's Pedersen commitment, exactly the
+    check behind a :class:`DKGRejection` in :func:`aggregate_signing_dkg`,
+    or ``"feldman"`` for the share against the sender's Feldman commitment,
+    the binding that aggregator reports as ``ValueError``). The dataclass is
+    frozen, positionally constructible and compared by value, and carries no
+    network, storage or hidden state.
+    """
+
+    sender_id: int
+    receiver_id: int
+    check: str
+
+
+def diagnose_signing_contributions(
+    contributions: Iterable[SigningContribution],
+) -> tuple[ContributionFault, ...]:
+    """Locate every failing double-share pairing before aggregation.
+
+    Accepts exactly the same :class:`SigningContribution` iterable as
+    :func:`aggregate_signing_dkg` and applies its validation boundary
+    unchanged: a non-:class:`SigningContribution` element or any wrong field
+    type raises TypeError; an empty iterable, duplicate or missing senders,
+    disagreeing ``participant_ids``, threshold or group parameters, and any
+    out-of-range value or structurally illegal field raise ValueError. Such
+    inputs are never reported as faults — they reject the whole call just as
+    in the aggregator.
+
+    For structurally legal contributions, every sender is examined in
+    ascending ``sender_id`` order regardless of input order, and within each
+    contribution the double-share positions are examined in that
+    contribution's original ``participant_ids`` order. For every
+    ``receiver_id`` position the double share is first checked against the
+    sender's Pedersen commitment (the same
+    :func:`verify_dkg_received_share` check the aggregator runs, including
+    the receiver-addressing coordinate), then the share alone against the
+    sender's Feldman commitment with :func:`verify_share`. A failed check
+    yields one :class:`ContributionFault` — ``check="pedersen"`` or
+    ``check="feldman"`` — so a sender failing at several positions produces
+    several faults, a position failing both commitments produces two faults
+    (the Pedersen fault first), and a pairing one commitment accepts but the
+    other rejects is still reported in full. Contributions that verify
+    completely contribute no faults.
+
+    The function never mutates its input and changes no other entry point:
+    :func:`aggregate_signing_dkg`, :func:`aggregate_dkg`, :func:`refresh`,
+    :func:`reshare`, the signing entries and the audit entries keep their
+    existing return values and exception behaviour. All results pass (the
+    fault tuple is empty) if and only if
+    :func:`aggregate_signing_dkg` would succeed on the same input.
+    """
+    materialised = list(contributions)
+    if not materialised:
+        raise ValueError("at least one contribution is required")
+    for contribution in materialised:
+        _check_signing_contribution_types(contribution)
+    for contribution in materialised:
+        _check_signing_contribution_structure(contribution)
+
+    dealings = [contribution.contribution for contribution in materialised]
+
+    # Structural consistency (ids, threshold, group parameters, exactly one
+    # contribution per participant) is validated exactly as in
+    # aggregate_signing_dkg, so the scan below only sees a legal contribution
+    # set.
+    first = dealings[0]
+    participant_ids = first.participant_ids
+    first_pedersen = first.commitment
+    threshold = len(first_pedersen.values)
+    for dealing in dealings:
+        commitment = dealing.commitment
+        if dealing.participant_ids != participant_ids:
+            raise ValueError("contributions must agree on the same participant ids")
+        if (
+            commitment.field_prime != first_pedersen.field_prime
+            or commitment.group_prime != first_pedersen.group_prime
+            or commitment.generator != first_pedersen.generator
+            or commitment.blinding_generator != first_pedersen.blinding_generator
+        ):
+            raise ValueError("contributions must share the same group parameters")
+        if len(commitment.values) != threshold:
+            raise ValueError("contributions must share the same threshold")
+    sender_ids = [dealing.sender_id for dealing in dealings]
+    if len(set(sender_ids)) != len(sender_ids):
+        raise ValueError("duplicate contribution from the same participant")
+    if set(sender_ids) != set(participant_ids):
+        raise ValueError("each participant must contribute exactly once")
+
+    # Sort by sender so the reported order cannot depend on the input order.
+    ordered = sorted(materialised, key=lambda item: item.contribution.sender_id)
+
+    faults: list[ContributionFault] = []
+    for item in ordered:
+        dealing = item.contribution
+        for index, receiver_id in enumerate(dealing.participant_ids):
+            received = DKGReceivedShare(
+                sender_id=dealing.sender_id,
+                receiver_id=receiver_id,
+                share=dealing.shares[index],
+                blinding_share=dealing.blinding_shares[index],
+            )
+            # The Pedersen pairing is exactly the check behind a
+            # DKGRejection in aggregate_signing_dkg; the Feldman pairing is
+            # the binding that aggregator turns into a ValueError. Both run
+            # for every position, so one failure never masks another.
+            if not verify_dkg_received_share(received, dealing.commitment):
+                faults.append(
+                    ContributionFault(
+                        sender_id=dealing.sender_id,
+                        receiver_id=receiver_id,
+                        check="pedersen",
+                    )
+                )
+            if not verify_share(dealing.shares[index], item.feldman_commitment):
+                faults.append(
+                    ContributionFault(
+                        sender_id=dealing.sender_id,
+                        receiver_id=receiver_id,
+                        check="feldman",
+                    )
+                )
+    return tuple(faults)
 
 
 def refresh(
