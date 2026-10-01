@@ -155,6 +155,43 @@ assert verify_signature(
 支持 `threshold = 1`。一次性随机数由可注入的 `randbelow` 在 `prime - 1` 个值上
 抽取并自动排除零（返回值加一），复用防护需要调用方保证——本实现不保存任何状态。
 
+### 可独立流转的签名凭证
+
+`AggregateSignature` 验签时还需要调用方另行持有消息、公钥与群参数。
+`create_signature_receipt` 把它们连同签名捆成一个冻结的 `SignatureReceipt`
+（字段依次为 `message`、`signature`、`public_key`、`field_prime`、`group_prime`、
+`generator`），接收方仅凭凭证即可 `verify_signature_receipt`，全程不接触秘密份额、
+一次性 nonce 或任何隐藏状态。凭证在创建时必须通过 `verify_signature` 同款校验：
+参数类型错误抛 `TypeError`（`bool` 不视为整数），公钥或群参数非法、签名与消息/
+公钥不匹配抛 `ValueError`。
+
+```python
+from thresholdsign import (
+    create_signature_receipt, encode_signature_receipt,
+    decode_signature_receipt, verify_signature_receipt,
+)
+
+receipt = create_signature_receipt(message, signature, key)
+assert verify_signature_receipt(receipt)          # 只凭凭证验签，结果与 verify_signature 一致
+
+blob = encode_signature_receipt(receipt)          # 唯一确定的 bytes，无秘密或状态
+restored = decode_signature_receipt(blob)         # 只校验结构，不验签
+assert encode_signature_receipt(restored) == blob  # 成功解码必可逐字节复现
+assert verify_signature_receipt(restored)
+```
+
+编码以标签 `b"thresholdsign/signature-receipt/v1"` 开头，随后依次写 4 字节大端
+长度前缀的消息帧（消息可为空）、`public_key`、`field_prime`、`group_prime`、
+`generator`、签名的 `R` 与 `z`（均为 VARINT：4 字节大端长度加最短无符号大端
+值体，零为单字节 `00`、正数无前导零），最后是 4 字节签名者计数及逐个严格递增的
+签名者编号。`encode_signature_receipt` 只接受结构合法的凭证（不要求签名匹配，
+输出唯一）；`decode_signature_receipt` 对非 `bytes` 抛 `TypeError`，遇标签错误、
+截断、尾随字节、非规范整数、重复或乱序签名者编号、越界的 `R`/`z`/`public_key`、
+非法素数或群参数抛 `ValueError`，且不验签——结构合法但签名不匹配的凭证照常返回，
+由 `verify_signature_receipt` 返回 `False`。篡改凭证的消息、公钥、群参数、`R`、
+`z` 或签名者集合，或换钥后的凭证，验签一律返回 `False`；非 `SignatureReceipt`
+或字段类型错误抛 `TypeError`，越界或结构非法抛 `ValueError`。
+
 ### 主动份额刷新
 
 签名密钥长期使用时，可用主动份额刷新（proactive refresh）在不改变联合秘密与

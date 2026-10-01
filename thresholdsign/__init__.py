@@ -270,6 +270,11 @@ __all__ = [
     "SigningAudit",
     "create_audit",
     "check_audit",
+    "SignatureReceipt",
+    "create_signature_receipt",
+    "encode_signature_receipt",
+    "decode_signature_receipt",
+    "verify_signature_receipt",
     "NonceReuse",
     "find_nonce_reuse",
     "encode_nonce_reuse",
@@ -4198,6 +4203,306 @@ def check_audit(
         ):
             return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# Self-contained threshold Schnorr signature receipts: a frozen record that
+# bundles the signed message together with the (R, z, signer_ids) aggregate
+# signature, the joint public key and the field/group parameters, so a
+# receiver can verify with nothing but the receipt. The receipt carries no
+# secret share, no nonce and no hidden protocol state.
+# ---------------------------------------------------------------------------
+
+SIGNATURE_RECEIPT_TAG = b"thresholdsign/signature-receipt/v1"
+
+
+@dataclass(frozen=True)
+class SignatureReceipt:
+    """A self-contained, independently transferable threshold Schnorr receipt.
+
+    ``message`` is the signed byte string, ``signature`` the
+    :class:`AggregateSignature` ``(R, z, signer_ids)`` exactly as produced by
+    :func:`aggregate_signature`, ``public_key`` the joint verification key
+    ``Y``, and ``field_prime`` / ``group_prime`` / ``generator`` the public
+    group parameters. Nothing in the receipt is secret: there is no secret
+    share, per-signer nonce or other hidden state, and a receiver needs only
+    the receipt to run :func:`verify_signature_receipt`.
+    """
+
+    message: bytes
+    signature: AggregateSignature
+    public_key: int
+    field_prime: int
+    group_prime: int
+    generator: int
+
+
+def _check_signature_receipt_fields(
+    message: object,
+    signature: object,
+    public_key: object,
+    field_prime: object,
+    group_prime: object,
+    generator: object,
+) -> None:
+    """Type- and structure-check every field of a SignatureReceipt.
+
+    Mirrors :func:`verify_signature`'s structural boundary: wrong types raise
+    TypeError and every illegal value — the message/signature/key/group
+    domains, including a signature ``R`` outside the order-``field_prime``
+    subgroup — raises ValueError. The signature equation itself is not
+    checked here; that verdict belongs to :func:`verify_signature` /
+    :func:`verify_signature_receipt`.
+    """
+    if not isinstance(message, bytes):
+        raise TypeError("message must be bytes")
+    if not isinstance(signature, AggregateSignature):
+        raise TypeError("signature must be an AggregateSignature instance")
+    if not isinstance(public_key, int) or isinstance(public_key, bool):
+        raise TypeError("public_key must be an integer")
+    if not isinstance(field_prime, int) or isinstance(field_prime, bool):
+        raise TypeError("field_prime must be an integer")
+    if not isinstance(group_prime, int) or isinstance(group_prime, bool):
+        raise TypeError("group_prime must be an integer")
+    if not isinstance(generator, int) or isinstance(generator, bool):
+        raise TypeError("generator must be an integer")
+    if not isinstance(signature.R, int) or isinstance(signature.R, bool):
+        raise TypeError("signature.R must be an integer")
+    if not isinstance(signature.z, int) or isinstance(signature.z, bool):
+        raise TypeError("signature.z must be an integer")
+    if not isinstance(signature.signer_ids, tuple):
+        raise TypeError("signature.signer_ids must be a tuple")
+    for signer_id in signature.signer_ids:
+        if not isinstance(signer_id, int) or isinstance(signer_id, bool):
+            raise TypeError("signer ids must be integers")
+        if not 0 < signer_id < field_prime:
+            raise ValueError("signer ids must satisfy 1 <= id <= field_prime - 1")
+    if not signature.signer_ids:
+        raise ValueError("at least one signer is required")
+    if any(
+        signature.signer_ids[index] >= signature.signer_ids[index + 1]
+        for index in range(len(signature.signer_ids) - 1)
+    ):
+        raise ValueError("signer ids must be strictly increasing and unique")
+
+    _validate_feldman_parameters(field_prime, group_prime, generator)
+    if not 0 < signature.R < group_prime:
+        raise ValueError("signature R must satisfy 0 < R < group_prime")
+    if not 0 <= signature.z < field_prime:
+        raise ValueError("signature z must satisfy 0 <= z < field_prime")
+    if not 0 < public_key < group_prime:
+        raise ValueError("public_key must satisfy 0 < Y < group_prime")
+    if pow(signature.R, field_prime, group_prime) != 1:
+        raise ValueError("signature R must lie in the order-field_prime subgroup")
+    if pow(public_key, field_prime, group_prime) != 1:
+        raise ValueError("public_key must lie in the order-field_prime subgroup")
+
+
+def create_signature_receipt(
+    message: bytes,
+    signature: AggregateSignature,
+    dkg_result: SigningDKGResult,
+) -> SignatureReceipt:
+    """Bundle a verified threshold Schnorr signature into a transferable receipt.
+
+    The receipt records ``message``, the :class:`AggregateSignature`
+    ``(R, z, signer_ids)`` unchanged, the joint ``public_key`` of
+    ``dkg_result`` and the public ``field_prime`` / ``group_prime`` /
+    ``generator`` of its commitment. Wrong argument types raise TypeError
+    (``bool`` is not accepted as an integer); an illegal key or group setup,
+    malformed signature structure, or a signature that does not verify under
+    the key for ``message`` raise ValueError, exactly as
+    :func:`verify_signature` would. On success the returned receipt verifies
+    with :func:`verify_signature_receipt`; no secret share, nonce or other
+    hidden state is copied into it.
+    """
+    if not isinstance(message, bytes):
+        raise TypeError("message must be bytes")
+    if not isinstance(signature, AggregateSignature):
+        raise TypeError("signature must be an AggregateSignature instance")
+    if not isinstance(dkg_result, SigningDKGResult):
+        raise TypeError("dkg_result must be a SigningDKGResult instance")
+    _result, public_key, field_prime, group_prime, generator = _check_signing_setup(
+        dkg_result
+    )
+    _check_signing_dkg_structure(dkg_result)
+
+    if not verify_signature(
+        message,
+        signature,
+        public_key,
+        group_prime=group_prime,
+        generator=generator,
+        prime=field_prime,
+    ):
+        raise ValueError("signature does not verify for the message and signing key")
+    return SignatureReceipt(
+        message=message,
+        signature=signature,
+        public_key=public_key,
+        field_prime=field_prime,
+        group_prime=group_prime,
+        generator=generator,
+    )
+
+
+def encode_signature_receipt(receipt: SignatureReceipt) -> bytes:
+    """Canonically encode a :class:`SignatureReceipt` for independent transport.
+
+    The encoding starts with the tag
+    ``b"thresholdsign/signature-receipt/v1"`` and then writes, in order, the
+    message as a 4-byte unsigned big-endian length-prefixed frame (the
+    message may be empty), ``public_key``, ``field_prime``,
+    ``group_prime`` and ``generator`` as VARINTs, the signature's ``R`` and
+    ``z`` as VARINTs, and finally the 4-byte signer count followed by one
+    strictly increasing VARINT per signer id. A VARINT is a 4-byte unsigned
+    big-endian body length followed by the shortest unsigned big-endian
+    value: zero is the single byte ``00`` and positive values carry no
+    leading zero.
+
+    Only a structurally valid receipt is accepted: a non-receipt argument or
+    a wrong field type raises TypeError, and an illegal message/signature
+    shape, key range or group setup raises ValueError. The signature is not
+    re-verified at encode time — a structurally legal receipt whose
+    signature does not match still encodes, and
+    :func:`verify_signature_receipt` is what reports such a receipt as
+    ``False``. The output for a given receipt is unique and contains no
+    secret share, nonce or hidden state.
+    """
+    if not isinstance(receipt, SignatureReceipt):
+        raise TypeError("receipt must be a SignatureReceipt instance")
+    _check_signature_receipt_fields(
+        receipt.message,
+        receipt.signature,
+        receipt.public_key,
+        receipt.field_prime,
+        receipt.group_prime,
+        receipt.generator,
+    )
+    if len(receipt.message) > 0xFFFFFFFF:
+        raise ValueError("message encoding too long")
+    if len(receipt.signature.signer_ids) > 0xFFFFFFFF:
+        raise ValueError("too many signer ids")
+
+    buffer = bytearray(SIGNATURE_RECEIPT_TAG)
+    buffer += len(receipt.message).to_bytes(4, "big", signed=False)
+    buffer += receipt.message
+    for value in (
+        receipt.public_key,
+        receipt.field_prime,
+        receipt.group_prime,
+        receipt.generator,
+        receipt.signature.R,
+        receipt.signature.z,
+    ):
+        buffer += _encode_varint(value)
+    buffer += len(receipt.signature.signer_ids).to_bytes(4, "big", signed=False)
+    for signer_id in receipt.signature.signer_ids:
+        buffer += _encode_varint(signer_id)
+    return bytes(buffer)
+
+
+def decode_signature_receipt(payload: bytes) -> SignatureReceipt:
+    """Decode the canonical encoding produced by :func:`encode_signature_receipt`.
+
+    Accepts only the single canonical form: the tag
+    ``b"thresholdsign/signature-receipt/v1"``, one length-prefixed message
+    frame, VARINTs for ``public_key``, ``field_prime``, ``group_prime``,
+    ``generator``, ``R`` and ``z``, and a 4-byte count followed by one
+    strictly increasing VARINT per signer id. A non-bytes argument raises
+    TypeError; a wrong or missing tag, truncation, trailing bytes, a
+    non-canonical integer (leading zero or over-long length), a count that
+    does not match the stream, or duplicated, zero or non-increasing signer
+    ids raise ValueError, as do out-of-range ``R``, ``z`` or ``public_key``
+    and an illegal prime or group setup. A successfully decoded receipt
+    re-encodes to exactly the input bytes.
+
+    Decoding validates structure only and never verifies the signature: a
+    structurally legal receipt whose signature does not match is returned
+    normally and :func:`verify_signature_receipt` reports it as ``False``.
+    """
+    if not isinstance(payload, bytes):
+        raise TypeError("payload must be bytes")
+    if not payload.startswith(SIGNATURE_RECEIPT_TAG):
+        raise ValueError("bad signature receipt tag")
+    offset = len(SIGNATURE_RECEIPT_TAG)
+
+    if offset + 4 > len(payload):
+        raise ValueError("truncated signature receipt message length")
+    message_length = int.from_bytes(payload[offset:offset + 4], "big")
+    offset += 4
+    if offset + message_length > len(payload):
+        raise ValueError("truncated signature receipt message")
+    message = bytes(payload[offset:offset + message_length])
+    offset += message_length
+
+    public_key, offset = _read_varint(payload, offset, what="signature receipt public_key")
+    field_prime, offset = _read_varint(payload, offset, what="signature receipt field_prime")
+    group_prime, offset = _read_varint(payload, offset, what="signature receipt group_prime")
+    generator, offset = _read_varint(payload, offset, what="signature receipt generator")
+    R, offset = _read_varint(payload, offset, what="signature receipt R")
+    z, offset = _read_varint(payload, offset, what="signature receipt z")
+
+    if offset + 4 > len(payload):
+        raise ValueError("truncated signer id count")
+    signer_count = int.from_bytes(payload[offset:offset + 4], "big")
+    offset += 4
+    signer_ids = []
+    for _ in range(signer_count):
+        signer_id, offset = _read_varint(payload, offset, what="signature receipt signer id")
+        if signer_id == 0:
+            raise ValueError("signer ids must be positive")
+        if signer_ids and signer_id <= signer_ids[-1]:
+            raise ValueError("signer ids must be strictly increasing and unique")
+        signer_ids.append(signer_id)
+    if offset != len(payload):
+        raise ValueError("trailing bytes after signature receipt")
+
+    receipt = SignatureReceipt(
+        message=message,
+        signature=AggregateSignature(R=R, z=z, signer_ids=tuple(signer_ids)),
+        public_key=public_key,
+        field_prime=field_prime,
+        group_prime=group_prime,
+        generator=generator,
+    )
+    _check_signature_receipt_fields(
+        message,
+        receipt.signature,
+        public_key,
+        field_prime,
+        group_prime,
+        generator,
+    )
+    if encode_signature_receipt(receipt) != payload:
+        raise ValueError("non-canonical signature receipt")
+    return receipt
+
+
+def verify_signature_receipt(receipt: SignatureReceipt) -> bool:
+    """Verify a threshold Schnorr receipt with nothing but the receipt itself.
+
+    Reconstructs the Fiat-Shamir challenge and checks the aggregate equation
+    ``g ** z == R * Y ** c`` exactly as :func:`verify_signature`, using the
+    message, signature, public key and group parameters carried in
+    ``receipt``; a valid receipt returns ``True`` and a receipt whose
+    message, public key, group parameters, ``R``, ``z`` or ``signer_ids``
+    was tampered with, or whose signature belongs to another key, returns
+    ``False``. A non-:class:`SignatureReceipt` argument or a field of the
+    wrong type raises TypeError, and an out-of-range value or otherwise
+    structurally illegal receipt raises ValueError, with the same boundary
+    as :func:`verify_signature`.
+    """
+    if not isinstance(receipt, SignatureReceipt):
+        raise TypeError("receipt must be a SignatureReceipt instance")
+    return verify_signature(
+        receipt.message,
+        receipt.signature,
+        receipt.public_key,
+        group_prime=receipt.group_prime,
+        generator=receipt.generator,
+        prime=receipt.field_prime,
+    )
 
 
 # ---------------------------------------------------------------------------
