@@ -1561,6 +1561,34 @@ python3 -m thresholdsign
   或份额方程失败都计入重算 status=0，与记录的 status 对比而非直接判负，因此
   原样生成的失败回执复核为 `True`；重算结论与回执一致返回 `True`，合法篡改
   或消息/密钥不匹配返回 `False`
+- `AuditReceipt(message, audit, participant_ids, threshold, field_prime,
+  group_prime, generator, public_key, verification_shares)` — 冻结数据类，
+  可按位置构造、按值相等；把一条 `SigningAudit` 与复核所需的公开材料绑定：
+  被签名的 `message`、审计回执、严格递增的参与者编号、门限、群参数
+  `q/p/g`、联合公钥 `Y` 以及按参与者编号位置对齐的每人一个验证份额 `Y_i`；
+  不含 `SigningDKGResult`、秘密份额、nonce、多项式系数或隐藏状态
+- `create_audit_receipt(message, audit, dkg_result)` — 从 `message`、`audit` 与
+  `SigningDKGResult` 提取全部公开值（秘密不离 DKG 结果），并按
+  `check_audit(message, audit, dkg_result)` 的口径确认记录；成功与如实记录的失败
+  审计均可封装，消息不一致、回执结构非法、群/DKG 参数非法或密码学不一致抛
+  `ValueError`，参数类型错误抛 `TypeError`
+- `verify_audit_receipt(receipt)` — 仅凭 receipt 复核：结构校验通过后重算消息
+  摘要、`Y`、`R`、Fiat-Shamir 挑战、各行 `R_i` 与 `z_i`（验证份额按编号
+  取参与者对应位置的 `Y_i`）、记录状态以及成功时的聚合 `z` 与聚合签名
+  `g^z = R·Y^c`；全一致返回 `True`，任一字段被篡改或改绑到别的消息/密钥返回
+  `False`；非 `AuditReceipt` 或字段类型错误抛 `TypeError`，越界、回执载荷畸形
+  或列表/计数错误抛 `ValueError`
+- `encode_audit_receipt(receipt)` / `decode_audit_receipt(payload)` —
+  自包含审计凭证的唯一规范编码：标签 `b"thresholdsign/audit-receipt/v1"`
+  后依次写 4 字节无符号大端消息长度与原始 `message`、`field_prime`、
+  `group_prime`、`generator`、`public_key`、`threshold`，再写 4 字节参与者
+  计数与各编号、4 字节验证份额计数（与参与者等长、位置对齐）与各份额，最后写
+  4 字节载荷长度与 `audit.payload` 原字节；每个整数为 4 字节无符号大端长度加
+  最短无符号大端正文（零为单字节 `00`），消息与 payload 帧长度可为零（payload
+  帧非零）。编码唯一、往返逐值相等；`decode` 只做结构校验：非 `bytes` 抛
+  `TypeError`，坏/缺标签、截断、尾随字节、非规范整数（前导零、超长或零长度
+  正文）、计数或范围错误、空/重复/乱序参与者、份额数不匹配或审计载荷畸形抛
+  `ValueError`；编码不含秘密或状态
 - `NonceReuse(signer_id, nonce_commitment, receipts)` — 冻结数据类，可按位置
   构造、按值相等；同一签名者重复使用同一轮次一承诺 `R_i` 的证据：`receipts`
   为含该 `(signer_id, R_i)` 行的 status=1 审计回执，按 `payload` 字节序去重

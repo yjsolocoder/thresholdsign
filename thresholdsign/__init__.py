@@ -26,7 +26,13 @@ signer missing from the round-one batch) / SigningRound /
 SignatureShare / SignatureShareRejection / AggregateSignature /
 create_signing_nonce_commitment / create_signing_round / create_signature_share
 / verify_signature_share / aggregate_signature / verify_signature, signing
-audit receipts: SigningAudit / create_audit / check_audit, the stateless
+audit receipts: SigningAudit / create_audit / check_audit, and the
+self-contained AuditReceipt / create_audit_receipt /
+verify_audit_receipt that binds an audit record to its public
+verification material (group parameters, joint key and one
+verification share per participant) so the record re-verifies with no
+SigningDKGResult, secret or hidden state, with its canonical transport
+encoding encode_audit_receipt / decode_audit_receipt, the stateless
 nonce-reuse audit NonceReuse / find_nonce_reuse, leaked-share recovery from
 reused nonces via NonceLeak / recover_leaks, the canonical nonce-reuse
 transport encoding encode_nonce_reuse / decode_nonce_reuse, the canonical
@@ -290,6 +296,11 @@ __all__ = [
     "SigningAudit",
     "create_audit",
     "check_audit",
+    "AuditReceipt",
+    "create_audit_receipt",
+    "verify_audit_receipt",
+    "encode_audit_receipt",
+    "decode_audit_receipt",
     "NonceReuse",
     "find_nonce_reuse",
     "encode_nonce_reuse",
@@ -5059,6 +5070,436 @@ def check_audit(
         ):
             return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# Self-contained audit receipts: an audit record plus the public verification
+# material (group parameters, joint key and one verification share per
+# participant), so a receiver can re-check the audit exactly as check_audit
+# would without ever handling a SigningDKGResult, a secret share or any other
+# hidden state. A canonical transport encoding frames the same public values.
+# ---------------------------------------------------------------------------
+
+AUDIT_RECEIPT_TAG = b"thresholdsign/audit-receipt/v1"
+
+
+@dataclass(frozen=True)
+class AuditReceipt:
+    """A self-contained, publicly verifiable binding of an audit to its key.
+
+    ``message`` is the exact byte string the audit was produced for and
+    ``audit`` the :class:`SigningAudit` being bound; ``participant_ids`` is the
+    strictly increasing, duplicate-free tuple of DKG participant ids and
+    ``threshold`` the signing threshold; ``field_prime`` (``q``),
+    ``group_prime`` (``p``) and ``generator`` (``g``) name the group;
+    ``public_key`` is the joint verification key ``Y`` and
+    ``verification_shares`` holds one ``Y_i`` per participant, aligned
+    positionally with ``participant_ids``. A verifier reproduces the check of
+    :func:`check_audit` — digest, ``Y``, ``R``, challenge, each row's
+    ``R_i`` and ``z_i``, the status and, on success, the aggregated ``z`` —
+    solely from these fields. The dataclass is frozen, positionally
+    constructible and compared by value, and carries no secret share, nonce,
+    polynomial coefficient or hidden state.
+    """
+
+    message: bytes
+    audit: SigningAudit
+    participant_ids: tuple[int, ...]
+    threshold: int
+    field_prime: int
+    group_prime: int
+    generator: int
+    public_key: int
+    verification_shares: tuple[int, ...]
+
+
+def _check_audit_receipt_fields(
+    message: object,
+    audit: object,
+    participant_ids: object,
+    threshold: object,
+    field_prime: object,
+    group_prime: object,
+    generator: object,
+    public_key: object,
+    verification_shares: object,
+) -> None:
+    """Type- and structure-check every AuditReceipt field.
+
+    Only structure is checked: the audit payload is decoded structurally and
+    its signer ids must be participants with at least ``threshold`` rows, but
+    the cryptographic recomputation (digest, challenge, share equations and
+    aggregate) is left to :func:`verify_audit_receipt`.
+    """
+    if not isinstance(message, bytes):
+        raise TypeError("message must be bytes")
+    if not isinstance(audit, SigningAudit):
+        raise TypeError("audit must be a SigningAudit instance")
+    if not isinstance(audit.payload, bytes):
+        raise TypeError("audit payload must be bytes")
+    if not isinstance(participant_ids, tuple):
+        raise TypeError("participant_ids must be a tuple")
+    if not isinstance(verification_shares, tuple):
+        raise TypeError("verification_shares must be a tuple")
+    for name, value in (
+        ("threshold", threshold),
+        ("field_prime", field_prime),
+        ("group_prime", group_prime),
+        ("generator", generator),
+        ("public_key", public_key),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"{name} must be an integer")
+    for participant_id in participant_ids:
+        if not isinstance(participant_id, int) or isinstance(participant_id, bool):
+            raise TypeError("participant ids must be integers")
+    for share in verification_shares:
+        if not isinstance(share, int) or isinstance(share, bool):
+            raise TypeError("verification shares must be integers")
+
+    _validate_feldman_parameters(field_prime, group_prime, generator)
+    if not participant_ids:
+        raise ValueError("participant ids must be a non-empty tuple")
+    for participant_id in participant_ids:
+        if not 0 < participant_id < field_prime:
+            raise ValueError(
+                "participant ids must satisfy 1 <= id <= field_prime - 1"
+            )
+    if any(
+        participant_ids[index] >= participant_ids[index + 1]
+        for index in range(len(participant_ids) - 1)
+    ):
+        raise ValueError("participant ids must be strictly increasing and unique")
+    if not 1 <= threshold <= len(participant_ids):
+        raise ValueError("threshold must satisfy 1 <= threshold <= participant count")
+    if len(verification_shares) != len(participant_ids):
+        raise ValueError("one verification share per participant is required")
+    for share in verification_shares:
+        if not 0 < share < group_prime:
+            raise ValueError("verification shares must satisfy 0 < Y_i < group_prime")
+        if pow(share, field_prime, group_prime) != 1:
+            raise ValueError(
+                "verification shares must lie in the order-field_prime subgroup"
+            )
+    if not 0 < public_key < group_prime:
+        raise ValueError("public_key must satisfy 0 < public_key < group_prime")
+    if pow(public_key, field_prime, group_prime) != 1:
+        raise ValueError("public_key must lie in the order-field_prime subgroup")
+
+    # A structurally legal audit for this group whose signers are all
+    # participants with at least threshold rows; the recorded status itself is
+    # re-verified cryptographically by verify_audit_receipt.
+    _digest, _Y, _R, _c, rows, _status, _z = _decode_audit_payload(
+        audit.payload, field_prime, group_prime
+    )
+    signer_ids = tuple(row[0] for row in rows)
+    if len(signer_ids) < threshold:
+        raise ValueError("audit rows must cover at least threshold signers")
+    if any(signer_id not in participant_ids for signer_id in signer_ids):
+        raise ValueError("audit signer ids must be participants")
+
+
+def create_audit_receipt(
+    message: bytes,
+    audit: SigningAudit,
+    dkg_result: SigningDKGResult,
+) -> AuditReceipt:
+    """Bind an audit record to the public verification material of its key.
+
+    Extracts the group parameters, threshold, participant ids, joint public
+    key and per-participant verification shares from ``dkg_result`` (no
+    secret or hidden state leaves it) and confirms the record exactly as
+    :func:`check_audit` would — recomputing the message digest, public key,
+    Fiat-Shamir challenge, aggregate ``R``, every row's share equation and,
+    when the audit succeeded, the aggregated ``z``. Both a successful and a
+    faithfully recorded failing audit are packaged; the audit's recorded status
+    must match the recomputed one. Wrong argument types raise TypeError; a
+    message inconsistent with the audit, a malformed :class:`SigningAudit`
+    payload, an illegal group or DKG structure, or any cryptographic
+    inconsistency raises ValueError.
+    """
+    if not isinstance(message, bytes):
+        raise TypeError("message must be bytes")
+    if not isinstance(audit, SigningAudit):
+        raise TypeError("audit must be a SigningAudit instance")
+    result, public_key, field_prime, group_prime, _generator = _check_signing_setup(
+        dkg_result
+    )
+    _check_signing_dkg_structure(dkg_result)
+    if not check_audit(message, audit, dkg_result):
+        raise ValueError(
+            "audit does not verify against the message and the signing key"
+        )
+    return AuditReceipt(
+        message=message,
+        audit=audit,
+        participant_ids=result.participant_ids,
+        threshold=len(result.commitment.values),
+        field_prime=field_prime,
+        group_prime=group_prime,
+        generator=_generator,
+        public_key=public_key,
+        verification_shares=dkg_result.verification_shares,
+    )
+
+
+def verify_audit_receipt(receipt: AuditReceipt) -> bool:
+    """Verify an audit receipt solely from its own contents.
+
+    Structurally validates every field (the same boundary as
+    :func:`create_audit_receipt`, minus the DKG result) and then re-runs the
+    whole check of :func:`check_audit` without a :class:`SigningDKGResult`:
+    the ``SHA256(message)`` digest, the public key, the Fiat-Shamir
+    challenge from the header ``R``, the aggregate ``R`` as the product of
+    the row commitments, each row's
+    ``g ** z_i == R_i * Y_i ** (c * lambda_i)`` with the verification share
+    aligned to the signer's participant position, the recorded status, and —
+    only on success — the aggregated ``z`` and the aggregate signature
+    ``g ** z == R * Y ** c``. Returns ``True`` only when everything agrees; a
+    receipt whose message, group parameters, public key, participant ids,
+    verification shares or audit payload were tampered with, or which was
+    rebound to another message or key, returns ``False``. A
+    non-:class:`AuditReceipt` argument or a wrong-typed field raises
+    TypeError; an out-of-range value, malformed audit payload or another
+    structural defect raises ValueError.
+    """
+    if not isinstance(receipt, AuditReceipt):
+        raise TypeError("receipt must be an AuditReceipt instance")
+    _check_audit_receipt_fields(
+        receipt.message,
+        receipt.audit,
+        receipt.participant_ids,
+        receipt.threshold,
+        receipt.field_prime,
+        receipt.group_prime,
+        receipt.generator,
+        receipt.public_key,
+        receipt.verification_shares,
+    )
+
+    digest, Y, R, challenge, rows, status, z = _decode_audit_payload(
+        receipt.audit.payload, receipt.field_prime, receipt.group_prime
+    )
+    if digest != hashlib.sha256(receipt.message).digest():
+        return False
+    if Y != receipt.public_key:
+        return False
+
+    signer_ids = tuple(row[0] for row in rows)
+    recomputed_R = 1
+    for _signer_id, nonce_commitment, _z_i in rows:
+        recomputed_R = recomputed_R * nonce_commitment % receipt.group_prime
+    recomputed_challenge = schnorr_challenge(
+        receipt.message,
+        receipt.public_key,
+        R,
+        signer_ids,
+        field_prime=receipt.field_prime,
+        group_prime=receipt.group_prime,
+    )
+    if recomputed_challenge != challenge:
+        return False
+
+    all_verified = recomputed_R == R
+    z_total = 0
+    for signer_id, nonce_commitment, z_i in rows:
+        weight = _lagrange_weight(
+            signer_id, signer_ids, receipt.field_prime
+        )
+        share_index = receipt.participant_ids.index(signer_id)
+        Y_i = receipt.verification_shares[share_index]
+        expected = (
+            nonce_commitment
+            * pow(Y_i, challenge * weight % receipt.field_prime, receipt.group_prime)
+            % receipt.group_prime
+        )
+        if pow(receipt.generator, z_i, receipt.group_prime) != expected:
+            all_verified = False
+        z_total = (z_total + z_i) % receipt.field_prime
+    if (1 if all_verified else 0) != status:
+        return False
+
+    if status == 1:
+        if z != z_total:
+            return False
+        if pow(receipt.generator, z, receipt.group_prime) != (
+            R * pow(receipt.public_key, challenge, receipt.group_prime)
+            % receipt.group_prime
+        ):
+            return False
+    return True
+
+
+def encode_audit_receipt(receipt: AuditReceipt) -> bytes:
+    """Canonically encode an audit receipt for transport or storage.
+
+    The encoding starts with the tag
+    ``b"thresholdsign/audit-receipt/v1"``, followed in order by: a 4-byte
+    unsigned big-endian message length and the raw message bytes (an empty
+    message is legal), the length-prefixed ``field_prime``,
+    ``group_prime``, ``generator`` and ``public_key``, the length-prefixed
+    ``threshold``, a 4-byte count plus one length-prefixed participant id
+    each, a 4-byte count plus one length-prefixed verification share
+    each (shares aligned with the participant ids), and finally a 4-byte
+    payload length and the raw ``audit.payload`` bytes. Every integer body is
+    the shortest unsigned big-endian representation of its value, prefixed
+    by its 4-byte unsigned big-endian length: zero is the single body byte
+    ``00`` and positive values carry no leading zero. The output for a given
+    receipt is unique — a decoded receipt re-encodes to exactly the same bytes
+    — and it contains no secret share, nonce, coefficient or hidden state.
+
+    Only a structurally valid :class:`AuditReceipt` is accepted: wrong
+    field types raise TypeError (``bool`` is not an integer) and an illegal
+    group setup, key, participant set, verification-share list, threshold or
+    audit payload raises ValueError; the audit is not cryptographically
+    re-verified — :func:`verify_audit_receipt` remains the way to test
+    validity.
+    """
+    if not isinstance(receipt, AuditReceipt):
+        raise TypeError("receipt must be an AuditReceipt instance")
+    _check_audit_receipt_fields(
+        receipt.message,
+        receipt.audit,
+        receipt.participant_ids,
+        receipt.threshold,
+        receipt.field_prime,
+        receipt.group_prime,
+        receipt.generator,
+        receipt.public_key,
+        receipt.verification_shares,
+    )
+
+    buffer = bytearray(AUDIT_RECEIPT_TAG)
+    buffer += len(receipt.message).to_bytes(4, "big", signed=False)
+    buffer += receipt.message
+    for value in (
+        receipt.field_prime,
+        receipt.group_prime,
+        receipt.generator,
+        receipt.public_key,
+    ):
+        buffer += _encode_varint(value)
+    buffer += _encode_varint(receipt.threshold)
+    buffer += len(receipt.participant_ids).to_bytes(4, "big", signed=False)
+    for participant_id in receipt.participant_ids:
+        buffer += _encode_varint(participant_id)
+    buffer += len(receipt.verification_shares).to_bytes(4, "big", signed=False)
+    for share in receipt.verification_shares:
+        buffer += _encode_varint(share)
+    buffer += len(receipt.audit.payload).to_bytes(4, "big", signed=False)
+    buffer += receipt.audit.payload
+    return bytes(buffer)
+
+
+def _read_audit_receipt_frame(
+    stream: bytes, offset: int, *, what: str
+) -> tuple[bytes, int]:
+    """Read a 4-byte-length-prefixed raw byte frame at ``offset``.
+
+    Unlike :func:`_read_varint`, a zero-length frame is allowed (the empty
+    message). Raises ValueError on truncation only.
+    """
+    if offset + 4 > len(stream):
+        raise ValueError(f"truncated {what} length")
+    length = int.from_bytes(stream[offset:offset + 4], "big")
+    offset += 4
+    if offset + length > len(stream):
+        raise ValueError(f"truncated {what}")
+    return bytes(stream[offset:offset + length]), offset + length
+
+
+def decode_audit_receipt(payload: bytes) -> AuditReceipt:
+    """Decode the canonical encoding produced by :func:`encode_audit_receipt`.
+
+    Accepts only the single canonical form: the tag
+    ``b"thresholdsign/audit-receipt/v1"``, a 4-byte message length followed
+    by exactly that many message bytes (zero length is legal),
+    length-prefixed ``field_prime``, ``group_prime``, ``generator`` and
+    ``public_key``, the length-prefixed threshold, a 4-byte count
+    followed by one length-prefixed participant id each, a 4-byte count
+    followed by one length-prefixed verification share each, and a
+    4-byte payload length followed by exactly that many audit payload
+    bytes. A non-bytes argument raises TypeError; a wrong or missing tag,
+    truncation, trailing bytes, a non-canonical integer (leading zero
+    or over-long length), an empty, non-positive, duplicate or
+    out-of-order participant list, mismatching participant/share counts,
+    an out-of-range threshold, key, participant or verification share,
+    an illegal group setup, or a malformed audit payload raises
+    ValueError. A successfully decoded receipt re-encodes to exactly the
+    input bytes.
+
+    Decoding validates structure only, never the audit equations: a receipt
+    whose audit does not match its message or key is returned normally, and
+    :func:`verify_audit_receipt` reports it as ``False``.
+    """
+    if not isinstance(payload, bytes):
+        raise TypeError("payload must be bytes")
+    if not payload.startswith(AUDIT_RECEIPT_TAG):
+        raise ValueError("bad audit receipt tag")
+    offset = len(AUDIT_RECEIPT_TAG)
+
+    message, offset = _read_audit_receipt_frame(
+        payload, offset, what="audit receipt message"
+    )
+    field_prime, offset = _read_varint(payload, offset, what="field prime")
+    group_prime, offset = _read_varint(payload, offset, what="group prime")
+    generator, offset = _read_varint(payload, offset, what="generator")
+    public_key, offset = _read_varint(payload, offset, what="public key")
+    threshold, offset = _read_varint(payload, offset, what="threshold")
+
+    if offset + 4 > len(payload):
+        raise ValueError("truncated audit receipt participant count")
+    participant_count = int.from_bytes(payload[offset:offset + 4], "big")
+    offset += 4
+    participant_ids = []
+    for _ in range(participant_count):
+        participant_id, offset = _read_varint(
+            payload, offset, what="audit receipt participant id"
+        )
+        participant_ids.append(participant_id)
+
+    if offset + 4 > len(payload):
+        raise ValueError("truncated audit receipt verification share count")
+    share_count = int.from_bytes(payload[offset:offset + 4], "big")
+    offset += 4
+    verification_shares = []
+    for _ in range(share_count):
+        share, offset = _read_varint(
+            payload, offset, what="audit receipt verification share"
+        )
+        verification_shares.append(share)
+
+    audit_payload, offset = _read_audit_receipt_frame(
+        payload, offset, what="audit payload"
+    )
+    if offset != len(payload):
+        raise ValueError("trailing bytes after audit receipt")
+
+    receipt = AuditReceipt(
+        message=message,
+        audit=SigningAudit(payload=audit_payload),
+        participant_ids=tuple(participant_ids),
+        threshold=threshold,
+        field_prime=field_prime,
+        group_prime=group_prime,
+        generator=generator,
+        public_key=public_key,
+        verification_shares=tuple(verification_shares),
+    )
+    _check_audit_receipt_fields(
+        message,
+        receipt.audit,
+        receipt.participant_ids,
+        threshold,
+        field_prime,
+        group_prime,
+        generator,
+        public_key,
+        receipt.verification_shares,
+    )
+    if encode_audit_receipt(receipt) != payload:
+        raise ValueError("non-canonical audit receipt")
+    return receipt
 
 
 # ---------------------------------------------------------------------------
