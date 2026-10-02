@@ -189,6 +189,45 @@ assert verify_signature_receipt(restored)
 由 `verify_signature_receipt` 返回 `False`。篡改 message、公钥、群参数、`R`、`z`
 或签名者编号、或换用另一把密钥的凭证均验签失败。
 
+### 可独立流转的签名份额凭证
+
+单个签名者也可以把自己的第二轮份额（`z_i`）打包成自包含的
+`SignatureShareReceipt`：凭证冻结记录 `message`、聚合 `R`、递增的 `signer_ids`、
+`signer_id`、该签名者的验证份额 `Y_i`、联合公钥 `Y`、群参数 `q`、`p`、`g`，以及
+该签名者的第一轮承诺 `R_i` 和第二轮响应 `z_i`。接收方只凭凭证即可复核份额，完全
+不接触 DKG 结果、签名轮次、秘密份额、nonce 或多项式系数：
+
+```python
+from thresholdsign import (
+    create_signature_share_receipt, encode_signature_share_receipt,
+    decode_signature_share_receipt, verify_signature_share_receipt,
+)
+
+# share 是某个签名者的 SignatureShare，round_info 是 SigningRound，key 是 DKG 结果
+receipt = create_signature_share_receipt(message, share, round_info, key)
+assert verify_signature_share_receipt(receipt)    # 与 verify_signature_share 结论一致
+
+blob = encode_signature_share_receipt(receipt)    # bytes，无秘密、无状态、唯一编码
+restored = decode_signature_share_receipt(blob)
+assert encode_signature_share_receipt(restored) == blob
+assert verify_signature_share_receipt(restored)
+```
+
+`create_signature_share_receipt` 复核消息一致、签名者属于签名集合、`R_i` 承诺绑定、
+由轮次内容重推的聚合 `R` 与 Fiat-Shamir 挑战，并检查份额方程
+`g^z_i == R_i * Y_i^(c*lambda_i)`（`lambda_i` 为 `signer_id` 在 `signer_ids` 上的
+Lagrange 权重）；消息不匹配、上下文不一致或方程失败抛 `ValueError`，失败绝不返回
+凭证，类型错误抛 `TypeError`。凭证编码以标签
+`b"thresholdsign/signature-share-receipt/v1"` 开头，随后依次写 4 字节消息长度与
+消息字节（空 message 合法）、`q`、`p`、`g`、`Y`、聚合 `R`、4 字节签名者计数与各
+`signer_id`，最后写 `signer_id`、`Y_i`、`R_i`、`z_i`；整数编码规则与签名凭证相同。
+`decode_signature_share_receipt` 只恢复结构而不验证份额——坏标签、截断、尾随字节、
+非规范整数、重复或乱序签名者编号、`signer_id` 不属于集合、越界数字、非法群参数抛
+`ValueError`，非 bytes 入参抛 `TypeError`。`verify_signature_share_receipt` 只凭
+凭证重建挑战与 Lagrange 权重并复核份额方程；篡改 message、签名集合、聚合 `R`、
+`Y_i`、`R_i`、`z_i`、`Y` 或群参数均返回 `False`，类型错误抛 `TypeError`、结构非法
+抛 `ValueError`。
+
 ### 主动份额刷新
 
 签名密钥长期使用时，可用主动份额刷新（proactive refresh）在不改变联合秘密与
@@ -1446,6 +1485,35 @@ python3 -m thresholdsign
   `True`，篡改 message、公钥、群参数、`R`、`z`、签名者编号或换钥后的凭证返回
   `False`；非 `SignatureReceipt` 或字段类型错误抛 `TypeError`，越界或结构非法抛
   `ValueError`
+- `SignatureShareReceipt(message, R, signer_ids, signer_id, Y_i, Y, q, p, g, R_i, z_i)`
+  — 冻结数据类，可按位置构造、按值相等；可独立流转的单个签名份额凭证：`message`
+  为被签名字节串，`R` 为聚合非随机承诺，`signer_ids` 为严格递增的签名集合，
+  `signer_id` 为发布份额的签名者（属于该集合），`Y_i` 为其验证份额，`Y` 为联合
+  公钥，`q`/`p`/`g` 为群参数，`R_i`/`z_i` 为该签名者的第一轮承诺与第二轮响应；
+  不含 DKG 结果、秘密份额、nonce 或多项式系数
+- `create_signature_share_receipt(message, share, round_info, dkg_result)` — 复用
+  `verify_signature_share` 的完整边界：校验消息与轮次一致、签名者属于轮次/DKG、
+  `R_i` 承诺绑定、由轮次内容重推聚合 `R` 与挑战、份额方程
+  `g^z_i = R_i·Y_i^(c·λ_i)`；类型错误（布尔不视为整数）抛 `TypeError`，结构越界、
+  参数非法、上下文不一致或方程失败抛 `ValueError`，失败不返回回执
+- `encode_signature_share_receipt(receipt)` / `decode_signature_share_receipt(payload)` —
+  凭证的唯一字节编码：标签 `b"thresholdsign/signature-share-receipt/v1"` 后依次写
+  4 字节无符号大端消息长度与原始消息（空消息合法）、`q`、`p`、`g`、`Y`、聚合 `R`、
+  4 字节签名者计数与各 `signer_id`，最后写 `signer_id`、`Y_i`、`R_i`、`z_i`；
+  每个整数为 4 字节长度加最短无符号大端正文（零为单字节 `00`，正数无前导零）。
+  encode 对非 `SignatureShareReceipt` 或字段类型错误抛 `TypeError`，越界值、
+  `signer_id` 不属于集合、非法素数或群参数抛 `ValueError`，但不验证份额方程；
+  decode 对非 bytes 抛 `TypeError`，坏标签、截断、尾随字节、消息长度不符、
+  非规范整数、签名者编号为空/非正/重复/乱序、`signer_id` 不属于集合、越界
+  `R`/`R_i`/`Y_i`/`Y`/`z_i`、非法素数或群参数抛 `ValueError`，且只恢复结构不
+  验证份额。成功解码的凭证重编码逐字节等于输入
+- `verify_signature_share_receipt(receipt)` — 只凭凭证：从 `message`、`Y`、聚合
+  `R` 与 `signer_ids` 重建 Fiat-Shamir 挑战，取 `signer_id` 在 `signer_ids` 上的
+  Lagrange 权重并校验 `g^z_i = R_i·Y_i^(c·λ_i)`，同时确认 `signer_id` 属于集合且
+  `R_i`、`Y_i` 在指定阶子群；结论与 `verify_signature_share` 一致；有效凭证返回
+  `True`，替换 message、签名集合、聚合 `R`、`Y_i`、`R_i`、`z_i`、`Y` 或群参数的
+  凭证返回 `False`；非 `SignatureShareReceipt` 或字段类型错误抛 `TypeError`，
+  越界或结构非法抛 `ValueError`
 - `SigningAudit(payload)` — 冻结数据类，仅含 `payload` 一个字段；一次签名轮次第
   二轮校验的审计回执，自包含的字节编码中不含 nonce、秘密份额或系数
 - `create_audit(message, shares, round_info, dkg_result)` — `message` 必须与轮次
