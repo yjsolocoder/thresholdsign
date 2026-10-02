@@ -124,7 +124,12 @@ decode_hdscapa for transferring or persisting a whole archive as one
 self-delimiting byte string, and the
 cross-key form RHE / encode_rhe / decode_rhe / check_rhe that ties the
 two root signatures to a non-empty RotationChain so the old and new
-roots may be signed by different threshold keys, publicly
+roots may be signed by different threshold keys, plus RHEFault /
+RHEDiagnosis / diagnose_rhe, the stateless failure diagnoser that
+locates every failing anchor, link or authorization hop and,
+independently of the chain, each endpoint root signature that does not
+verify, in one deterministically ordered report without guessing at an
+attacker, publicly
 verifiable key-rotation authorization: Rotation / rotation_payload /
 verify_rotation, the persistent, multi-hop authorization chain
 RotationChain / verify_rotation_chain / encode_rotation_chain /
@@ -494,6 +499,9 @@ __all__ = [
     "encode_rhe",
     "decode_rhe",
     "check_rhe",
+    "RHEFault",
+    "RHEDiagnosis",
+    "diagnose_rhe",
     "Rotation",
     "rotation_payload",
     "verify_rotation",
@@ -26372,3 +26380,218 @@ def check_rhe(x: RHE) -> bool:
     ):
         result = False
     return result
+
+
+# ---------------------------------------------------------------------------
+# Stateless failure diagnosis for cross-key append proofs: a companion to
+# check_rhe that reports every failing rotation-chain hop and both endpoint
+# root signatures rather than a bare False. The rotation-chain checks reuse
+# the anchor / link / authorization semantics of diagnose_rotation_chain,
+# and the two endpoint signatures are always re-verified independently, so a
+# broken chain never masks a bad root signature. The diagnosis only locates
+# failing checks on public data; it never guesses at an attacker. No state
+# is kept and check_rhe's short-circuiting behaviour is left unchanged.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RHEFault:
+    """One failing check located while diagnosing a cross-key append proof.
+
+    The fields, in order, are ``check`` (the check that failed) and
+    ``index`` (the zero-based rotation-chain certificate position pinned to
+    the failure, or ``None``). The stable, never-confused ``check`` values
+    are:
+
+    - ``"anchor"`` — the rotation chain anchor differs from the first
+      certificate's ``old``; always at index 0.
+    - ``"link"`` — the certificate immediately before ``index`` has a
+      ``new`` that differs from the certificate at ``index``'s ``old``.
+    - ``"authorization"`` — the certificate at ``index`` is structurally
+      legal but :func:`verify_rotation` rejects its signature.
+    - ``"old-signature"`` — the old endpoint's root signature does not
+      verify on ``b"sh/r" || U64(old_total) || old_root`` under the first
+      certificate's group parameters and ``old`` key; ``index`` is None.
+    - ``"new-signature"`` — the new endpoint's root signature does not
+      verify on ``b"sh/r" || U64(n) || new_root`` under the last
+      certificate's group parameters and ``new`` key; ``index`` is None.
+
+    The dataclass is frozen, positionally constructible and compared by
+    value, and carries no network, storage or hidden state.
+    """
+
+    check: str
+    index: int | None
+
+
+@dataclass(frozen=True)
+class RHEDiagnosis:
+    """Every failing chain and endpoint-signature check of an :class:`RHE`.
+
+    ``valid`` is the verdict — ``True`` exactly when :func:`check_rhe`
+    returns ``True`` for the same proof — and ``faults`` the non-None tuple
+    of every :class:`RHEFault` found. The rotation-chain faults come first
+    in certificate order: walking the certificates by their zero-based
+    index, each position's positional fault (``"anchor"`` at index 0,
+    ``"link"`` elsewhere, when present) precedes that position's
+    ``"authorization"`` fault, and a position may carry both because each
+    certificate signature is checked independently of the linkage. After
+    the chain faults come ``"old-signature"`` and then ``"new-signature"``,
+    each at most once and both with ``index`` None; the endpoint root
+    signatures are re-verified independently of one another and of the
+    chain, so a broken chain never masks a bad root signature. No fault is
+    reported for an honest single- or multi-hop proof:
+    ``RHEDiagnosis(True, ())``.
+
+    Like a bare :class:`RHE`, the dataclass is frozen, positionally
+    constructible and compared by value, keeps no network, storage or
+    hidden state, and never infers an attacker from a mismatch.
+    """
+
+    valid: bool
+    faults: tuple[RHEFault, ...]
+
+
+def diagnose_rhe(x: RHE) -> RHEDiagnosis:
+    """Locate every failing chain hop and endpoint signature of an RHE.
+
+    The stateless companion of :func:`check_rhe`: the returned
+    :class:`RHEDiagnosis`'s ``valid`` field is always exactly the boolean
+    :func:`check_rhe` returns for the same proof, but a failing diagnosis
+    additionally pinpoints every check that does not hold instead of
+    folding them into one ``False``. The extension, rotation chain,
+    certificates and both signatures are structurally validated up front
+    with exactly the boundary of :func:`check_rhe`, and every signature's
+    integers are additionally range-checked against the endpoint group
+    they are actually verified under, so the checks below only ever run on
+    structurally legal values and deterministic input damage is never
+    dressed up as a diagnostic fault.
+
+    Scanning the certificates in chain order, three stable
+    ``check`` values can appear, with the same semantics as
+    :func:`diagnose_rotation_chain`:
+
+    - ``"anchor"`` — ``rotations.anchor`` differs from the first
+      certificate's ``old``; reported once at index 0.
+    - ``"link"`` — for an adjacent pair, ``certificates[i].new`` differs
+      from ``certificates[i + 1].old``; reported at index ``i + 1``.
+    - ``"authorization"`` — a structurally legal certificate whose
+      :func:`verify_rotation` signature check returns ``False``; reported
+      at the certificate's own index.
+
+    Afterwards the two endpoint root statements are rebuilt from
+    ``x.extension`` with the ordinary seal-history tree rules (the first
+    ``old_total`` leaves give the old root and all leaves the new one),
+    and the root signatures are checked independently even when the chain
+    is broken: ``"old-signature"`` is reported when ``x.old_sig`` fails on
+    ``b"sh/r" || U64(old_total) || old_root`` under the first
+    certificate's ``(q, p, g, old)``, and ``"new-signature"`` when
+    ``x.new_sig`` fails on ``b"sh/r" || U64(n) || new_root`` under the
+    last certificate's ``(q, p, g, new)``; both carry ``index`` None.
+
+    Every observable failure is collected in one pass: one bad hop or
+    endpoint never masks another, the same index may carry both a
+    positional and an ``"authorization"`` fault, and a tampered old or new
+    root signature, a swapped signature pair, a broken rotation
+    authorization or a severed key link each pinpoints its own failure.
+    With no failing check the fault tuple is empty and ``valid`` is
+    ``True``; otherwise ``valid`` is ``False``. Equal inputs always yield
+    equal, deterministically ordered reports.
+
+    A non-:class:`RHE` argument or wrong field types raise TypeError,
+    exactly as :func:`check_rhe`. An empty rotation chain, an
+    ``old_total`` of zero or at least the leaf count, an empty leaf set or
+    a leaf that is not exactly 32 bytes, a structurally illegal chain
+    certificate or aggregate signature, or a signature whose integers do
+    not fit the corresponding endpoint's parameters raise ValueError,
+    exactly as :func:`check_rhe` and :func:`verify_signature` do. A
+    structurally legal proof whose chain, links or signatures do not match
+    cryptographically returns a report normally and never raises. The
+    function is stateless, neither infers an attacker nor mutates
+    :func:`check_rhe`'s short-circuiting behaviour, and keeps no hidden
+    state.
+    """
+    _extension, rotations, old_sig, new_sig, old_total, leaves = (
+        _check_rhe_fields(x)
+    )
+
+    # Full structural validation of every certificate up front, along the
+    # same boundary diagnose_rotation_chain relies on, so the scan below
+    # only ever sees structurally legal certificates and a failing
+    # signature is a cryptographic mismatch, never malformed input.
+    for cert in rotations.certificates:
+        _check_rotation_fields(
+            cert.old, cert.new, cert.ids, cert.t, cert.q, cert.p, cert.g, cert.sig
+        )
+    first = rotations.certificates[0]
+    last = rotations.certificates[-1]
+    # Each root signature is range-checked against the endpoint group it
+    # is actually verified under; check_rhe reaches verify_signature only
+    # through a fully verified chain, whose bounds guarantee this.
+    _check_signature_against_endpoint(old_sig, first.q, first.p)
+    _check_signature_against_endpoint(new_sig, last.q, last.p)
+
+    faults: list[RHEFault] = []
+    for index, cert in enumerate(rotations.certificates):
+        if index == 0:
+            if rotations.anchor != cert.old:
+                faults.append(RHEFault("anchor", 0))
+        elif rotations.certificates[index - 1].new != cert.old:
+            faults.append(RHEFault("link", index))
+        if not verify_rotation(cert):
+            faults.append(RHEFault("authorization", index))
+
+    old_root = _history_extension_root(leaves[:old_total])
+    new_root = _history_extension_root(leaves)
+    old_message = (
+        SEAL_HISTORY_PROOF_ROOT_TAG + _history_proof_u64(old_total) + old_root
+    )
+    new_message = (
+        SEAL_HISTORY_PROOF_ROOT_TAG
+        + _history_proof_u64(len(leaves))
+        + new_root
+    )
+
+    if not verify_signature(
+        old_message,
+        old_sig,
+        first.old,
+        group_prime=first.p,
+        generator=first.g,
+        prime=first.q,
+    ):
+        faults.append(RHEFault("old-signature", None))
+    if not verify_signature(
+        new_message,
+        new_sig,
+        last.new,
+        group_prime=last.p,
+        generator=last.g,
+        prime=last.q,
+    ):
+        faults.append(RHEFault("new-signature", None))
+
+    return RHEDiagnosis(not faults, tuple(faults))
+
+
+def _check_signature_against_endpoint(
+    signature: AggregateSignature, prime: int, group_prime: int
+) -> None:
+    """Range-check a root signature against the endpoint group it is checked in.
+
+    Mirrors the integer bounds :func:`verify_signature` enforces once it
+    has been handed group parameters, so :func:`diagnose_rhe` rejects a
+    signature that does not fit its endpoint's parameters as malformed
+    input (ValueError) rather than letting :func:`verify_signature` raise
+    mid-diagnosis; the structural tuple and signer-id ordering checks were
+    already applied by :func:`_check_rhe_fields`.
+    """
+    for signer_id in signature.signer_ids:
+        if not 0 < signer_id < prime:
+            raise ValueError("signer ids must satisfy 1 <= id <= prime - 1")
+    if not 0 < signature.R < group_prime:
+        raise ValueError("signature R must satisfy 0 < R < group_prime")
+    if pow(signature.R, prime, group_prime) != 1:
+        raise ValueError("signature R must lie in the order-prime subgroup")
+    if not 0 <= signature.z < prime:
+        raise ValueError("signature z must satisfy 0 <= z < prime")
