@@ -278,6 +278,11 @@ __all__ = [
     "encode_signature_receipt",
     "decode_signature_receipt",
     "verify_signature_receipt",
+    "SignatureShareReceipt",
+    "create_signature_share_receipt",
+    "encode_signature_share_receipt",
+    "decode_signature_share_receipt",
+    "verify_signature_share_receipt",
     "SigningAudit",
     "create_audit",
     "check_audit",
@@ -4384,6 +4389,425 @@ def verify_signature_receipt(receipt: SignatureReceipt) -> bool:
         generator=receipt.generator,
         prime=receipt.field_prime,
     )
+
+
+# ---------------------------------------------------------------------------
+# Self-contained signature share receipts: an independently transferable
+# record of one signer's round-two share in one threshold Schnorr signing
+# round. A receiver verifies solely from the receipt — the message, the
+# round's aggregate R and signer set, the signer's id, verification share
+# Y_i, nonce commitment R_i and share z_i, the joint public key Y and the
+# group parameters — and never needs the DKG result, a secret share, a
+# nonce, a polynomial coefficient or any hidden state.
+# ---------------------------------------------------------------------------
+
+SIGNATURE_SHARE_RECEIPT_TAG = b"thresholdsign/signature-share-receipt/v1"
+
+
+@dataclass(frozen=True)
+class SignatureShareReceipt:
+    """A self-contained, independently verifiable receipt for one signature share.
+
+    ``message`` is the exact byte string that was signed; ``R`` is the
+    round's aggregate nonce commitment and ``signer_ids`` the strictly
+    increasing signing set whose ids the Fiat-Shamir challenge binds;
+    ``signer_id`` names the signer this receipt attests;
+    ``verification_share`` is that signer's public verification share
+    ``Y_i = g ** s_i mod group_prime``; ``public_key`` is the joint
+    verification key ``Y``; ``field_prime`` (``q``), ``group_prime`` (``p``)
+    and ``generator`` (``g``) are the group parameters a verifier needs to
+    reconstruct the challenge and the Lagrange weight; ``nonce_commitment``
+    is the signer's round-one value ``R_i`` and ``z`` its round-two share
+    ``z_i``. The dataclass is frozen, positionally constructible and
+    compared by value, and carries no secret share, nonce, polynomial
+    coefficient, network, storage or hidden state.
+    """
+
+    message: bytes
+    R: int
+    signer_ids: tuple[int, ...]
+    signer_id: int
+    verification_share: int
+    public_key: int
+    field_prime: int
+    group_prime: int
+    generator: int
+    nonce_commitment: int
+    z: int
+
+
+def _check_signature_share_receipt_fields(
+    message: object,
+    R: object,
+    signer_ids: object,
+    signer_id: object,
+    verification_share: object,
+    public_key: object,
+    field_prime: object,
+    group_prime: object,
+    generator: object,
+    nonce_commitment: object,
+    z: object,
+) -> None:
+    """Type- and structure-check every SignatureShareReceipt field.
+
+    The share equation itself is not checked here; whether ``z`` actually
+    matches the message, key and commitments is left to
+    :func:`verify_signature_share_receipt`.
+    """
+    if not isinstance(message, bytes):
+        raise TypeError("message must be bytes")
+    if not isinstance(signer_ids, tuple):
+        raise TypeError("signer_ids must be a tuple")
+    for member_id in signer_ids:
+        if not isinstance(member_id, int) or isinstance(member_id, bool):
+            raise TypeError("signer ids must be integers")
+    for name, value in (
+        ("R", R),
+        ("signer_id", signer_id),
+        ("verification_share", verification_share),
+        ("public_key", public_key),
+        ("field_prime", field_prime),
+        ("group_prime", group_prime),
+        ("generator", generator),
+        ("nonce_commitment", nonce_commitment),
+        ("z", z),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"{name} must be an integer")
+
+    _validate_feldman_parameters(field_prime, group_prime, generator)
+    if not signer_ids:
+        raise ValueError("at least one signer is required")
+    for member_id in signer_ids:
+        if not 0 < member_id < field_prime:
+            raise ValueError("signer ids must satisfy 1 <= id <= field_prime - 1")
+    if any(
+        signer_ids[index] >= signer_ids[index + 1]
+        for index in range(len(signer_ids) - 1)
+    ):
+        raise ValueError("signer ids must be strictly increasing and unique")
+    if not 0 < signer_id < field_prime:
+        raise ValueError("signer_id must satisfy 1 <= signer_id <= field_prime - 1")
+    if not 0 < R < group_prime:
+        raise ValueError("R must satisfy 0 < R < group_prime")
+    if pow(R, field_prime, group_prime) != 1:
+        raise ValueError("R must lie in the order-field_prime subgroup")
+    for name, element in (
+        ("verification_share", verification_share),
+        ("public_key", public_key),
+    ):
+        if not 0 < element < group_prime:
+            raise ValueError(f"{name} must satisfy 0 < {name} < group_prime")
+        if pow(element, field_prime, group_prime) != 1:
+            raise ValueError(f"{name} must lie in the order-field_prime subgroup")
+    if not 1 < nonce_commitment < group_prime:
+        raise ValueError("nonce_commitment must satisfy 1 < R_i < group_prime")
+    if pow(nonce_commitment, field_prime, group_prime) != 1:
+        raise ValueError("nonce_commitment must lie in the order-field_prime subgroup")
+    if not 0 <= z < field_prime:
+        raise ValueError("z must satisfy 0 <= z < field_prime")
+
+
+def create_signature_share_receipt(
+    message: bytes,
+    share: SignatureShare,
+    round_info: SigningRound,
+    dkg_result: SigningDKGResult,
+) -> SignatureShareReceipt:
+    """Package one verified signature share into a self-contained receipt.
+
+    The receipt binds the message, the round's aggregate ``R`` and signer
+    set, the signer's id, its public verification share ``Y_i`` and
+    round-one commitment ``R_i``, its share ``z_i``, the joint public key
+    ``Y`` and the group parameters — everything
+    :func:`verify_signature_share_receipt` needs, and nothing else: no
+    secret share, nonce or polynomial coefficient.
+
+    ``message`` must be exactly the round's message; the round's ``R`` and
+    challenge are re-derived from its contents, the share's
+    ``nonce_commitment`` must repeat the signer's published ``R_i`` and the
+    share equation ``g ** z_i == R_i * Y_i ** (c * lambda_i)`` must hold,
+    exactly as in :func:`verify_signature_share`. Any inconsistency or
+    equation failure raises ValueError and no receipt is returned. Wrong
+    argument types raise TypeError (a Python ``bool`` is not accepted as an
+    integer); an illegal DKG structure, group setup, round, identifier or
+    numeric range raises ValueError.
+    """
+    if not isinstance(message, bytes):
+        raise TypeError("message must be bytes")
+    if not isinstance(share, SignatureShare):
+        raise TypeError("share must be a SignatureShare instance")
+    if not isinstance(share.signer_id, int) or isinstance(share.signer_id, bool):
+        raise TypeError("share.signer_id must be an integer")
+    if not isinstance(share.z, int) or isinstance(share.z, bool):
+        raise TypeError("share.z must be an integer")
+    if not isinstance(share.nonce_commitment, int) or isinstance(share.nonce_commitment, bool):
+        raise TypeError("share.nonce_commitment must be an integer")
+    result, public_key, field_prime, group_prime, generator = _check_signing_setup(
+        dkg_result
+    )
+    _check_signing_dkg_structure(dkg_result)
+    _validate_signing_round(
+        round_info,
+        field_prime,
+        group_prime,
+        result.participant_ids,
+        len(result.commitment.values),
+    )
+
+    if message != round_info.message:
+        raise ValueError("message must match the signing round")
+    if not 0 < share.signer_id < field_prime:
+        raise ValueError("signer id must satisfy 1 <= id <= field_prime - 1")
+    if not 0 <= share.z < field_prime:
+        raise ValueError("signature share z must satisfy 0 <= z < field_prime")
+    if not 1 < share.nonce_commitment < group_prime:
+        raise ValueError("nonce commitment must satisfy 1 < R_i < group_prime")
+    if share.signer_id not in round_info.signer_ids:
+        raise ValueError("signer must take part in the signing round")
+
+    R = 1
+    for commitment in round_info.nonce_commitments:
+        R = R * commitment.commitment % group_prime
+    if R != round_info.R:
+        raise ValueError("round R does not match its nonce commitments")
+    challenge = schnorr_challenge(
+        round_info.message,
+        public_key,
+        R,
+        round_info.signer_ids,
+        field_prime=field_prime,
+        group_prime=group_prime,
+    )
+    if challenge != round_info.challenge:
+        raise ValueError("round challenge does not match its contents")
+
+    index = round_info.signer_ids.index(share.signer_id)
+    R_i = round_info.nonce_commitments[index].commitment
+    if share.nonce_commitment != R_i:
+        raise ValueError("share nonce commitment does not match the round")
+
+    weight = _lagrange_weight(share.signer_id, round_info.signer_ids, field_prime)
+    share_index = result.participant_ids.index(share.signer_id)
+    Y_i = dkg_result.verification_shares[share_index]
+    expected = (
+        R_i * pow(Y_i, challenge * weight % field_prime, group_prime) % group_prime
+    )
+    if pow(generator, share.z, group_prime) != expected:
+        raise ValueError("signature share equation does not hold")
+
+    return SignatureShareReceipt(
+        message=message,
+        R=round_info.R,
+        signer_ids=round_info.signer_ids,
+        signer_id=share.signer_id,
+        verification_share=Y_i,
+        public_key=public_key,
+        field_prime=field_prime,
+        group_prime=group_prime,
+        generator=generator,
+        nonce_commitment=R_i,
+        z=share.z,
+    )
+
+
+def encode_signature_share_receipt(receipt: SignatureShareReceipt) -> bytes:
+    """Canonically encode a signature share receipt for transport or persistence.
+
+    The encoding starts with the tag
+    ``b"thresholdsign/signature-share-receipt/v1"``, followed by a 4-byte
+    unsigned big-endian message length and the raw message bytes, then
+    ``field_prime``, ``group_prime``, ``generator``, ``public_key``, ``R``,
+    ``verification_share``, ``nonce_commitment``, ``z`` and ``signer_id``,
+    and finally a 4-byte count plus one entry per id of ``signer_ids``.
+    Every integer is a 4-byte unsigned big-endian length followed by its
+    shortest unsigned big-endian value: zero is the single body byte ``00``
+    and positive values carry no leading zero. The output for a given
+    receipt is unique — a decoded receipt re-encodes to exactly the same
+    bytes — and it contains no secret share, nonce or hidden state.
+
+    Only a structurally valid :class:`SignatureShareReceipt` is accepted:
+    wrong field types raise TypeError (``bool`` is not an integer) and an
+    illegal group setup, key, commitment, identifier or numeric range
+    raises ValueError, but the share equation is not re-checked — a
+    structurally legal receipt whose share does not match still encodes,
+    and :func:`verify_signature_share_receipt` remains the way to test
+    validity.
+    """
+    if not isinstance(receipt, SignatureShareReceipt):
+        raise TypeError("receipt must be a SignatureShareReceipt instance")
+    _check_signature_share_receipt_fields(
+        receipt.message,
+        receipt.R,
+        receipt.signer_ids,
+        receipt.signer_id,
+        receipt.verification_share,
+        receipt.public_key,
+        receipt.field_prime,
+        receipt.group_prime,
+        receipt.generator,
+        receipt.nonce_commitment,
+        receipt.z,
+    )
+
+    buffer = bytearray(SIGNATURE_SHARE_RECEIPT_TAG)
+    buffer += len(receipt.message).to_bytes(4, "big", signed=False)
+    buffer += receipt.message
+    for value in (
+        receipt.field_prime,
+        receipt.group_prime,
+        receipt.generator,
+        receipt.public_key,
+        receipt.R,
+        receipt.verification_share,
+        receipt.nonce_commitment,
+        receipt.z,
+        receipt.signer_id,
+    ):
+        buffer += _encode_varint(value)
+    buffer += len(receipt.signer_ids).to_bytes(4, "big", signed=False)
+    for member_id in receipt.signer_ids:
+        buffer += _encode_varint(member_id)
+    return bytes(buffer)
+
+
+def decode_signature_share_receipt(payload: bytes) -> SignatureShareReceipt:
+    """Decode the canonical encoding produced by :func:`encode_signature_share_receipt`.
+
+    Accepts only the single canonical form: the tag
+    ``b"thresholdsign/signature-share-receipt/v1"``, a 4-byte message length
+    followed by exactly that many message bytes, the length-prefixed
+    ``field_prime``, ``group_prime``, ``generator``, ``public_key``, ``R``,
+    ``verification_share``, ``nonce_commitment``, ``z`` and ``signer_id``,
+    and a 4-byte count followed by one length-prefixed signer id each. A
+    non-bytes argument raises TypeError; a wrong or missing tag, truncation,
+    trailing bytes, a non-canonical integer (leading zero or over-long
+    length), a length that does not match the stream, a bad message length,
+    empty, non-positive, duplicate or out-of-order signer ids, an
+    out-of-range ``R``, ``z``, key, commitment or id, or an illegal prime
+    or group parameter raises ValueError. A successfully decoded receipt
+    re-encodes to exactly the input bytes.
+
+    Decoding validates structure only, never the share: a receipt whose
+    ``z_i`` does not match its message, key or commitments is returned
+    normally, and :func:`verify_signature_share_receipt` reports it as
+    ``False``.
+    """
+    if not isinstance(payload, bytes):
+        raise TypeError("payload must be bytes")
+    if not payload.startswith(SIGNATURE_SHARE_RECEIPT_TAG):
+        raise ValueError("bad signature share receipt tag")
+    offset = len(SIGNATURE_SHARE_RECEIPT_TAG)
+
+    if offset + 4 > len(payload):
+        raise ValueError("truncated signature share receipt message length")
+    message_length = int.from_bytes(payload[offset:offset + 4], "big")
+    offset += 4
+    if offset + message_length > len(payload):
+        raise ValueError("truncated signature share receipt message")
+    message = payload[offset:offset + message_length]
+    offset += message_length
+
+    field_prime, offset = _read_varint(payload, offset, what="field prime")
+    group_prime, offset = _read_varint(payload, offset, what="group prime")
+    generator, offset = _read_varint(payload, offset, what="generator")
+    public_key, offset = _read_varint(payload, offset, what="public key")
+    R, offset = _read_varint(payload, offset, what="aggregate R")
+    verification_share, offset = _read_varint(payload, offset, what="verification share")
+    nonce_commitment, offset = _read_varint(payload, offset, what="nonce commitment")
+    z, offset = _read_varint(payload, offset, what="signature share z")
+    signer_id, offset = _read_varint(payload, offset, what="signer id")
+    signer_ids, offset = _read_id_list(payload, offset, name="signer ids")
+    if offset != len(payload):
+        raise ValueError("trailing bytes after signature share receipt")
+
+    receipt = SignatureShareReceipt(
+        message=message,
+        R=R,
+        signer_ids=signer_ids,
+        signer_id=signer_id,
+        verification_share=verification_share,
+        public_key=public_key,
+        field_prime=field_prime,
+        group_prime=group_prime,
+        generator=generator,
+        nonce_commitment=nonce_commitment,
+        z=z,
+    )
+    _check_signature_share_receipt_fields(
+        message,
+        R,
+        signer_ids,
+        signer_id,
+        verification_share,
+        public_key,
+        field_prime,
+        group_prime,
+        generator,
+        nonce_commitment,
+        z,
+    )
+    if encode_signature_share_receipt(receipt) != payload:
+        raise ValueError("non-canonical signature share receipt")
+    return receipt
+
+
+def verify_signature_share_receipt(receipt: SignatureShareReceipt) -> bool:
+    """Verify a signature share receipt solely from its own contents.
+
+    Reconstructs the Fiat-Shamir challenge exactly as
+    :func:`verify_signature_share` does — from the tag, ``SHA256(message)``,
+    ``public_key``, ``R`` and the L-byte big-endian encodings of
+    ``signer_ids`` with ``L = ceil(group_prime.bit_length() / 8)`` — takes
+    the Lagrange weight ``lambda_i`` of ``signer_id`` at zero over
+    ``signer_ids`` and checks
+    ``g ** z_i == R_i * Y_i ** (c * lambda_i)`` modulo ``group_prime``.
+    Returns ``True`` exactly on a match; a receipt whose message, signer
+    set, ``R``, ``Y_i``, ``R_i``, ``z_i``, ``Y`` or group parameters were
+    tampered with, or whose ``signer_id`` is not part of ``signer_ids``,
+    returns ``False``. A non-:class:`SignatureShareReceipt` argument, or a
+    field of the wrong type (``bool`` is not an integer), raises TypeError;
+    an out-of-range value or other structural defect raises ValueError.
+    """
+    if not isinstance(receipt, SignatureShareReceipt):
+        raise TypeError("receipt must be a SignatureShareReceipt instance")
+    _check_signature_share_receipt_fields(
+        receipt.message,
+        receipt.R,
+        receipt.signer_ids,
+        receipt.signer_id,
+        receipt.verification_share,
+        receipt.public_key,
+        receipt.field_prime,
+        receipt.group_prime,
+        receipt.generator,
+        receipt.nonce_commitment,
+        receipt.z,
+    )
+    if receipt.signer_id not in receipt.signer_ids:
+        return False
+    challenge = schnorr_challenge(
+        receipt.message,
+        receipt.public_key,
+        receipt.R,
+        receipt.signer_ids,
+        field_prime=receipt.field_prime,
+        group_prime=receipt.group_prime,
+    )
+    weight = _lagrange_weight(
+        receipt.signer_id, receipt.signer_ids, receipt.field_prime
+    )
+    expected = (
+        receipt.nonce_commitment
+        * pow(
+            receipt.verification_share,
+            challenge * weight % receipt.field_prime,
+            receipt.group_prime,
+        )
+        % receipt.group_prime
+    )
+    return pow(receipt.generator, receipt.z, receipt.group_prime) == expected
 
 
 # ---------------------------------------------------------------------------
