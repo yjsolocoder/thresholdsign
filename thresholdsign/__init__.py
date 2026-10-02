@@ -122,7 +122,11 @@ roots may be signed by different threshold keys, publicly
 verifiable key-rotation authorization: Rotation / rotation_payload /
 verify_rotation, the persistent, multi-hop authorization chain
 RotationChain / verify_rotation_chain / encode_rotation_chain /
-decode_rotation_chain, and the stateless, threshold-Schnorr-authenticated
+decode_rotation_chain, plus RotationFault / RotationChainDiagnosis /
+diagnose_rotation_chain, the stateless failure diagnoser that locates
+every failing anchor, link or authorization hop in chain order without
+guessing at the cryptographic cause behind a mismatch, and the stateless,
+threshold-Schnorr-authenticated
 audit chain: AuditChain / audit_chain_payload / verify_audit_chain.
 Merkle inclusion proofs over a chain's records: AuditProof / make_proof /
 check_proof, the compact multi-record proofs AuditMultiProof /
@@ -488,6 +492,9 @@ __all__ = [
     "verify_rotation_chain",
     "encode_rotation_chain",
     "decode_rotation_chain",
+    "RotationFault",
+    "RotationChainDiagnosis",
+    "diagnose_rotation_chain",
     "AuditChain",
     "audit_chain_payload",
     "verify_audit_chain",
@@ -5610,6 +5617,133 @@ def decode_rotation_chain(payload: bytes) -> RotationChain:
     if encode_rotation_chain(chain) != payload:
         raise ValueError("non-canonical rotation chain")
     return chain
+
+
+# ---------------------------------------------------------------------------
+# Stateless failure diagnosis for rotation chains: a companion to
+# verify_rotation_chain that reports every hop where the anchor binding, a
+# new/old link or an authorization signature fails, rather than a bare
+# False. The diagnosis only locates failing checks; it never guesses at the
+# cryptographic cause behind a mismatch. No state is kept and
+# verify_rotation_chain stays unchanged.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RotationFault:
+    """One failing check at one position of a diagnosed rotation chain.
+
+    The fields, in order, are ``index`` (the zero-based certificate position
+    the failure is pinned to) and ``check`` (the check that failed:
+    ``"anchor"`` when the chain anchor differs from the first certificate's
+    ``old`` — always at index 0; ``"link"`` when the certificate immediately
+    before this position has a ``new`` that differs from this certificate's
+    ``old``; or ``"authorization"`` when this position's certificate is
+    structurally legal but :func:`verify_rotation` rejects its signature).
+    The check values are stable and never confused. The dataclass is frozen,
+    positionally constructible and compared by value, and carries no
+    network, storage or hidden state.
+    """
+
+    index: int
+    check: str
+
+
+@dataclass(frozen=True)
+class RotationChainDiagnosis:
+    """Every failing anchor, link and authorization check of a rotation chain.
+
+    ``valid`` is the verdict — ``True`` exactly when
+    :func:`verify_rotation_chain` returns ``True`` for the same chain — and
+    ``faults`` the non-None tuple of every :class:`RotationFault` found, in
+    chain order: faults are ordered by their zero-based certificate index,
+    and at one index the positional fault (``"anchor"`` at index 0,
+    ``"link"`` elsewhere, when present) precedes the ``"authorization"``
+    fault. A position can carry both, since the signature is checked
+    independently of the linkage. No fault is reported for an honest chain:
+    ``RotationChainDiagnosis(True, ())``.
+
+    Unlike a bare boolean, the report pinpoints at which hop the trusted
+    anchor stops matching a certificate ``old``, where a ``new`` fails to
+    meet the next ``old`` and which certificates carry signatures their
+    ``old`` keys do not authorize; it never guesses at the cryptographic
+    cause behind a mismatch. Like :class:`RotationChain`, the dataclass is
+    frozen, positionally constructible and compared by value, and keeps no
+    network, storage or hidden state.
+    """
+
+    valid: bool
+    faults: tuple[RotationFault, ...]
+
+
+def diagnose_rotation_chain(chain: RotationChain) -> RotationChainDiagnosis:
+    """Locate every failing anchor, link and authorization hop of a chain.
+
+    The stateless companion of :func:`verify_rotation_chain`: the returned
+    :class:`RotationChainDiagnosis`'s ``valid`` field is always exactly the
+    boolean that verifier returns for the same chain, but a failing
+    diagnosis additionally pinpoints, in chain order, every check that does
+    not hold instead of folding them into one ``False``. The chain container
+    and every certificate are structurally validated up front with exactly
+    the boundary of :func:`verify_rotation_chain`, so the scan below only
+    ever runs on structurally legal chains and certificates; deterministic
+    input damage is never dressed up as a diagnostic fault.
+
+    Scanning the certificates in chain order, three stable, never-confused
+    ``check`` values can appear:
+
+    - ``"anchor"`` — ``chain.anchor`` differs from the first certificate's
+      ``old``; reported once at index 0.
+    - ``"link"`` — for an adjacent pair, ``certificates[i].new`` differs
+      from ``certificates[i + 1].old``; reported at index ``i + 1``.
+    - ``"authorization"`` — a structurally legal certificate whose
+      :func:`verify_rotation` signature check returns ``False``; reported at
+      the certificate's own index.
+
+    Every position is examined even after an earlier cryptographic
+    mismatch, so one bad hop never masks another, and the same index may
+    carry both a positional and an ``"authorization"`` fault. Faults are
+    ordered by index; at one index the ``"anchor"`` or ``"link"`` fault
+    precedes the ``"authorization"`` fault. With no failing check the fault
+    tuple is empty and ``valid`` is ``True``; otherwise ``valid`` is
+    ``False``. Equal inputs always yield equal, deterministically ordered
+    reports.
+
+    A non-:class:`RotationChain` argument raises TypeError; a non-integer or
+    boolean anchor, a non-tuple certificate sequence or a
+    non-:class:`Rotation` element raise TypeError, exactly as
+    :func:`verify_rotation_chain`. An empty chain, or a certificate with an
+    illegal group setup, public key, member set, threshold or
+    :class:`AggregateSignature` structure raises ValueError, propagated
+    unchanged from :func:`rotation_payload` and :func:`verify_rotation`. A
+    structurally legal chain whose anchor, links or signatures do not match
+    cryptographically returns a report normally and never raises. The
+    function is stateless and keeps no hidden state.
+    """
+    if not isinstance(chain, RotationChain):
+        raise TypeError("chain must be a RotationChain instance")
+    _check_rotation_chain_fields(chain.anchor, chain.certificates)
+
+    # Full structural validation of every certificate up front, along the
+    # same boundary verify_rotation_chain relies on, so the scan below only
+    # ever sees structurally legal certificates and a failing signature is
+    # a cryptographic mismatch, never malformed input.
+    for cert in chain.certificates:
+        _check_rotation_fields(
+            cert.old, cert.new, cert.ids, cert.t, cert.q, cert.p, cert.g, cert.sig
+        )
+
+    faults: list[RotationFault] = []
+    for index, cert in enumerate(chain.certificates):
+        if index == 0:
+            if chain.anchor != cert.old:
+                faults.append(RotationFault(0, "anchor"))
+        elif chain.certificates[index - 1].new != cert.old:
+            faults.append(RotationFault(index, "link"))
+        if not verify_rotation(cert):
+            faults.append(RotationFault(index, "authorization"))
+
+    return RotationChainDiagnosis(not faults, tuple(faults))
 
 
 # ---------------------------------------------------------------------------
