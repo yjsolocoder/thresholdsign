@@ -1081,6 +1081,170 @@ class RecoveryReport:
     rejected: tuple[Share, ...]
 
 
+def _poly_trim(poly: Sequence[int], prime: int) -> list[int]:
+    """Drop leading zero coefficients; the zero polynomial is ``[0]``."""
+    result = [value % prime for value in poly]
+    while len(result) > 1 and result[-1] == 0:
+        result.pop()
+    return result
+
+
+def _poly_multiply(left: Sequence[int], right: Sequence[int], prime: int) -> list[int]:
+    """Convolution product of two coefficient tuples modulo ``prime``."""
+    if not left or not right:
+        return [0]
+    result = [0] * (len(left) + len(right) - 1)
+    for i, a in enumerate(left):
+        if a == 0:
+            continue
+        for j, b in enumerate(right):
+            result[i + j] = (result[i + j] + a * b) % prime
+    return _poly_trim(result, prime)
+
+
+def _poly_divmod(
+    dividend: Sequence[int], divisor: Sequence[int], prime: int
+) -> tuple[list[int], list[int]]:
+    """Polynomial long division; returns ``(quotient, remainder)`` mod ``prime``."""
+    divisor = _poly_trim(divisor, prime)
+    remainder = [value % prime for value in dividend]
+    quotient = [0] * max(1, len(remainder) - len(divisor) + 1)
+    inv_leading = pow(divisor[-1], -1, prime)
+    for position in range(len(quotient) - 1, -1, -1):
+        shift = position + len(divisor) - 1
+        if shift >= len(remainder) or remainder[shift] == 0:
+            continue
+        factor = remainder[shift] * inv_leading % prime
+        quotient[position] = factor
+        for j in range(len(divisor)):
+            remainder[position + j] = (
+                remainder[position + j] - factor * divisor[j]
+            ) % prime
+    return quotient, _poly_trim(remainder, prime)
+
+
+def _poly_eea_update(
+    quotient: Sequence[int],
+    current: Sequence[int],
+    previous: Sequence[int],
+    prime: int,
+) -> list[int]:
+    """EEA coefficient recurrence ``previous - quotient * current``."""
+    product = _poly_multiply(quotient, current, prime)
+    width = max(len(product), len(previous))
+    result = [0] * width
+    for j in range(width):
+        total = 0
+        if j < len(previous):
+            total += previous[j]
+        if j < len(product):
+            total -= product[j]
+        result[j] = total % prime
+    return _poly_trim(result, prime)
+
+
+def _product_polynomial(roots: Sequence[int], prime: int) -> list[int]:
+    """Monic polynomial with a root at every given coordinate: ``prod(x - r)``."""
+    product = [1]
+    for root in roots:
+        product = _poly_multiply(product, ((-root) % prime, 1), prime)
+    return product
+
+
+def _newton_interpolate(ordered: Sequence[Share], prime: int) -> list[int]:
+    """Interpolating polynomial through all shares in ascending ``x`` order.
+
+    Builds the Newton form in O(n^2) field operations and converts to
+    ascending monomial coefficients. The result is unique when the ``x``
+    coordinates are distinct.
+    """
+    # Divided differences: the value carried past each point is its Newton
+    # coefficient. ``row[order]`` stores the previous iteration's value at the
+    # needed depth, and the x-difference is invertible since coordinates are
+    # distinct.
+    diagonal: list[int] = []
+    row: list[int] = []
+    for index, share in enumerate(ordered):
+        previous = share.y % prime
+        for order in range(index):
+            # previous: f[x_{index-order}, ..., x_index]; row[order]:
+            # f[x_{index-order-1}, ..., x_{index-1}] from the prior point.
+            current = (
+                (previous - row[order])
+                * pow(share.x - ordered[index - order - 1].x, -1, prime)
+            ) % prime
+            row[order] = previous
+            previous = current
+        row.append(previous)
+        diagonal.append(previous)
+
+    # Expand sum_k diagonal[k] * prod_{j<k} (x - x_j) into monomial form.
+    coefficients = [0] * len(ordered)
+    basis: list[int] = [1]
+    for position, coefficient in enumerate(diagonal):
+        if coefficient:
+            for j, basis_value in enumerate(basis):
+                coefficients[j] = (
+                    coefficients[j] + coefficient * basis_value
+                ) % prime
+        if position < len(ordered) - 1:
+            basis = _poly_multiply(
+                basis, ((-ordered[position].x) % prime, 1), prime
+            )
+    return _poly_trim(coefficients, prime)
+
+
+def _gao_decode(
+    ordered: Sequence[Share], threshold: int, prime: int
+) -> tuple[list[int], int] | None:
+    """Gao's GCD-based Reed-Solomon decoder.
+
+    Returns ``(coefficients, agreement_count)`` for a degree-below-threshold
+    polynomial the decoder produces, or ``None`` when no codeword lies inside
+    the correction radius ``2 * errors <= n - threshold``. A returned
+    polynomial is not trusted as the global decision here; the caller
+    re-derives uniqueness from the agreement count.
+    """
+    n = len(ordered)
+    # G(x) = product over every share coordinate; E(x) fits all n points.
+    g_poly = _product_polynomial([share.x for share in ordered], prime)
+    e_poly = _newton_interpolate(ordered, prime)
+
+    # Extended Euclidean algorithm on (G, E). Stop at the first remainder
+    # with 2*deg(R) < n + threshold; its coefficient row satisfies
+    # R = Q*E - T*G with deg(Q) <= (n - threshold) / 2.
+    r_previous, r_current = g_poly, _poly_trim(e_poly, prime)
+    q_previous, q_current = [0], [1]
+    while 2 * (len(_poly_trim(r_current, prime)) - 1) >= n + threshold:
+        quotient, remainder = _poly_divmod(r_previous, r_current, prime)
+        r_previous, r_current = r_current, remainder
+        q_previous, q_current = (
+            q_current,
+            _poly_eea_update(quotient, q_current, q_previous, prime),
+        )
+
+    q_poly = _poly_trim(q_current, prime)
+    r_poly = _poly_trim(r_current, prime)
+    if len(q_poly) == 1 and q_poly[0] == 0:
+        return None
+
+    # The row yields the message polynomial only when Q divides R exactly;
+    # F = R / Q must then have degree below the threshold.
+    f_candidate, leftover = _poly_divmod(r_poly, q_poly, prime)
+    if not (len(leftover) == 1 and leftover[0] == 0):
+        return None
+    f_candidate = _poly_trim(f_candidate, prime)
+    if len(f_candidate) - 1 >= threshold:
+        return None
+
+    agreement = sum(
+        1
+        for share in ordered
+        if evaluate_polynomial(f_candidate, share.x, prime=prime) == share.y
+    )
+    return f_candidate, agreement
+
+
 def _interpolate_coefficients(points: Sequence[Share], prime: int) -> tuple[int, ...]:
     """Interpolate the unique degree-<len(points) polynomial at ``points``.
 
@@ -1169,30 +1333,27 @@ def recover_secret(
         if position > 0 and share.x == ordered[position - 1].x:
             raise ValueError("duplicate share index")
 
-    # Every degree-<threshold candidate that can matter is the interpolant of
-    # some threshold-sized subset; distinct interpolants are deduplicated by
-    # their coefficient tuples. Evaluating each candidate at every supplied
-    # point counts the shares it agrees with.
-    best_coefficients: tuple[int, ...] | None = None
-    best_count = 0
-    tied = False
-    seen: set[tuple[int, ...]] = set()
-    for combo in combinations(ordered, threshold):
-        coefficients = _interpolate_coefficients(combo, prime)
-        if coefficients in seen:
-            continue
-        seen.add(coefficients)
-        count = sum(
-            1
-            for share in ordered
-            if evaluate_polynomial(coefficients, share.x, prime=prime) == share.y
-        )
-        if count > best_count:
-            best_count = count
-            best_coefficients = coefficients
+    # Fast path: the Gao GCD decoder finds, in polynomial field work, a
+    # degree-<threshold> polynomial that fits every share within the
+    # correction radius 2e <= n - threshold. When it returns a polynomial
+    # agreeing with c shares where 2(n - c) <= n - threshold, it is the
+    # unique global best: any other degree-<threshold> polynomial shares at
+    # most t - 1 of those c points, hence fits at most
+    # (t - 1) + (n - c) < c points.
+    decoded = _gao_decode(ordered, threshold, prime)
+    if decoded is not None:
+        best_coefficients, best_count = decoded
+        errors = len(ordered) - best_count
+        if 2 * errors <= len(ordered) - threshold:
             tied = False
-        elif count == best_count and coefficients != best_coefficients:
-            tied = True
+        else:
+            best_coefficients, best_count, tied = _exhaustive_best(
+                ordered, threshold, prime, best_coefficients, best_count
+            )
+    else:
+        best_coefficients, best_count, tied = _exhaustive_best(
+            ordered, threshold, prime
+        )
 
     if best_count < threshold:
         raise ValueError(
@@ -1214,6 +1375,48 @@ def recover_secret(
         if evaluate_polynomial(best_coefficients, share.x, prime=prime) != share.y
     )
     return RecoveryReport(secret, accepted, rejected)
+
+
+def _exhaustive_best(
+    ordered: Sequence[Share],
+    threshold: int,
+    prime: int,
+    seed_coefficients: Sequence[int] | None = None,
+    seed_count: int = 0,
+) -> tuple[list[int] | None, int, bool]:
+    """Global decision by enumerating threshold-sized subset interpolants.
+
+    Used only outside the correction radius, where the instance is small
+    relative to the gap the fast path certifies. Candidates stream one at a
+    time, so memory stays bounded in the number of shares rather than the
+    number of combinations; duplicate interpolants are recognised against
+    the incumbent best polynomial only.
+    """
+    best_coefficients: list[int] | None = None
+    if seed_coefficients is not None:
+        # Enumerated interpolants always carry exactly ``threshold`` entries;
+        # pad a trimmed seed so identical polynomials compare equal.
+        best_coefficients = list(seed_coefficients) + [0] * max(
+            0, threshold - len(seed_coefficients)
+        )
+    best_count = seed_count
+    tied = False
+    for combo in combinations(ordered, threshold):
+        coefficients = list(_interpolate_coefficients(combo, prime))
+        if best_coefficients is not None and coefficients == best_coefficients:
+            continue
+        count = sum(
+            1
+            for share in ordered
+            if evaluate_polynomial(coefficients, share.x, prime=prime) == share.y
+        )
+        if count > best_count:
+            best_count = count
+            best_coefficients = coefficients
+            tied = False
+        elif count == best_count:
+            tied = True
+    return best_coefficients, best_count, tied
 
 
 @dataclass(frozen=True)

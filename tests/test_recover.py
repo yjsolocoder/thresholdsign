@@ -5,6 +5,7 @@ from thresholdsign import (
     DEFAULT_PRIME,
     RecoveryReport,
     Share,
+    evaluate_polynomial,
     reconstruct_secret,
     recover_secret,
     split_secret,
@@ -115,6 +116,158 @@ class RecoverHappyPathTest(unittest.TestCase):
         report = recover_secret(tamper(shares, 3, prime=DEFAULT_PRIME), 2)
         self.assertEqual(report.secret, SECRET)
         self.assertEqual([share.x for share in report.rejected], [3])
+
+
+LARGE_PRIME = 2017
+LARGE_N = 64
+LARGE_T = 32
+LARGE_CAPACITY = (LARGE_N - LARGE_T) // 2  # 16
+
+
+def _large_coefficients():
+    # Deterministic dense degree-(t-1) coefficient vector over GF(2017).
+    value = 1
+    coefficients = []
+    for _ in range(LARGE_T):
+        value = (value * 45 + 7) % LARGE_PRIME
+        coefficients.append(value)
+    return coefficients
+
+
+def _large_shares(coefficients):
+    return [
+        Share(x, evaluate_polynomial(coefficients, x, prime=LARGE_PRIME))
+        for x in range(1, LARGE_N + 1)
+    ]
+
+
+def _damage(shares, positions, *, prime=LARGE_PRIME):
+    damaged = list(shares)
+    for position in positions:
+        damaged[position] = Share(
+            damaged[position].x, (damaged[position].y + 1009) % prime
+        )
+    return damaged
+
+
+class PolynomialRecoveryScaleTest(unittest.TestCase):
+    # Enumerating every C(64, 32) subset cannot finish at all, so merely
+    # completing these cases pins recovery to polynomial field work.
+
+    def test_zero_errors_dense_polynomial(self):
+        coefficients = _large_coefficients()
+        report = recover_secret(_large_shares(coefficients), LARGE_T, prime=LARGE_PRIME)
+        self.assertEqual(report.secret, coefficients[0])
+        self.assertEqual(len(report.rejected), 0)
+        self.assertEqual(len(report.accepted), LARGE_N)
+
+    def test_half_and_full_error_capacity_at_fixed_positions(self):
+        coefficients = _large_coefficients()
+        shares = _large_shares(coefficients)
+        for error_count in (1, 8, LARGE_CAPACITY):
+            with self.subTest(error_count=error_count):
+                positions = tuple(range(error_count))
+                report = recover_secret(
+                    _damage(shares, positions), LARGE_T, prime=LARGE_PRIME
+                )
+                self.assertEqual(report.secret, coefficients[0])
+                self.assertEqual(
+                    [share.x for share in report.rejected],
+                    [position + 1 for position in positions],
+                )
+
+    def test_every_sliding_window_of_sixteen_errors(self):
+        coefficients = _large_coefficients()
+        shares = _large_shares(coefficients)
+        for start in range(LARGE_N):
+            positions = [(start + offset) % LARGE_N for offset in range(LARGE_CAPACITY)]
+            with self.subTest(start=start):
+                report = recover_secret(
+                    _damage(shares, positions), LARGE_T, prime=LARGE_PRIME
+                )
+                self.assertEqual(report.secret, coefficients[0])
+                self.assertEqual(
+                    sorted(share.x for share in report.rejected),
+                    sorted(position + 1 for position in positions),
+                )
+
+    def test_lower_degree_polynomials_recover(self):
+        for degree in (0, 1, 5, LARGE_T - 2):
+            with self.subTest(degree=degree):
+                coefficients = _large_coefficients()[: degree + 1]
+                shares = _large_shares(coefficients)
+                positions = tuple(range(LARGE_CAPACITY))
+                report = recover_secret(
+                    _damage(shares, positions), LARGE_T, prime=LARGE_PRIME
+                )
+                self.assertEqual(report.secret, coefficients[0])
+                self.assertEqual(len(report.rejected), LARGE_CAPACITY)
+
+    def test_does_not_mutate_input_and_reuses_share_objects(self):
+        coefficients = _large_coefficients()
+        shares = _large_shares(coefficients)
+        damaged = _damage(shares, range(5))
+        snapshot = [Share(share.x, share.y) for share in damaged]
+        report = recover_secret(damaged, LARGE_T, prime=LARGE_PRIME)
+        self.assertEqual(
+            [Share(share.x, share.y) for share in damaged], snapshot
+        )
+        for share in (*report.accepted, *report.rejected):
+            self.assertIn(share, damaged)
+
+
+class BeyondCorrectionRadiusTest(unittest.TestCase):
+    # Outside 2e <= n - t the global enumeration semantics still hold.
+
+    def test_unique_best_beyond_radius_still_reported(self):
+        coefficients = [SECRET % PRIME, 12345, 678901]
+        shares = [
+            Share(x, evaluate_polynomial(coefficients, x, prime=PRIME))
+            for x in range(1, 13)
+        ]
+        positions = [1, 4, 6, 9, 11]  # 5 errors; radius is floor(9/2) = 4
+        damaged = tamper_multi(shares, positions, prime=PRIME)
+        report = recover_secret(damaged, 3, prime=PRIME)
+        self.assertEqual(report.secret, SECRET % PRIME)
+        self.assertEqual([share.x for share in report.rejected], positions)
+        self.assertEqual(len(report.accepted), 7)
+
+    def test_unique_best_with_low_degree_polynomial_beyond_radius(self):
+        coefficients = [424242]  # constant polynomial, threshold 3
+        shares = [
+            Share(x, evaluate_polynomial(coefficients, x, prime=PRIME))
+            for x in range(1, 13)
+        ]
+        positions = [1, 4, 6, 9, 11]
+        damaged = tamper_multi(shares, positions, prime=PRIME)
+        report = recover_secret(damaged, 3, prime=PRIME)
+        self.assertEqual(report.secret, 424242)
+        self.assertEqual([share.x for share in report.rejected], positions)
+
+    def test_tie_with_identical_secret_still_raises(self):
+        # Two distinct degree-2 polynomials with the same constant term each
+        # fit three supplied points: tied candidates, even equal secrets,
+        # must not be treated as unique.
+        first = [1, 2, 0]
+        second = [1, 3, 0]
+        shares = [
+            Share(x, evaluate_polynomial(first, x, prime=PRIME)) for x in (1, 2, 3)
+        ] + [
+            Share(x, evaluate_polynomial(second, x, prime=PRIME))
+            for x in (4, 5, 6)
+        ]
+        with self.assertRaises(ValueError):
+            recover_secret(shares, 3, prime=PRIME)
+
+
+def tamper_multi(shares, positions, *, prime=PRIME, offset=999):
+    damaged = list(shares)
+    for x_coordinate in positions:
+        index = x_coordinate - 1
+        damaged[index] = Share(
+            damaged[index].x, (damaged[index].y + offset) % prime
+        )
+    return damaged
 
 
 class ThresholdOneTest(unittest.TestCase):
