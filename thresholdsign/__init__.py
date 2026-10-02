@@ -1115,6 +1115,146 @@ def _interpolate_coefficients(points: Sequence[Share], prime: int) -> tuple[int,
     return tuple(coefficients)
 
 
+def _barycentric_weights(xs: Sequence[int], prime: int) -> list[int]:
+    """Inverse products ``1 / prod_{j != i}(x_i - x_j)`` for distinct ``xs``."""
+    weights: list[int] = []
+    for position, x_i in enumerate(xs):
+        denominator = 1
+        for other_position, x_j in enumerate(xs):
+            if other_position != position:
+                denominator = denominator * (x_i - x_j) % prime
+        weights.append(pow(denominator, -1, prime))
+    return weights
+
+
+def _berlekamp_massey(syndrome: Sequence[int], prime: int) -> list[int] | None:
+    """Shortest LFSR connection polynomial ``C`` with ``C[0] = 1``.
+
+    Returns the ascending-order coefficients of the monic polynomial whose
+    degree ``L`` satisfies the first ``len(syndrome)`` syndromes, or ``None``
+    when the sequence needs more than half as many feedback taps as
+    syndromes were supplied (the unique-decoding radius).
+    """
+    length = 0
+    connection = [1]
+    previous = [1]
+    shift = 1
+    previous_discrepancy = 1
+    for step in range(len(syndrome)):
+        discrepancy = syndrome[step]
+        for tap in range(1, length + 1):
+            if tap < len(connection):
+                discrepancy = (
+                    discrepancy + connection[tap] * syndrome[step - tap]
+                ) % prime
+        if discrepancy == 0:
+            shift += 1
+            continue
+        scale = discrepancy * pow(previous_discrepancy, -1, prime) % prime
+        saved = connection[:]
+        needed = len(previous) + shift
+        if len(connection) < needed:
+            connection.extend([0] * (needed - len(connection)))
+        for tap in range(len(previous)):
+            connection[tap + shift] = (
+                connection[tap + shift] - scale * previous[tap]
+            ) % prime
+        if 2 * length <= step:
+            length = step + 1 - length
+            previous = saved
+            previous_discrepancy = discrepancy
+            shift = 1
+        else:
+            shift += 1
+        if 2 * length > len(syndrome):
+            return None
+    # Updates may extend the buffer beyond the actual degree; the locator
+    # is a degree-L polynomial, so keep exactly L + 1 coefficients.
+    return connection[: length + 1]
+
+
+def _decode_within_radius(
+    xs: Sequence[int],
+    ys: Sequence[int],
+    threshold: int,
+    prime: int,
+) -> tuple[int, ...] | None:
+    """Unique bounded-distance decode of an RS codeword.
+
+    When the supplied points are within the unique error-correction radius
+    (``2e <= n - threshold``) of a degree-below-``threshold`` polynomial,
+    return the ascending tuple of positions whose ``y`` values disagree with
+    that polynomial. Return ``None`` when no such close polynomial exists, in
+    which case the caller falls back to exhaustive global arbitration.
+
+    The syndrome is the first ``n - threshold`` moments of the data with
+    barycentric weights; Berlekamp-Massey yields the error locator, a Chien
+    search the positions, and interpolation over the surviving shares the
+    candidate polynomial. Work is quadratic in the share count with linear
+    extra storage.
+    """
+    count = len(xs)
+    redundancy = count - threshold
+    if redundancy == 0:
+        return ()
+    weights = _barycentric_weights(xs, prime)
+
+    syndrome = [0] * redundancy
+    for position in range(count):
+        weighted = weights[position] * ys[position] % prime
+        x_power = 1
+        for power in range(redundancy):
+            syndrome[power] = (
+                syndrome[power] + weighted * x_power
+            ) % prime
+            x_power = x_power * xs[position] % prime
+    if not any(syndrome):
+        return ()
+
+    locator = _berlekamp_massey(syndrome, prime)
+    if locator is None:
+        return None
+    error_degree = len(locator) - 1
+
+    # Chien search: the locator's roots are the inverses of the erroneous
+    # coordinates. Horner over the ascending coefficient list c_0..c_e
+    # evaluates x**e C(1/x) = prod(x - x_e), which vanishes at every
+    # erroneous share coordinate.
+    error_positions: list[int] = []
+    for position in range(count):
+        value = 0
+        for coefficient in locator:
+            value = (value * xs[position] + coefficient) % prime
+        if value == 0:
+            error_positions.append(position)
+    if len(error_positions) != error_degree:
+        return None
+
+    # The locator only names positions; the unique polynomial through those
+    # points is recovered from threshold of the surviving shares (at least
+    # threshold remain inside the radius) and must agree with every share
+    # outside the located error set.
+    error_set = set(error_positions)
+    accepted_positions = [
+        position for position in range(count) if position not in error_set
+    ]
+    if len(accepted_positions) < threshold:
+        return None
+    coefficients = _interpolate_coefficients(
+        [Share(xs[position], ys[position]) for position in accepted_positions[:threshold]],
+        prime,
+    )
+    decoded_errors = tuple(
+        position
+        for position in range(count)
+        if evaluate_polynomial(coefficients, xs[position], prime=prime)
+        != ys[position]
+    )
+    if len(decoded_errors) != error_degree or set(decoded_errors) != error_set:
+        return None
+    return decoded_errors
+
+
 def recover_secret(
     shares: tuple[Share, ...] | list[Share],
     threshold: int,
@@ -1135,6 +1275,13 @@ def recover_secret(
     submission order. A tie for the most-agreeing polynomial, or no
     polynomial agreeing with at least ``threshold`` shares, cannot be
     decided and raises ``ValueError``.
+
+    When the shares are within the unique error-correction radius
+    (``2e <= n - threshold``), a syndrome decode (Berlekamp-Massey
+    locator plus interpolation) settles the report with polynomial work
+    in ``n`` and ``threshold``. Inputs outside that radius retain the
+    global most-agreeing-polynomial arbitration by exhaustive candidate
+    enumeration, so ties and near-ties keep their original semantics.
     """
     if not isinstance(shares, (tuple, list)):
         raise TypeError("shares must be a tuple or list")
@@ -1169,8 +1316,54 @@ def recover_secret(
         if position > 0 and share.x == ordered[position - 1].x:
             raise ValueError("duplicate share index")
 
-    # Every degree-<threshold candidate that can matter is the interpolant of
-    # some threshold-sized subset; distinct interpolants are deduplicated by
+    # Threshold one only has constant polynomials: the decision is the
+    # majority y value, with a tie left undecided.
+    if threshold == 1:
+        counts: dict[int, int] = {}
+        for share in ordered:
+            counts[share.y] = counts.get(share.y, 0) + 1
+        best_value = None
+        best_count = 0
+        tied = False
+        for value in sorted(counts):
+            count = counts[value]
+            if count > best_count:
+                best_value = value
+                best_count = count
+                tied = False
+            elif count == best_count:
+                tied = True
+        if tied:
+            raise ValueError(
+                "multiple polynomials agree with the most shares; cannot decide"
+            )
+        assert best_value is not None
+        accepted = tuple(share for share in ordered if share.y == best_value)
+        rejected = tuple(share for share in ordered if share.y != best_value)
+        return RecoveryReport(best_value, accepted, rejected)
+
+    xs = [share.x for share in ordered]
+    ys = [share.y for share in ordered]
+
+    error_positions = _decode_within_radius(xs, ys, threshold, prime)
+    if error_positions is not None:
+        error_set = set(error_positions)
+        accepted = tuple(
+            share
+            for position, share in enumerate(ordered)
+            if position not in error_set
+        )
+        rejected = tuple(
+            share
+            for position, share in enumerate(ordered)
+            if position in error_set
+        )
+        secret = reconstruct_secret(accepted, prime=prime)
+        return RecoveryReport(secret, accepted, rejected)
+
+    # Outside the unique-correction radius: enumerate every threshold-sized
+    # subset. Every degree-<threshold candidate that can matter is the
+    # interpolant of such a subset; distinct interpolants are deduplicated by
     # their coefficient tuples. Evaluating each candidate at every supplied
     # point counts the shares it agrees with.
     best_coefficients: tuple[int, ...] | None = None
