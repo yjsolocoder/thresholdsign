@@ -397,6 +397,41 @@ anchor/`old` 对不上的链照常返回，由 `verify_rotation_chain` 返回 `F
 `ValueError`；非 `bytes` 的解码入参抛 `TypeError`。链本身不含任何网络、
 存储或隐藏状态。
 
+### 轮换链故障诊断
+
+`verify_rotation_chain` 只给出真假结论；无状态入口 `diagnose_rotation_chain`
+是它的诊断伴随函数，返回按链序逐跳描述故障的
+`RotationChainDiagnosis(valid, faults)`，定位锚点、链衔接和授权签名分别在
+哪一跳失效，而不猜测密码学不匹配背后的原因。冻结数据类
+`RotationFault(index, check)` 的 `check` 为稳定且互不混淆的三个值之一：
+
+- `"anchor"`：只可能在 `index == 0`，首张证书的 `old` 与 `anchor` 不同；
+- `"link"`：在 `index` 处 `certificates[index - 1].new !=
+  certificates[index].old`；
+- `"authorization"`：`index` 处结构合法的证书未通过 `verify_rotation`。
+
+同一位置的 link 与 authorization 互相独立、可以同时出现（report 中 link 在前）；
+诊断不会因第一处密码学不匹配提前结束，而是检查其余全部位置。无故障时
+`faults` 为空元组且 `valid` 为 `True`，否则 `valid` 为 `False`；同值输入每次
+得到按值相等、顺序确定的报告。
+
+```python
+from thresholdsign import diagnose_rotation_chain
+
+report = diagnose_rotation_chain(chain)
+assert report.valid == verify_rotation_chain(chain)
+for fault in report.faults:        # (RotationFault(index, check), ...)
+    ...                            # 按链序排列，同位置 link 先于 authorization
+```
+
+入参不是 `RotationChain` 抛 `TypeError`；anchor 不是非布尔整数、
+`certificates` 不是元组或元素不是 `Rotation` 也抛 `TypeError`；证书序列为空
+抛 `ValueError`；任一证书的群参数、公钥、成员编号、threshold 或
+`AggregateSignature` 结构非法时沿用 `rotation_payload` 与 `verify_rotation`
+的 `ValueError`——确定性输入损坏不会被伪装成诊断故障。结构合法但锚点、衔接或
+授权签名密码学不匹配均正常返回报告，不抛异常。诊断本身不含任何网络、存储、
+时间或隐藏状态。
+
 ### 门限 Schnorr 认证的无状态审计链
 
 `SigningAudit` 回执各自独立；`AuditChain` 把一批成功或失败回执按给定顺序
@@ -2107,6 +2142,22 @@ python3 -m thresholdsign
   非规范 anchor、帧内非法证书、计数不符、溢出、截断、尾随字节，成功后重编码
   必得到原字节；签名不匹配或衔接断裂由 `verify_rotation_chain` 返回 `False`。
   非 `bytes` 入参抛 `TypeError`，其余非法情形抛 `ValueError`
+- `RotationFault(index, check)` — 冻结数据类，可按位置构造、按值相等；
+  `index` 为零基证书位置，`check` 为 `"anchor"` / `"link"` /
+  `"authorization"` 三个稳定且互不混淆的值之一；同位置的 link 与
+  authorization 相互独立，可各记一条
+- `RotationChainDiagnosis(valid, faults)` — 冻结数据类，可按位置构造、按值
+  相等；`valid` 恰为同链 `verify_rotation_chain` 的返回值，`faults` 为按链序
+  排列（同位置 link 先于 authorization）的 `RotationFault` 元组，无故障时
+  必为 `RotationChainDiagnosis(True, ())`
+- `diagnose_rotation_chain(chain) -> RotationChainDiagnosis` —
+  `verify_rotation_chain` 的无状态诊断伴随函数，不因第一处密码学不匹配提前
+  结束：`anchor != certificates[0].old` 在 index 0 记 `"anchor"`，相邻位置
+  `certificates[i].new != certificates[i+1].old` 在 index i+1 记 `"link"`，
+  结构合法但签名不匹配在自身 index 记 `"authorization"`；结构边界与
+  `verify_rotation_chain` 完全一致：非 `RotationChain` 入参、非整数/布尔
+  anchor、非元组证书序列或非 `Rotation` 元素抛 `TypeError`，空链或任一证书
+  结构非法抛 `ValueError`；同值输入得到按值相等、顺序确定的报告
 - `RHE(extension, rotations, old_sig, new_sig)` — 冻结数据类，四字段无默认，
   可按位置构造、按值相等与哈希，不含网络、存储或隐藏状态；跨密钥的封印历史
   追加证明：`extension` 为 `SealHistoryExtension`，`rotations` 为非空且保序
