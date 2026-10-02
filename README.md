@@ -424,6 +424,37 @@ anchor/`old` 对不上的链照常返回，由 `verify_rotation_chain` 返回 `F
 报告，不抛异常。诊断不引入网络、存储、时间或隐藏状态，也不改变任何既有
 入口的返回口径。
 
+### 跨密钥追加证明的故障诊断
+
+`check_rhe` 只给真假结论，并且在轮换链不通过时短路、不复核两个端点根
+签名；无状态入口 `diagnose_rhe(x)` 作为它的诊断伴侣，返回冻结数据类
+`RHEDiagnosis(valid, faults)`，一次收集证明上所有可观察的失败。`faults`
+为 `RHEFault(check, index)` 元组，`check` 的五类取值稳定且互不混淆：
+
+- 轮换链部分按证书零基下标顺序报告，语义与 `diagnose_rotation_chain`
+  一致：`"anchor"`（anchor 与首张证书 `old` 不同，固定 index 0）、
+  `"link"`（前一张证书 `new` 与本张 `old` 不同，记在该证书下标）、
+  `"authorization"`（结构合法的证书未通过 `verify_rotation`，记在该证书
+  下标）；每个位置先记 `anchor`/`link`，再记 `authorization`，同一位置
+  可同时出现两类；
+- 其后依次报告 `"old-signature"`（旧端点根签名未通过，以首张证书的
+  `(q, p, g, old)` 核验 `b"sh/r" || U64(old_total) || old_root`）与
+  `"new-signature"`（新端点根签名未通过，以末张证书的
+  `(q, p, g, new)` 核验 `b"sh/r" || U64(n) || new_root`），两者
+  `index` 恒为 `None`。
+
+所有证书签名与两个端点根签名都独立复核：即使轮换链断开，旧、新两个根
+签名仍分别检查，因此篡改旧根、篡改新根、对调两个签名、破坏轮换授权或
+断开键链接时，结果都指出对应失败，且一次可出现多处；合法的单跳或多跳
+证明得到 `valid is True` 且 `faults == ()`。诊断只定位公开数据上的
+失败，不推断攻击者，也不改变 `check_rhe` 的短路行为。`valid` 恒等于
+`check_rhe` 对同一对象的真假结论；同值输入每次得到按值相等、顺序确定的
+报告。入参不是 `RHE` 或字段类型不符抛 `TypeError`；空轮换链、旧前缀
+长度为零或不小于总叶数、叶集合为空或叶宽不是 32 字节、证书或聚合签名
+结构非法、签名整数不适应对应端点参数时抛 `ValueError`，边界与
+`check_rhe` 一致——结构合法但密码学校验不匹配时返回诊断而不是抛异常。
+诊断不引入网络、存储、时间或隐藏状态。
+
 ### 门限 Schnorr 认证的无状态审计链
 
 `SigningAudit` 回执各自独立；`AuditChain` 把一批成功或失败回执按给定顺序
@@ -2211,6 +2242,28 @@ python3 -m thresholdsign
   宽不符、非 32 字节叶、空轮换链或坏嵌套链、非规范整数、空签名者集、截断或
   尾随字节（`ValueError`）；成功后重编码必逐字节等于输入，链或签名不匹配由
   `check_rhe` 返回 `False`
+- `RHEFault(check, index)` — 冻结数据类，可按位置构造、按值相等与哈希；记录
+  跨密钥追加证明上一处失败的检查：`check` 只能取 `"anchor"`、`"link"`、
+  `"authorization"`（轮换链语义，`index` 为故障所固定到的证书零基下标，前
+  两者分别固定为 index 0 与断链后一证书下标）、`"old-signature"`、
+  `"new-signature"`（旧/新端点根签名未通过，`index` 恒为 `None`）；不含
+  网络、存储或隐藏状态
+- `RHEDiagnosis(valid, faults)` — 冻结数据类，可按位置构造、按值相等；
+  `valid` 恒等于 `check_rhe` 对同一证明的真假结论，`faults` 为按报告顺序
+  排列的 `RHEFault` 元组：先按证书下标排列轮换链故障，同一下标
+  `anchor`/`link` 先于 `authorization`，其后依次为 `old-signature`、
+  `new-signature`；无故障时为 `()`
+- `diagnose_rhe(x) -> RHEDiagnosis` — `check_rhe` 的无状态诊断伴侣：先沿
+  用同一结构边界（扩展、轮换链容器与每张证书、两个签名帧）完整校验，再按
+  证书顺序逐跳诊断 anchor、相邻 `new == old` 衔接与 `verify_rotation`
+  授权签名，随后独立复核旧、新两个端点根签名；不因前一项失败跳过后一项，
+  即使轮换链断开两个端点根签名也分别检查，同一下标可同时出现位置故障与
+  `authorization`。结构合法但锚点、衔接、授权签名或任一端点根签名密码学
+  不匹配一律返回报告，不抛异常；非 `RHE` 入参或字段类型不符抛 `TypeError`，
+  空轮换链、`old_total` 越界、空叶或叶宽错误、证书或聚合签名结构非法、
+  签名整数不适应端点群参数抛 `ValueError`，边界与 `check_rhe` 一致。同值
+  输入每次得到按值相等、顺序确定的报告，不推断攻击者，不改变 `check_rhe`
+  的短路行为，也不引入网络、存储、时间或隐藏状态
 - `AuditChain(records, signature)` — 冻结数据类，可按位置构造、按值相等；
   由门限 Schnorr 签名认证的无状态审计链：`records` 为非空且保序的
   `(message, SigningAudit)` 元组，链序即回执封装顺序，`signature` 为对
