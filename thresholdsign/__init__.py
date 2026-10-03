@@ -7840,6 +7840,110 @@ AUDIT_PROOF_ROOT_TAG = b"am/r"
 AUDIT_PROOF_DIGEST_SIZE = 32  # SHA256 output width; every tree node is this wide
 
 
+# The audit and seal-history Merkle families share one set of level-pairing
+# rules — odd-tail duplication, left-to-right pairing and the
+# ``(width + 1) // 2`` width contraction — parameterized only by the
+# family-specific node combiner. These helpers are that single shared rule;
+# the per-family leaf/node digest functions and domain-separation tags stay
+# separate, so the two trees can never be mixed.
+
+
+def _merkle_parent_level(
+    level: tuple[bytes, ...], node: Callable[[bytes, bytes], bytes]
+) -> tuple[bytes, ...]:
+    """Pair up one tree level into the level above.
+
+    A level with an odd tail width is paired with its own last node
+    duplicated, so every level above the leaves has an even width.
+    """
+    if len(level) % 2 == 1:
+        level = level + level[-1:]
+    return tuple(
+        node(level[index], level[index + 1])
+        for index in range(0, len(level), 2)
+    )
+
+
+def _merkle_levels(
+    leaves: tuple[bytes, ...], node: Callable[[bytes, bytes], bytes]
+) -> list[tuple[bytes, ...]]:
+    """Build the leaf level and every internal level up to the single root."""
+    levels: list[tuple[bytes, ...]] = [tuple(leaves)]
+    current = levels[0]
+    while len(current) > 1:
+        current = _merkle_parent_level(current, node)
+        levels.append(current)
+    return levels
+
+
+def _merkle_root(
+    leaves: tuple[bytes, ...], node: Callable[[bytes, bytes], bytes]
+) -> bytes:
+    """Reduce leaf digests to the single root with the shared pairing rule."""
+    current = leaves
+    while len(current) > 1:
+        current = _merkle_parent_level(current, node)
+    return current[0]
+
+
+def _merkle_proof_path(
+    levels: list[tuple[bytes, ...]], index: int
+) -> list[bytes]:
+    """Sibling digests from leaf ``index`` up to, but excluding, the root.
+
+    At an odd-width level the last member is paired with itself, so the
+    sibling carried for that level is the node's own digest.
+    """
+    path: list[bytes] = []
+    position = index
+    for level in levels[:-1]:
+        if len(level) % 2 == 1:
+            level = level + level[-1:]
+        path.append(level[position ^ 1])
+        position //= 2
+    return path
+
+
+def _merkle_rebuild_path_root(
+    index: int,
+    count: int,
+    leaf_digest: bytes,
+    siblings: tuple[bytes, ...],
+    node: Callable[[bytes, bytes], bytes],
+    *,
+    check_odd_tail_sibling: bool,
+) -> bytes | None:
+    """Rebuild a single-leaf proof's root along its sibling path.
+
+    At each level the current position is paired by its parity — an even
+    position is hashed on the left, an odd position on the right — except
+    for an odd tail: when the level has odd width and the current node is
+    its last member it has no companion, so it is paired with itself
+    (``H(node, node)``), exactly the last-node duplication the tree builder
+    uses. When ``check_odd_tail_sibling`` is set, the carried sibling at
+    such a level must equal the node itself and ``None`` is returned when it
+    does not; when clear, the sibling at that level is ignored. The width
+    contracts as ``(width + 1) // 2``.
+    """
+    current = leaf_digest
+    position = index
+    width = count
+    for sibling in siblings:
+        if width % 2 == 1 and position == width - 1:
+            # Odd tail with no companion: pair the node with itself, as the
+            # tree builder duplicated its last node for pairing.
+            if check_odd_tail_sibling and sibling != current:
+                return None
+            current = node(current, current)
+        elif position % 2 == 0:
+            current = node(current, sibling)
+        else:
+            current = node(sibling, current)
+        position //= 2
+        width = (width + 1) // 2
+    return current
+
+
 def _audit_proof_u64(value: int) -> bytes:
     """8-byte unsigned big-endian encoding of a non-negative integer < 2**64."""
     return value.to_bytes(8, "big", signed=False)
@@ -7865,25 +7969,14 @@ def _audit_proof_levels(
 ) -> list[tuple[bytes, ...]]:
     """Build the leaf level and every internal level up to the single root.
 
-    A level with an odd tail width is paired with its own last node
-    duplicated, so every level above the leaves has an even width.
+    The level-by-level pairing is the shared rule in :func:`_merkle_levels`
+    with the ``b"am/n"`` node combiner.
     """
-    levels: list[tuple[bytes, ...]] = [
-        tuple(
-            _audit_proof_leaf(index, message, audit)
-            for index, (message, audit) in enumerate(records)
-        )
-    ]
-    current = levels[0]
-    while len(current) > 1:
-        if len(current) % 2 == 1:
-            current = current + current[-1:]
-        current = tuple(
-            _audit_proof_node(current[index], current[index + 1])
-            for index in range(0, len(current), 2)
-        )
-        levels.append(current)
-    return levels
+    leaves = tuple(
+        _audit_proof_leaf(index, message, audit)
+        for index, (message, audit) in enumerate(records)
+    )
+    return _merkle_levels(leaves, _audit_proof_node)
 
 
 @dataclass(frozen=True)
@@ -7946,13 +8039,7 @@ def make_proof(
     except IndexError:
         raise ValueError("index out of range") from None
 
-    path = []
-    position = index
-    for level in levels[:-1]:
-        width = len(level)
-        padded = level if width % 2 == 0 else level + level[-1:]
-        path.append(padded[position ^ 1])
-        position //= 2
+    path = _merkle_proof_path(levels, index)
 
     root = levels[-1][0]
     proof = AuditProof(
@@ -8057,22 +8144,19 @@ def check_proof(
     _result, public_key, field_prime, group_prime, generator = _check_signing_setup(key)
     _check_signing_dkg_structure(key)
 
-    node = _audit_proof_leaf(index, message, audit)
-    position = index
-    width = count
-    for sibling in path:
-        if width % 2 == 1 and position == width - 1:
-            # Odd tail with no companion: pair the node with itself, as the
-            # tree builder duplicated its last node for pairing.
-            node = _audit_proof_node(node, node)
-        elif position % 2 == 0:
-            node = _audit_proof_node(node, sibling)
-        else:
-            node = _audit_proof_node(sibling, node)
-        position //= 2
-        width = (width + 1) // 2
+    leaf = _audit_proof_leaf(index, message, audit)
+    # The audit family ignores the sibling carried at an odd-tail level, so
+    # the self-pair digest is not compared here.
+    root = _merkle_rebuild_path_root(
+        index,
+        count,
+        leaf,
+        path,
+        _audit_proof_node,
+        check_odd_tail_sibling=False,
+    )
 
-    signed_message = AUDIT_PROOF_ROOT_TAG + _audit_proof_u64(count) + node
+    signed_message = AUDIT_PROOF_ROOT_TAG + _audit_proof_u64(count) + root
     if not check_audit(message, audit, key):
         return False
     return verify_signature(
@@ -9158,19 +9242,10 @@ class AuditExtensionProof:
 def _audit_extension_root(leaves: tuple[bytes, ...]) -> bytes:
     """Root digest of the AuditProof tree rebuilt directly from leaf digests.
 
-    The pairing rules are exactly those of :func:`_audit_proof_levels`: a
-    level with an odd tail width duplicates its last node, and internal
-    nodes are ``H(b"am/n" || left || right)``.
+    The pairing rules are exactly those of :func:`_audit_proof_levels` — the
+    shared rule in :func:`_merkle_root` with the ``b"am/n"`` node combiner.
     """
-    current = leaves
-    while len(current) > 1:
-        if len(current) % 2 == 1:
-            current = current + current[-1:]
-        current = tuple(
-            _audit_proof_node(current[index], current[index + 1])
-            for index in range(0, len(current), 2)
-        )
-    return current[0]
+    return _merkle_root(leaves, _audit_proof_node)
 
 
 def make_extension(
@@ -13792,25 +13867,14 @@ def _history_proof_levels(
 ) -> list[tuple[bytes, ...]]:
     """Build the leaf level and every internal level up to the single root.
 
-    A level with an odd tail width is paired with its own last node
-    duplicated, so every level above the leaves has an even width.
+    The level-by-level pairing is the shared rule in :func:`_merkle_levels`
+    with the ``b"sh/n"`` node combiner.
     """
-    levels: list[tuple[bytes, ...]] = [
-        tuple(
-            _history_proof_leaf(index, seal)
-            for index, seal in enumerate(items)
-        )
-    ]
-    current = levels[0]
-    while len(current) > 1:
-        if len(current) % 2 == 1:
-            current = current + current[-1:]
-        current = tuple(
-            _history_proof_node(current[index], current[index + 1])
-            for index in range(0, len(current), 2)
-        )
-        levels.append(current)
-    return levels
+    leaves = tuple(
+        _history_proof_leaf(index, seal)
+        for index, seal in enumerate(items)
+    )
+    return _merkle_levels(leaves, _history_proof_node)
 
 
 @dataclass(frozen=True)
@@ -13873,15 +13937,9 @@ def make_history_proof(
 
     levels = _history_proof_levels(history.items)
 
-    path = []
-    position = index
-    for level in levels[:-1]:
-        width = len(level)
-        padded = level if width % 2 == 0 else level + level[-1:]
-        # At an odd tail the companion position is the duplicated last
-        # node, so the carried sibling equals the current node itself.
-        path.append(padded[position ^ 1])
-        position //= 2
+    # At an odd tail the companion position is the duplicated last node, so
+    # the carried sibling equals the current node itself.
+    path = _merkle_proof_path(levels, index)
 
     root = levels[-1][0]
     proof = SealHistoryProof(
@@ -13985,25 +14043,22 @@ def check_history_proof(
     if not verify_seal(seal, key):
         return False
 
-    node = _history_proof_leaf(index, seal)
-    position = index
-    width = total
-    for sibling in siblings:
-        if width % 2 == 1 and position == width - 1:
-            # Odd tail with no companion: the tree builder duplicated
-            # the last node, so the carried sibling must be this node.
-            if sibling != node:
-                return False
-            node = _history_proof_node(node, node)
-        elif position % 2 == 0:
-            node = _history_proof_node(node, sibling)
-        else:
-            node = _history_proof_node(sibling, node)
-        position //= 2
-        width = (width + 1) // 2
+    leaf = _history_proof_leaf(index, seal)
+    # The seal-history family requires the sibling carried at an odd-tail
+    # level to equal the node itself; a mismatch fails the proof.
+    root = _merkle_rebuild_path_root(
+        index,
+        total,
+        leaf,
+        siblings,
+        _history_proof_node,
+        check_odd_tail_sibling=True,
+    )
+    if root is None:
+        return False
 
     signed_message = (
-        SEAL_HISTORY_PROOF_ROOT_TAG + _history_proof_u64(total) + node
+        SEAL_HISTORY_PROOF_ROOT_TAG + _history_proof_u64(total) + root
     )
     return verify_signature(
         signed_message,
@@ -15075,19 +15130,11 @@ class SealHistoryExtension:
 def _history_extension_root(leaves: tuple[bytes, ...]) -> bytes:
     """Root digest of the SealHistoryProof tree rebuilt from leaf digests.
 
-    The pairing rules are exactly those of :func:`_history_proof_levels`:
-    a level with an odd tail width duplicates its last node, and internal
-    nodes are ``H(b"sh/n" || left || right)``.
+    The pairing rules are exactly those of :func:`_history_proof_levels` —
+    the shared rule in :func:`_merkle_root` with the ``b"sh/n"`` node
+    combiner.
     """
-    current = leaves
-    while len(current) > 1:
-        if len(current) % 2 == 1:
-            current = current + current[-1:]
-        current = tuple(
-            _history_proof_node(current[index], current[index + 1])
-            for index in range(0, len(current), 2)
-        )
-    return current[0]
+    return _merkle_root(leaves, _history_proof_node)
 
 
 def make_history_extension(
