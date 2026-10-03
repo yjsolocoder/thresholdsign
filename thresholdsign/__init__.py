@@ -6327,6 +6327,41 @@ class RotationChainDiagnosis:
     faults: tuple[RotationFault, ...]
 
 
+def _scan_rotation_chain_faults(
+    anchor: int, certificates: tuple[Rotation, ...]
+) -> tuple[tuple[int, str], ...]:
+    """Locate every failing anchor, link and authorization hop of a chain.
+
+    The single scan behind both :func:`diagnose_rotation_chain` and
+    :func:`diagnose_rhe`: the caller must already have run
+    :func:`_check_rotation_chain_fields` on the container. Every certificate
+    is structurally validated up front, along the same boundary
+    :func:`verify_rotation_chain` relies on, so the scan below only ever
+    sees structurally legal certificates and a failing signature is a
+    cryptographic mismatch, never malformed input.
+
+    The returned ``(index, check)`` pairs are in chain order: at one index
+    the positional fault (``"anchor"`` at index 0, ``"link"`` elsewhere,
+    when present) precedes the ``"authorization"`` fault. The scan never
+    short-circuits, so one bad hop never masks another.
+    """
+    for cert in certificates:
+        _check_rotation_fields(
+            cert.old, cert.new, cert.ids, cert.t, cert.q, cert.p, cert.g, cert.sig
+        )
+
+    faults: list[tuple[int, str]] = []
+    for index, cert in enumerate(certificates):
+        if index == 0:
+            if anchor != cert.old:
+                faults.append((0, "anchor"))
+        elif certificates[index - 1].new != cert.old:
+            faults.append((index, "link"))
+        if not verify_rotation(cert):
+            faults.append((index, "authorization"))
+    return tuple(faults)
+
+
 def diagnose_rotation_chain(chain: RotationChain) -> RotationChainDiagnosis:
     """Locate every failing anchor, link and authorization hop of a chain.
 
@@ -6375,25 +6410,12 @@ def diagnose_rotation_chain(chain: RotationChain) -> RotationChainDiagnosis:
         raise TypeError("chain must be a RotationChain instance")
     _check_rotation_chain_fields(chain.anchor, chain.certificates)
 
-    # Full structural validation of every certificate up front, along the
-    # same boundary verify_rotation_chain relies on, so the scan below only
-    # ever sees structurally legal certificates and a failing signature is
-    # a cryptographic mismatch, never malformed input.
-    for cert in chain.certificates:
-        _check_rotation_fields(
-            cert.old, cert.new, cert.ids, cert.t, cert.q, cert.p, cert.g, cert.sig
+    faults = [
+        RotationFault(index, check)
+        for index, check in _scan_rotation_chain_faults(
+            chain.anchor, chain.certificates
         )
-
-    faults: list[RotationFault] = []
-    for index, cert in enumerate(chain.certificates):
-        if index == 0:
-            if chain.anchor != cert.old:
-                faults.append(RotationFault(0, "anchor"))
-        elif chain.certificates[index - 1].new != cert.old:
-            faults.append(RotationFault(index, "link"))
-        if not verify_rotation(cert):
-            faults.append(RotationFault(index, "authorization"))
-
+    ]
     return RotationChainDiagnosis(not faults, tuple(faults))
 
 
@@ -26693,31 +26715,18 @@ def diagnose_rhe(x: RHE) -> RHEDiagnosis:
         _check_rhe_fields(x)
     )
 
-    # Full structural validation of every certificate up front, along the
-    # same boundary diagnose_rotation_chain relies on, so the scan below
-    # only ever sees structurally legal certificates and a failing
-    # signature is a cryptographic mismatch, never malformed input.
-    for cert in rotations.certificates:
-        _check_rotation_fields(
-            cert.old, cert.new, cert.ids, cert.t, cert.q, cert.p, cert.g, cert.sig
-        )
-
     first = rotations.certificates[0]
     last = rotations.certificates[-1]
 
-    faults: list[RHEFault] = []
-
-    # Rotation chain, in certificate order: the positional fault at an
-    # index first, then that certificate's authorization fault. The scan
-    # never short-circuits, mirroring diagnose_rotation_chain.
-    for index, cert in enumerate(rotations.certificates):
-        if index == 0:
-            if rotations.anchor != cert.old:
-                faults.append(RHEFault("anchor", 0))
-        elif rotations.certificates[index - 1].new != cert.old:
-            faults.append(RHEFault("link", index))
-        if not verify_rotation(cert):
-            faults.append(RHEFault("authorization", index))
+    # Rotation chain, in certificate order: the exact scan
+    # diagnose_rotation_chain runs, so the chain faults of an RHE report
+    # correspond one-to-one with diagnosing the chain on its own.
+    faults: list[RHEFault] = [
+        RHEFault(check, index)
+        for index, check in _scan_rotation_chain_faults(
+            rotations.anchor, rotations.certificates
+        )
+    ]
 
     # Both endpoint root signatures are checked independently of the chain
     # verdict and of each other, using check_rhe's exact root statements.
