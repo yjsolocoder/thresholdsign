@@ -7860,30 +7860,75 @@ def _audit_proof_node(left: bytes, right: bytes) -> bytes:
     return hashlib.sha256(AUDIT_PROOF_NODE_TAG + left + right).digest()
 
 
-def _audit_proof_levels(
-    records: tuple[tuple[bytes, SigningAudit], ...],
+def _proof_tree_levels(
+    leaves: tuple[bytes, ...],
+    node: Callable[[bytes, bytes], bytes],
 ) -> list[tuple[bytes, ...]]:
-    """Build the leaf level and every internal level up to the single root.
+    """Build every level above the leaf digests up to the single root.
 
     A level with an odd tail width is paired with its own last node
-    duplicated, so every level above the leaves has an even width.
+    duplicated, so every level above the leaves has an even width;
+    ``node`` is the family-specific ordered internal-node combiner. This
+    is the single per-level pairing rule behind both the audit and the
+    seal-history proof trees.
     """
-    levels: list[tuple[bytes, ...]] = [
-        tuple(
-            _audit_proof_leaf(index, message, audit)
-            for index, (message, audit) in enumerate(records)
-        )
-    ]
+    levels: list[tuple[bytes, ...]] = [tuple(leaves)]
     current = levels[0]
     while len(current) > 1:
         if len(current) % 2 == 1:
             current = current + current[-1:]
         current = tuple(
-            _audit_proof_node(current[index], current[index + 1])
+            node(current[index], current[index + 1])
             for index in range(0, len(current), 2)
         )
         levels.append(current)
     return levels
+
+
+def _proof_tree_root(
+    leaves: tuple[bytes, ...], node: Callable[[bytes, bytes], bytes]
+) -> bytes:
+    """Root digest of the shared pairing tree rebuilt from leaf digests.
+
+    The pairing rules are exactly those of :func:`_proof_tree_levels`;
+    ``node`` is the family-specific ordered internal-node combiner.
+    """
+    return _proof_tree_levels(leaves, node)[-1][0]
+
+
+def _proof_tree_path(
+    levels: list[tuple[bytes, ...]], index: int
+) -> tuple[bytes, ...]:
+    """Sibling digests on the path from the leaf level up to the root.
+
+    At each level the companion position is ``position ^ 1`` on the
+    odd-tail-padded level, so at an odd tail the carried sibling is the
+    node's own digest. This is the single path-selection rule shared by
+    the audit and seal-history single-record proofs.
+    """
+    path = []
+    position = index
+    for level in levels[:-1]:
+        width = len(level)
+        padded = level if width % 2 == 0 else level + level[-1:]
+        path.append(padded[position ^ 1])
+        position //= 2
+    return tuple(path)
+
+
+def _audit_proof_levels(
+    records: tuple[tuple[bytes, SigningAudit], ...],
+) -> list[tuple[bytes, ...]]:
+    """Build the leaf level and every internal level up to the single root.
+
+    The leaf digests are :func:`_audit_proof_leaf` in record order; the
+    per-level pairing is the shared rule of :func:`_proof_tree_levels`.
+    """
+    leaves = tuple(
+        _audit_proof_leaf(index, message, audit)
+        for index, (message, audit) in enumerate(records)
+    )
+    return _proof_tree_levels(leaves, _audit_proof_node)
 
 
 @dataclass(frozen=True)
@@ -7946,17 +7991,11 @@ def make_proof(
     except IndexError:
         raise ValueError("index out of range") from None
 
-    path = []
-    position = index
-    for level in levels[:-1]:
-        width = len(level)
-        padded = level if width % 2 == 0 else level + level[-1:]
-        path.append(padded[position ^ 1])
-        position //= 2
+    path = _proof_tree_path(levels, index)
 
     root = levels[-1][0]
     proof = AuditProof(
-        i=index, n=count, m=message, a=audit, p=tuple(path)
+        i=index, n=count, m=message, a=audit, p=path
     )
     return AUDIT_PROOF_ROOT_TAG + _audit_proof_u64(count) + root, proof
 
@@ -9158,19 +9197,11 @@ class AuditExtensionProof:
 def _audit_extension_root(leaves: tuple[bytes, ...]) -> bytes:
     """Root digest of the AuditProof tree rebuilt directly from leaf digests.
 
-    The pairing rules are exactly those of :func:`_audit_proof_levels`: a
-    level with an odd tail width duplicates its last node, and internal
-    nodes are ``H(b"am/n" || left || right)``.
+    The pairing rules are exactly those of :func:`_audit_proof_levels` —
+    the shared rule of :func:`_proof_tree_levels` with internal nodes
+    ``H(b"am/n" || left || right)``.
     """
-    current = leaves
-    while len(current) > 1:
-        if len(current) % 2 == 1:
-            current = current + current[-1:]
-        current = tuple(
-            _audit_proof_node(current[index], current[index + 1])
-            for index in range(0, len(current), 2)
-        )
-    return current[0]
+    return _proof_tree_root(leaves, _audit_proof_node)
 
 
 def make_extension(
@@ -13792,25 +13823,14 @@ def _history_proof_levels(
 ) -> list[tuple[bytes, ...]]:
     """Build the leaf level and every internal level up to the single root.
 
-    A level with an odd tail width is paired with its own last node
-    duplicated, so every level above the leaves has an even width.
+    The leaf digests are :func:`_history_proof_leaf` in item order; the
+    per-level pairing is the shared rule of :func:`_proof_tree_levels`.
     """
-    levels: list[tuple[bytes, ...]] = [
-        tuple(
-            _history_proof_leaf(index, seal)
-            for index, seal in enumerate(items)
-        )
-    ]
-    current = levels[0]
-    while len(current) > 1:
-        if len(current) % 2 == 1:
-            current = current + current[-1:]
-        current = tuple(
-            _history_proof_node(current[index], current[index + 1])
-            for index in range(0, len(current), 2)
-        )
-        levels.append(current)
-    return levels
+    leaves = tuple(
+        _history_proof_leaf(index, seal)
+        for index, seal in enumerate(items)
+    )
+    return _proof_tree_levels(leaves, _history_proof_node)
 
 
 @dataclass(frozen=True)
@@ -13873,22 +13893,16 @@ def make_history_proof(
 
     levels = _history_proof_levels(history.items)
 
-    path = []
-    position = index
-    for level in levels[:-1]:
-        width = len(level)
-        padded = level if width % 2 == 0 else level + level[-1:]
-        # At an odd tail the companion position is the duplicated last
-        # node, so the carried sibling equals the current node itself.
-        path.append(padded[position ^ 1])
-        position //= 2
+    # At an odd tail the companion position is the duplicated last
+    # node, so the carried sibling equals the current node itself.
+    path = _proof_tree_path(levels, index)
 
     root = levels[-1][0]
     proof = SealHistoryProof(
         index=index,
         total=total,
         seal=history.items[index],
-        siblings=tuple(path),
+        siblings=path,
     )
     return SEAL_HISTORY_PROOF_ROOT_TAG + _history_proof_u64(total) + root, proof
 
@@ -15075,19 +15089,11 @@ class SealHistoryExtension:
 def _history_extension_root(leaves: tuple[bytes, ...]) -> bytes:
     """Root digest of the SealHistoryProof tree rebuilt from leaf digests.
 
-    The pairing rules are exactly those of :func:`_history_proof_levels`:
-    a level with an odd tail width duplicates its last node, and internal
-    nodes are ``H(b"sh/n" || left || right)``.
+    The pairing rules are exactly those of :func:`_history_proof_levels` —
+    the shared rule of :func:`_proof_tree_levels` with internal nodes
+    ``H(b"sh/n" || left || right)``.
     """
-    current = leaves
-    while len(current) > 1:
-        if len(current) % 2 == 1:
-            current = current + current[-1:]
-        current = tuple(
-            _history_proof_node(current[index], current[index + 1])
-            for index in range(0, len(current), 2)
-        )
-    return current[0]
+    return _proof_tree_root(leaves, _history_proof_node)
 
 
 def make_history_extension(
