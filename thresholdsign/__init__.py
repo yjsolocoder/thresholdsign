@@ -8091,7 +8091,280 @@ def check_proof(
 # is exactly make_proof's tree; a single AuditMultiProof carries only the
 # siblings that are not themselves disclosed records (or odd-tail self-pairs),
 # so the whole set can be audited from one signature without hidden state.
+#
+# The audit (``am/*``) and seal-history (``sh/*``) multi-proofs are the same
+# compact Merkle walk over two independent digest domains. The structural
+# machinery below — the per-level companion decision, the unique sibling
+# count it determines, and the level-by-level root rebuild — lives here once;
+# each family only supplies its leaf/node digests and root statement. This
+# keeps the two families' sibling selection, count and rebuild rules from
+# drifting apart without mixing their hash domains.
 # ---------------------------------------------------------------------------
+
+# Per-proven-node actions emitted by :func:`_compact_multi_proof_plan`, in
+# ascending level (leaves upward) and position order:
+_MP_SIBLING = "sibling"  # carry/consume the companion digest
+_MP_SELF = "self"  # odd-width tail: the tree pairs the node with itself
+_MP_PAIR = "pair"  # left member whose companion is also a proven node
+_MP_SKIP = "skip"  # right member of such a pair; the "pair" builds the parent
+
+
+def _compact_multi_proof_plan(
+    count: int, indices: tuple[int, ...]
+) -> Iterable[tuple[int, list[tuple[int, str]]]]:
+    """Yield ``(width, actions)`` for one level at a time, leaves upward.
+
+    ``actions`` pairs every current proven position (ascending) with the
+    single thing the level must do with it:
+
+    * :data:`_MP_SIBLING` — its companion is neither proven nor absent, so a
+      companion digest has to be carried (makers append one entry; verifiers
+      consume one);
+    * :data:`_MP_SELF` — it is the last member of an odd-width level, which
+      the tree pairs with itself, so no digest is carried;
+    * :data:`_MP_PAIR` — it is the left member of a pair whose companion is
+      itself a proven node, so the parent is built from two carried nodes
+      and no digest is carried;
+    * :data:`_MP_SKIP` — it is the right member of such a pair and the
+      :data:`_MP_PAIR` action already produced the shared parent.
+
+    The plan depends only on ``count`` and the disclosed positions — never on
+    any digests — so makers, the unique sibling-count check and verifier root
+    rebuilds all share this one decision walk.
+    """
+    positions = set(indices)
+    width = count
+    while width > 1:
+        actions: list[tuple[int, str]] = []
+        next_positions = set()
+        for position in sorted(positions):
+            if width % 2 == 1 and position == width - 1:
+                # Odd tail with no companion: the tree pairs it with itself.
+                action = _MP_SELF
+            elif (position ^ 1) in positions:
+                # The companion is itself a disclosed node; no digest moves.
+                action = _MP_PAIR if position % 2 == 0 else _MP_SKIP
+            else:
+                action = _MP_SIBLING
+            actions.append((position, action))
+            next_positions.add(position // 2)
+        yield width, actions
+        positions = next_positions
+        width = (width + 1) // 2
+
+
+def _required_compact_multi_proof_siblings(
+    count: int, indices: tuple[int, ...]
+) -> int:
+    """Number of 32-byte companion digests the compact walk must carry.
+
+    One per :data:`_MP_SIBLING` action in :func:`_compact_multi_proof_plan`;
+    the answer depends only on ``count`` and the disclosed positions, so it is
+    the unique sibling count makers, encoders and decoders all demand.
+    """
+    return sum(
+        action == _MP_SIBLING
+        for _width, actions in _compact_multi_proof_plan(count, indices)
+        for _position, action in actions
+    )
+
+
+def _collect_compact_multi_proof_siblings(
+    levels: Sequence[Sequence[bytes]],
+    count: int,
+    indices: tuple[int, ...],
+) -> tuple[bytes, ...]:
+    """Collect the carried companion digests in leaf-to-root, left-to-right order.
+
+    ``levels`` is the proof family's fully built tree (leaf level first, root
+    level last); only :data:`_MP_SIBLING` actions append a digest, taking it
+    from the level exactly as the tree paired it (with the odd tail's last
+    node duplicated), so no digest is sent twice and the ordering matches the
+    verifier's consumption order.
+    """
+    siblings: list[bytes] = []
+    for level, (_width, actions) in zip(
+        levels[:-1], _compact_multi_proof_plan(count, indices)
+    ):
+        width = len(level)
+        padded = level if width % 2 == 0 else level + level[-1:]
+        for position, action in actions:
+            if action == _MP_SIBLING:
+                siblings.append(padded[position ^ 1])
+    return tuple(siblings)
+
+
+def _rebuild_compact_multi_proof_root(
+    count: int,
+    indices: tuple[int, ...],
+    leaf_digests: Sequence[bytes],
+    siblings: tuple[bytes, ...],
+    node_digest: Callable[[bytes, bytes], bytes],
+) -> bytes:
+    """Rebuild the single root from disclosed leaves and carried companions.
+
+    ``leaf_digests`` pairs one-to-one with ``indices``. The level walk is
+    exactly :func:`_compact_multi_proof_plan`: a :data:`_MP_SELF` node is
+    paired with itself, a :data:`_MP_PAIR` is paired with its proven
+    companion (the :data:`_MP_SKIP` does nothing), and a
+    :data:`_MP_SIBLING` consumes the next entry of ``siblings`` in order, on
+    the left for an even position and on the right for an odd one. Raises
+    ValueError if the walk runs short of companions or leaves any unconsumed;
+    returns the level-zero digest (for a one-item tree, the sole leaf).
+    """
+    nodes = dict(zip(indices, leaf_digests))
+    pending = iter(siblings)
+    for _width, actions in _compact_multi_proof_plan(count, indices):
+        next_nodes = {}
+        for position, action in actions:
+            parent = position // 2
+            if action == _MP_SELF:
+                # Odd tail with no companion: pair the node with itself.
+                next_nodes[parent] = node_digest(nodes[position], nodes[position])
+            elif action == _MP_PAIR:
+                next_nodes[parent] = node_digest(
+                    nodes[position], nodes[position ^ 1]
+                )
+            elif action == _MP_SKIP:
+                continue
+            else:
+                try:
+                    sibling = next(pending)
+                except StopIteration:
+                    raise ValueError(
+                        "proof.siblings is missing entries"
+                    ) from None
+                if position % 2 == 0:
+                    next_nodes[parent] = node_digest(nodes[position], sibling)
+                else:
+                    next_nodes[parent] = node_digest(sibling, nodes[position])
+        nodes = next_nodes
+
+    try:
+        next(pending)
+    except StopIteration:
+        pass
+    else:
+        raise ValueError("proof.siblings has extra entries")
+    return nodes[0]
+
+
+def _validate_compact_multi_proof_structure(
+    proof: object,
+    *,
+    proof_type: type,
+    proof_type_name: str,
+    count_attr: str,
+    entries_attr: str,
+    count_label: str,
+    entries_label: str,
+    too_many_message: str,
+    digest_size: int,
+    check_entry: Callable[[object], None],
+) -> tuple[tuple[int, ...], int, tuple, tuple[bytes, ...]]:
+    """Shared type/structure checks for both compact multi-proof families.
+
+    Only the container structure is checked: family-specific entry contents
+    are validated by ``check_entry`` (which raises TypeError/ValueError
+    exactly as the family used to) and nothing is cryptographically verified.
+    The bounds are a positive sub-64-bit count, a non-empty
+    ``indices``/entries pair of equal length with strictly increasing indices
+    in ``0 <= i < count``, and exactly the sibling count
+    :func:`_required_compact_multi_proof_siblings` derives from ``count`` and
+    the indices, each exactly ``digest_size`` bytes. The check order and
+    errors mirror each family's historical validator one-for-one.
+    """
+    if not isinstance(proof, proof_type):
+        raise TypeError(f"proof must be a {proof_type_name} instance")
+    indices = proof.indices
+    count = getattr(proof, count_attr)
+    entries = getattr(proof, entries_attr)
+    siblings = proof.siblings
+    if not isinstance(indices, tuple):
+        raise TypeError("proof.indices must be a tuple")
+    if not isinstance(count, int) or isinstance(count, bool):
+        raise TypeError(f"proof.{count_label} must be an integer")
+    if not isinstance(entries, tuple):
+        raise TypeError(f"proof.{entries_label} must be a tuple")
+    if not isinstance(siblings, tuple):
+        raise TypeError("proof.siblings must be a tuple")
+
+    if count <= 0:
+        raise ValueError(f"proof.{count_label} must be positive")
+    if count > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError(too_many_message)
+    if len(indices) == 0:
+        raise ValueError("proof.indices must be non-empty")
+    if len(indices) != len(entries):
+        raise ValueError(
+            f"proof.{entries_label} must pair one-to-one with proof.indices"
+        )
+
+    previous = -1
+    for index in indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("proof.indices entries must be integers")
+        if index <= previous:
+            raise ValueError("proof.indices must be strictly increasing and unique")
+        if index < 0 or index >= count:
+            raise ValueError("proof.indices entry out of range")
+        previous = index
+
+    for entry in entries:
+        check_entry(entry)
+
+    for sibling in siblings:
+        if not isinstance(sibling, bytes):
+            raise TypeError("proof.siblings entries must be bytes")
+    for sibling in siblings:
+        if len(sibling) != digest_size:
+            raise ValueError("proof.siblings entries must be exactly 32 bytes")
+    required_siblings = _required_compact_multi_proof_siblings(count, indices)
+    if len(siblings) != required_siblings:
+        raise ValueError(
+            f"proof.siblings count is not the one determined by "
+            f"{count_label} and indices"
+        )
+    return indices, count, entries, siblings
+
+
+def _decode_compact_multi_proof_indices(
+    payload: bytes, offset: int, *, label: str
+) -> tuple[list[int], int]:
+    """Read the 4-byte non-empty index count and its canonical VARINT indices.
+
+    ``label`` names the proof family for the historical error wording (e.g.
+    ``"audit multi-proof"``). Only the framing is checked here; strict
+    increase and range remain the structural validator's job.
+    """
+    if offset + 4 > len(payload):
+        raise ValueError(f"truncated {label} index count")
+    index_count = int.from_bytes(payload[offset:offset + 4], "big")
+    offset += 4
+    if index_count == 0:
+        raise ValueError(f"{label} indices must be non-empty")
+    indices = []
+    for _ in range(index_count):
+        index, offset = _read_varint(payload, offset, what=f"{label} index")
+        indices.append(index)
+    return indices, offset
+
+
+def _decode_compact_multi_proof_siblings(
+    payload: bytes, offset: int, *, label: str, digest_size: int
+) -> tuple[tuple[bytes, ...], int]:
+    """Read the 4-byte sibling count and that many raw fixed-width digests."""
+    if offset + 4 > len(payload):
+        raise ValueError(f"truncated {label} sibling count")
+    sibling_count = int.from_bytes(payload[offset:offset + 4], "big")
+    offset += 4
+    siblings = []
+    for _ in range(sibling_count):
+        if offset + digest_size > len(payload):
+            raise ValueError(f"truncated {label} sibling")
+        siblings.append(bytes(payload[offset:offset + digest_size]))
+        offset += digest_size
+    return tuple(siblings), offset
 
 
 @dataclass(frozen=True)
@@ -8165,23 +8438,7 @@ def make_multi_proof(
 
     levels = _audit_proof_levels(records)
 
-    siblings: list[bytes] = []
-    positions = set(indices)
-    for level in levels[:-1]:
-        width = len(level)
-        padded = level if width % 2 == 0 else level + level[-1:]
-        next_positions = set()
-        for position in sorted(positions):
-            if width % 2 == 1 and position == width - 1:
-                # Odd tail with no companion: the tree pairs it with itself.
-                pass
-            elif (position ^ 1) in positions:
-                # The companion is itself a disclosed node; nothing to send.
-                pass
-            else:
-                siblings.append(padded[position ^ 1])
-            next_positions.add(position // 2)
-        positions = next_positions
+    siblings = _collect_compact_multi_proof_siblings(levels, count, indices)
 
     root = levels[-1][0]
     proof_records = tuple(records[index] for index in indices)
@@ -8197,31 +8454,27 @@ def make_multi_proof(
 def _required_multi_proof_siblings(count: int, indices: tuple[int, ...]) -> int:
     """Number of 32-byte companion digests a multi-proof for ``count`` leaves must carry.
 
-    Replays :func:`make_multi_proof`'s level walk structurally: at each level
-    a proven node needs a sibling unless it is the odd-width tail (paired
-    with itself) or its companion is itself a proven node at that level. The
-    answer depends only on ``n`` and the disclosed positions — never on the
-    records or the digests — so it is the unique sibling count both encoders
-    and decoders can demand.
+    Thin family-named wrapper over the shared
+    :func:`_required_compact_multi_proof_siblings` walk: at each level a
+    proven node needs a sibling unless it is the odd-width tail (paired with
+    itself) or its companion is itself a proven node at that level.
     """
-    required = 0
-    positions = set(indices)
-    width = count
-    while width > 1:
-        next_positions = set()
-        for position in sorted(positions):
-            if width % 2 == 1 and position == width - 1:
-                # Odd tail with no companion: the tree pairs it with itself.
-                pass
-            elif (position ^ 1) in positions:
-                # The companion is itself a disclosed node; nothing to send.
-                pass
-            else:
-                required += 1
-            next_positions.add(position // 2)
-        positions = next_positions
-        width = (width + 1) // 2
-    return required
+    return _required_compact_multi_proof_siblings(count, indices)
+
+
+def _validate_audit_multi_proof_record(record: object) -> None:
+    """Type/shape checks for one ``(message, SigningAudit)`` multi-proof entry."""
+    if not isinstance(record, tuple) or len(record) != 2:
+        raise TypeError("each proof record must be a (message, audit) tuple")
+    message, audit = record
+    if not isinstance(message, bytes):
+        raise TypeError("proof record message must be bytes")
+    if not isinstance(audit, SigningAudit):
+        raise TypeError("proof record audit must be a SigningAudit instance")
+    if not isinstance(audit.payload, bytes):
+        raise TypeError("proof record audit payload must be bytes")
+    if not audit.payload:
+        raise ValueError("proof record audit payload must be non-empty")
 
 
 def _validate_audit_multi_proof_structure(
@@ -8229,78 +8482,25 @@ def _validate_audit_multi_proof_structure(
 ) -> tuple[tuple[int, ...], int, tuple[tuple[bytes, SigningAudit], ...], tuple[bytes, ...]]:
     """Type- and structure-check an :class:`AuditMultiProof`, returning its fields.
 
-    Only the container structure is checked: the receipt payloads are kept
-    opaque and neither they nor the siblings are cryptographically verified
-    here. The bounds are ``0 < n < 2**64``, a non-empty
-    ``indices``/``records`` pair of equal length with strictly increasing
-    indices in ``0 <= i < n`` and well-formed ``(bytes, SigningAudit)``
-    records with non-empty payloads, and a siblings tuple whose entries are
-    exactly 32 bytes. Wrong field types raise TypeError; illegal bounds or
-    shapes raise ValueError. The number of siblings is derived uniquely from
-    ``n`` and ``indices`` (the compact walk sends one companion per proven
-    node that is neither an odd tail nor paired with another proven node), so
-    a missing or extra sibling raises ValueError here — before any root is
-    rebuilt.
+    Family-named wrapper over the shared
+    :func:`_validate_compact_multi_proof_structure`; see that function for
+    the bounds and errors. Only the container structure is checked: the
+    receipt payloads are kept opaque and neither they nor the siblings are
+    cryptographically verified here, and a missing or extra sibling is
+    rejected here — before any root is rebuilt.
     """
-    if not isinstance(proof, AuditMultiProof):
-        raise TypeError("proof must be an AuditMultiProof instance")
-    indices = proof.indices
-    count = proof.n
-    proof_records = proof.records
-    siblings = proof.siblings
-    if not isinstance(indices, tuple):
-        raise TypeError("proof.indices must be a tuple")
-    if not isinstance(count, int) or isinstance(count, bool):
-        raise TypeError("proof.n must be an integer")
-    if not isinstance(proof_records, tuple):
-        raise TypeError("proof.records must be a tuple")
-    if not isinstance(siblings, tuple):
-        raise TypeError("proof.siblings must be a tuple")
-
-    if count <= 0:
-        raise ValueError("proof.n must be positive")
-    if count > 0xFFFFFFFFFFFFFFFF:
-        raise ValueError("too many records")
-    if len(indices) == 0:
-        raise ValueError("proof.indices must be non-empty")
-    if len(indices) != len(proof_records):
-        raise ValueError("proof.records must pair one-to-one with proof.indices")
-
-    previous = -1
-    for index in indices:
-        if not isinstance(index, int) or isinstance(index, bool):
-            raise TypeError("proof.indices entries must be integers")
-        if index <= previous:
-            raise ValueError("proof.indices must be strictly increasing and unique")
-        if index < 0 or index >= count:
-            raise ValueError("proof.indices entry out of range")
-        previous = index
-
-    for record in proof_records:
-        if not isinstance(record, tuple) or len(record) != 2:
-            raise TypeError("each proof record must be a (message, audit) tuple")
-        message, audit = record
-        if not isinstance(message, bytes):
-            raise TypeError("proof record message must be bytes")
-        if not isinstance(audit, SigningAudit):
-            raise TypeError("proof record audit must be a SigningAudit instance")
-        if not isinstance(audit.payload, bytes):
-            raise TypeError("proof record audit payload must be bytes")
-        if not audit.payload:
-            raise ValueError("proof record audit payload must be non-empty")
-
-    for sibling in siblings:
-        if not isinstance(sibling, bytes):
-            raise TypeError("proof.siblings entries must be bytes")
-    for sibling in siblings:
-        if len(sibling) != AUDIT_PROOF_DIGEST_SIZE:
-            raise ValueError("proof.siblings entries must be exactly 32 bytes")
-    required_siblings = _required_multi_proof_siblings(count, indices)
-    if len(siblings) != required_siblings:
-        raise ValueError(
-            "proof.siblings count is not the one determined by n and indices"
-        )
-    return indices, count, proof_records, siblings
+    return _validate_compact_multi_proof_structure(
+        proof,
+        proof_type=AuditMultiProof,
+        proof_type_name="AuditMultiProof",
+        count_attr="n",
+        entries_attr="records",
+        count_label="n",
+        entries_label="records",
+        too_many_message="too many records",
+        digest_size=AUDIT_PROOF_DIGEST_SIZE,
+        check_entry=_validate_audit_multi_proof_record,
+    )
 
 
 def check_multi_proof(
@@ -8348,44 +8548,15 @@ def check_multi_proof(
     _result, public_key, field_prime, group_prime, generator = _check_signing_setup(key)
     _check_signing_dkg_structure(key)
 
-    nodes = {
-        index: _audit_proof_leaf(index, message, audit)
+    leaf_digests = [
+        _audit_proof_leaf(index, message, audit)
         for index, (message, audit) in zip(indices, proof_records)
-    }
-    pending = iter(siblings)
-    width = count
-    while width > 1:
-        next_nodes = {}
-        for position in sorted(nodes):
-            parent = position // 2
-            if parent in next_nodes:
-                continue
-            if width % 2 == 1 and position == width - 1:
-                # Odd tail with no companion: pair the node with itself.
-                next_nodes[parent] = _audit_proof_node(nodes[position], nodes[position])
-            elif (position ^ 1) in nodes:
-                left = position if position % 2 == 0 else position ^ 1
-                next_nodes[parent] = _audit_proof_node(nodes[left], nodes[left ^ 1])
-            else:
-                try:
-                    sibling = next(pending)
-                except StopIteration:
-                    raise ValueError("proof.siblings is missing entries") from None
-                if position % 2 == 0:
-                    next_nodes[parent] = _audit_proof_node(nodes[position], sibling)
-                else:
-                    next_nodes[parent] = _audit_proof_node(sibling, nodes[position])
-        nodes = next_nodes
-        width = (width + 1) // 2
+    ]
+    root = _rebuild_compact_multi_proof_root(
+        count, indices, leaf_digests, siblings, _audit_proof_node
+    )
 
-    try:
-        next(pending)
-    except StopIteration:
-        pass
-    else:
-        raise ValueError("proof.siblings has extra entries")
-
-    signed_message = AUDIT_PROOF_ROOT_TAG + _audit_proof_u64(count) + nodes[0]
+    signed_message = AUDIT_PROOF_ROOT_TAG + _audit_proof_u64(count) + root
     for (message, audit) in proof_records:
         if not check_audit(message, audit, key):
             return False
@@ -8838,24 +9009,15 @@ def decode_audit_multi_proof(payload: bytes) -> AuditMultiProof:
 
     count, offset = _read_varint(payload, offset, what="audit multi-proof n")
 
-    if offset + 4 > len(payload):
-        raise ValueError("truncated audit multi-proof index count")
-    index_count = int.from_bytes(payload[offset:offset + 4], "big")
-    offset += 4
-    if index_count == 0:
-        raise ValueError("audit multi-proof indices must be non-empty")
-    indices = []
-    for _ in range(index_count):
-        index, offset = _read_varint(
-            payload, offset, what="audit multi-proof index"
-        )
-        indices.append(index)
+    indices, offset = _decode_compact_multi_proof_indices(
+        payload, offset, label="audit multi-proof"
+    )
 
     if offset + 4 > len(payload):
         raise ValueError("truncated audit multi-proof record count")
     record_count = int.from_bytes(payload[offset:offset + 4], "big")
     offset += 4
-    if record_count != index_count:
+    if record_count != len(indices):
         raise ValueError(
             "audit multi-proof record count must match the index count"
         )
@@ -8869,18 +9031,12 @@ def decode_audit_multi_proof(payload: bytes) -> AuditMultiProof:
         )
         records.append((message, SigningAudit(payload=receipt)))
 
-    if offset + 4 > len(payload):
-        raise ValueError("truncated audit multi-proof sibling count")
-    sibling_count = int.from_bytes(payload[offset:offset + 4], "big")
-    offset += 4
-    siblings = []
-    for _ in range(sibling_count):
-        if offset + AUDIT_PROOF_DIGEST_SIZE > len(payload):
-            raise ValueError("truncated audit multi-proof sibling")
-        siblings.append(
-            bytes(payload[offset:offset + AUDIT_PROOF_DIGEST_SIZE])
-        )
-        offset += AUDIT_PROOF_DIGEST_SIZE
+    siblings, offset = _decode_compact_multi_proof_siblings(
+        payload,
+        offset,
+        label="audit multi-proof",
+        digest_size=AUDIT_PROOF_DIGEST_SIZE,
+    )
     if offset != len(payload):
         raise ValueError("trailing bytes after audit multi-proof")
 
@@ -14061,23 +14217,7 @@ def make_history_multi_proof(
 
     levels = _history_proof_levels(history.items)
 
-    siblings: list[bytes] = []
-    positions = set(indices)
-    for level in levels[:-1]:
-        width = len(level)
-        padded = level if width % 2 == 0 else level + level[-1:]
-        next_positions = set()
-        for position in sorted(positions):
-            if width % 2 == 1 and position == width - 1:
-                # Odd tail with no companion: the tree pairs it with itself.
-                pass
-            elif (position ^ 1) in positions:
-                # The companion is itself a disclosed node; nothing to send.
-                pass
-            else:
-                siblings.append(padded[position ^ 1])
-            next_positions.add(position // 2)
-        positions = next_positions
+    siblings = _collect_compact_multi_proof_siblings(levels, total, indices)
 
     root = levels[-1][0]
     proof_seals = tuple(history.items[index] for index in indices)
@@ -14095,31 +14235,19 @@ def _required_history_multi_proof_siblings(
 ) -> int:
     """Number of 32-byte companion digests a multi-proof must carry.
 
-    Replays :func:`make_history_multi_proof`'s level walk structurally: at
-    each level a proven node needs a sibling unless it is the odd-width
-    tail (paired with itself) or its companion is itself a proven node at
-    that level. The answer depends only on ``total`` and the disclosed
-    positions — never on the seals or the digests — so it is the unique
-    sibling count both makers and checkers can demand.
+    Thin family-named wrapper over the shared
+    :func:`_required_compact_multi_proof_siblings` walk. The answer depends
+    only on ``total`` and the disclosed positions — never on the seals or the
+    digests — so it is the unique sibling count makers, checkers and the
+    other seal-history proof families' codecs all demand.
     """
-    required = 0
-    positions = set(indices)
-    width = total
-    while width > 1:
-        next_positions = set()
-        for position in sorted(positions):
-            if width % 2 == 1 and position == width - 1:
-                # Odd tail with no companion: the tree pairs it with itself.
-                pass
-            elif (position ^ 1) in positions:
-                # The companion is itself a disclosed node; nothing to send.
-                pass
-            else:
-                required += 1
-            next_positions.add(position // 2)
-        positions = next_positions
-        width = (width + 1) // 2
-    return required
+    return _required_compact_multi_proof_siblings(total, indices)
+
+
+def _validate_history_multi_proof_seal(seal: object) -> None:
+    """Type check for one :class:`ReportSeal` multi-proof entry."""
+    if not isinstance(seal, ReportSeal):
+        raise TypeError("proof.seals entries must be ReportSeal instances")
 
 
 def _validate_history_multi_proof_structure(
@@ -14127,72 +14255,24 @@ def _validate_history_multi_proof_structure(
 ) -> tuple[tuple[int, ...], int, tuple[ReportSeal, ...], tuple[bytes, ...]]:
     """Type- and structure-check a SealHistoryMultiProof, returning its fields.
 
-    Only the container structure is checked: the seals themselves are
-    neither encoded nor verified here (that is :func:`verify_seal`'s job
-    during verification). The bounds are ``0 < total < 2**64``, a
-    non-empty ``indices``/``seals`` pair of equal length with strictly
-    increasing indices in ``0 <= i < total`` and a siblings tuple whose
-    entries are exactly 32 bytes. Wrong field types raise TypeError;
-    illegal bounds or shapes raise ValueError. The number of siblings is
-    derived uniquely from ``total`` and ``indices`` (the compact walk
-    sends one companion per proven node that is neither an odd tail nor
-    paired with another proven node), so a missing or extra sibling
-    raises ValueError here — before any root is rebuilt.
+    Family-named wrapper over the shared
+    :func:`_validate_compact_multi_proof_structure`; see that function for
+    the bounds and errors. The seals themselves are neither encoded nor
+    verified here (that is :func:`verify_seal`'s job during verification), and
+    a missing or extra sibling is rejected here — before any root is rebuilt.
     """
-    if not isinstance(proof, SealHistoryMultiProof):
-        raise TypeError(
-            "proof must be a SealHistoryMultiProof instance"
-        )
-    indices = proof.indices
-    total = proof.total
-    seals = proof.seals
-    siblings = proof.siblings
-    if not isinstance(indices, tuple):
-        raise TypeError("proof.indices must be a tuple")
-    if not isinstance(total, int) or isinstance(total, bool):
-        raise TypeError("proof.total must be an integer")
-    if not isinstance(seals, tuple):
-        raise TypeError("proof.seals must be a tuple")
-    if not isinstance(siblings, tuple):
-        raise TypeError("proof.siblings must be a tuple")
-
-    if total <= 0:
-        raise ValueError("proof.total must be positive")
-    if total > 0xFFFFFFFFFFFFFFFF:
-        raise ValueError("too many history items")
-    if len(indices) == 0:
-        raise ValueError("proof.indices must be non-empty")
-    if len(indices) != len(seals):
-        raise ValueError("proof.seals must pair one-to-one with proof.indices")
-
-    previous = -1
-    for index in indices:
-        if not isinstance(index, int) or isinstance(index, bool):
-            raise TypeError("proof.indices entries must be integers")
-        if index <= previous:
-            raise ValueError(
-                "proof.indices must be strictly increasing and unique"
-            )
-        if index < 0 or index >= total:
-            raise ValueError("proof.indices entry out of range")
-        previous = index
-
-    for seal in seals:
-        if not isinstance(seal, ReportSeal):
-            raise TypeError("proof.seals entries must be ReportSeal instances")
-
-    for sibling in siblings:
-        if not isinstance(sibling, bytes):
-            raise TypeError("proof.siblings entries must be bytes")
-    for sibling in siblings:
-        if len(sibling) != SEAL_HISTORY_PROOF_DIGEST_SIZE:
-            raise ValueError("proof.siblings entries must be exactly 32 bytes")
-    required_siblings = _required_history_multi_proof_siblings(total, indices)
-    if len(siblings) != required_siblings:
-        raise ValueError(
-            "proof.siblings count is not the one determined by total and indices"
-        )
-    return indices, total, seals, siblings
+    return _validate_compact_multi_proof_structure(
+        proof,
+        proof_type=SealHistoryMultiProof,
+        proof_type_name="SealHistoryMultiProof",
+        count_attr="total",
+        entries_attr="seals",
+        count_label="total",
+        entries_label="seals",
+        too_many_message="too many history items",
+        digest_size=SEAL_HISTORY_PROOF_DIGEST_SIZE,
+        check_entry=_validate_history_multi_proof_seal,
+    )
 
 
 def check_history_multi_proof(
@@ -14245,55 +14325,15 @@ def check_history_multi_proof(
         if not verify_seal(seal, key):
             return False
 
-    nodes = {
-        index: _history_proof_leaf(index, seal)
-        for index, seal in zip(indices, seals)
-    }
-    pending = iter(siblings)
-    width = total
-    while width > 1:
-        next_nodes = {}
-        for position in sorted(nodes):
-            parent = position // 2
-            if parent in next_nodes:
-                continue
-            if width % 2 == 1 and position == width - 1:
-                # Odd tail with no companion: pair the node with itself.
-                next_nodes[parent] = _history_proof_node(
-                    nodes[position], nodes[position]
-                )
-            elif (position ^ 1) in nodes:
-                left = position if position % 2 == 0 else position ^ 1
-                next_nodes[parent] = _history_proof_node(
-                    nodes[left], nodes[left ^ 1]
-                )
-            else:
-                try:
-                    sibling = next(pending)
-                except StopIteration:
-                    raise ValueError(
-                        "proof.siblings is missing entries"
-                    ) from None
-                if position % 2 == 0:
-                    next_nodes[parent] = _history_proof_node(
-                        nodes[position], sibling
-                    )
-                else:
-                    next_nodes[parent] = _history_proof_node(
-                        sibling, nodes[position]
-                    )
-        nodes = next_nodes
-        width = (width + 1) // 2
-
-    try:
-        next(pending)
-    except StopIteration:
-        pass
-    else:
-        raise ValueError("proof.siblings has extra entries")
+    leaf_digests = [
+        _history_proof_leaf(index, seal) for index, seal in zip(indices, seals)
+    ]
+    root = _rebuild_compact_multi_proof_root(
+        total, indices, leaf_digests, siblings, _history_proof_node
+    )
 
     signed_message = (
-        SEAL_HISTORY_PROOF_ROOT_TAG + _history_proof_u64(total) + nodes[0]
+        SEAL_HISTORY_PROOF_ROOT_TAG + _history_proof_u64(total) + root
     )
     return verify_signature(
         signed_message,
@@ -14435,24 +14475,15 @@ def decode_history_multi_proof(blob: bytes) -> SealHistoryMultiProof:
     if total > 0xFFFFFFFFFFFFFFFF:
         raise ValueError("seal history multi-proof total too large")
 
-    if offset + 4 > len(blob):
-        raise ValueError("truncated seal history multi-proof index count")
-    index_count = int.from_bytes(blob[offset:offset + 4], "big")
-    offset += 4
-    if index_count == 0:
-        raise ValueError("seal history multi-proof indices must be non-empty")
-    indices = []
-    for _ in range(index_count):
-        index, offset = _read_varint(
-            blob, offset, what="seal history multi-proof index"
-        )
-        indices.append(index)
+    indices, offset = _decode_compact_multi_proof_indices(
+        blob, offset, label="seal history multi-proof"
+    )
 
     if offset + 4 > len(blob):
         raise ValueError("truncated seal history multi-proof seal count")
     seal_count = int.from_bytes(blob[offset:offset + 4], "big")
     offset += 4
-    if seal_count != index_count:
+    if seal_count != len(indices):
         raise ValueError(
             "seal history multi-proof seal count must match the index count"
         )
@@ -14465,22 +14496,12 @@ def decode_history_multi_proof(blob: bytes) -> SealHistoryMultiProof:
         )
         seals.append(decode_seal(encoded_seal))
 
-    if offset + 4 > len(blob):
-        raise ValueError("truncated seal history multi-proof sibling count")
-    sibling_count = int.from_bytes(blob[offset:offset + 4], "big")
-    offset += 4
-    siblings = []
-    for _ in range(sibling_count):
-        if offset + SEAL_HISTORY_PROOF_DIGEST_SIZE > len(blob):
-            raise ValueError("truncated seal history multi-proof sibling")
-        siblings.append(
-            bytes(
-                blob[
-                    offset:offset + SEAL_HISTORY_PROOF_DIGEST_SIZE
-                ]
-            )
-        )
-        offset += SEAL_HISTORY_PROOF_DIGEST_SIZE
+    siblings, offset = _decode_compact_multi_proof_siblings(
+        blob,
+        offset,
+        label="seal history multi-proof",
+        digest_size=SEAL_HISTORY_PROOF_DIGEST_SIZE,
+    )
     if offset != len(blob):
         raise ValueError("trailing bytes after seal history multi-proof")
 
