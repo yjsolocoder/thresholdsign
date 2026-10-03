@@ -8117,6 +8117,41 @@ class AuditMultiProof:
     siblings: tuple[bytes, ...]
 
 
+def _multi_proof_collect_siblings(
+    levels: list[tuple[bytes, ...]], indices: tuple[int, ...]
+) -> list[bytes]:
+    """Collect the companion digests a compact multi-proof must carry.
+
+    Walks the precomputed tree ``levels`` (leaves first, root last) from the
+    leaf level upward: at each level a proven position is paired left to
+    right; when the companion position is itself a proven node carried in
+    the proof, or the node is the last member of an odd-width level (which
+    the tree pairs with itself), no sibling is appended; otherwise the
+    companion digest is. Proven nodes from lower levels feed the level
+    above exactly as in the tree, so no digest is sent twice. This is the
+    single sibling-selection rule shared by the audit and seal-history
+    compact multi-proofs.
+    """
+    siblings: list[bytes] = []
+    positions = set(indices)
+    for level in levels[:-1]:
+        width = len(level)
+        padded = level if width % 2 == 0 else level + level[-1:]
+        next_positions = set()
+        for position in sorted(positions):
+            if width % 2 == 1 and position == width - 1:
+                # Odd tail with no companion: the tree pairs it with itself.
+                pass
+            elif (position ^ 1) in positions:
+                # The companion is itself a disclosed node; nothing to send.
+                pass
+            else:
+                siblings.append(padded[position ^ 1])
+            next_positions.add(position // 2)
+        positions = next_positions
+    return siblings
+
+
 def make_multi_proof(
     records: tuple[tuple[bytes, SigningAudit], ...],
     indices: tuple[int, ...],
@@ -8165,23 +8200,7 @@ def make_multi_proof(
 
     levels = _audit_proof_levels(records)
 
-    siblings: list[bytes] = []
-    positions = set(indices)
-    for level in levels[:-1]:
-        width = len(level)
-        padded = level if width % 2 == 0 else level + level[-1:]
-        next_positions = set()
-        for position in sorted(positions):
-            if width % 2 == 1 and position == width - 1:
-                # Odd tail with no companion: the tree pairs it with itself.
-                pass
-            elif (position ^ 1) in positions:
-                # The companion is itself a disclosed node; nothing to send.
-                pass
-            else:
-                siblings.append(padded[position ^ 1])
-            next_positions.add(position // 2)
-        positions = next_positions
+    siblings = _multi_proof_collect_siblings(levels, indices)
 
     root = levels[-1][0]
     proof_records = tuple(records[index] for index in indices)
@@ -8197,12 +8216,14 @@ def make_multi_proof(
 def _required_multi_proof_siblings(count: int, indices: tuple[int, ...]) -> int:
     """Number of 32-byte companion digests a multi-proof for ``count`` leaves must carry.
 
-    Replays :func:`make_multi_proof`'s level walk structurally: at each level
-    a proven node needs a sibling unless it is the odd-width tail (paired
-    with itself) or its companion is itself a proven node at that level. The
-    answer depends only on ``n`` and the disclosed positions — never on the
-    records or the digests — so it is the unique sibling count both encoders
-    and decoders can demand.
+    Replays the compact level walk structurally: at each level a proven
+    node needs a sibling unless it is the odd-width tail (paired with
+    itself) or its companion is itself a proven node at that level. The
+    answer depends only on the leaf count and the disclosed positions —
+    never on the payloads or the digests — so it is the unique sibling
+    count both encoders and decoders can demand. This is the single
+    counting rule shared by the audit and seal-history compact
+    multi-proofs.
     """
     required = 0
     positions = set(indices)
@@ -8222,6 +8243,61 @@ def _required_multi_proof_siblings(count: int, indices: tuple[int, ...]) -> int:
         positions = next_positions
         width = (width + 1) // 2
     return required
+
+
+def _multi_proof_rebuild_root(
+    count: int,
+    nodes: dict[int, bytes],
+    siblings: tuple[bytes, ...],
+    node: Callable[[bytes, bytes], bytes],
+) -> bytes:
+    """Rebuild a compact multi-proof's root, consuming ``siblings`` exactly.
+
+    ``nodes`` maps each disclosed leaf position to its leaf digest; ``node``
+    is the family-specific ordered internal-node combiner. The walk pairs
+    proven nodes left to right at each level: a companion that is itself a
+    proven node is used directly, the last member of an odd-width level is
+    paired with itself, and otherwise the next 32-byte entry of ``siblings``
+    is consumed. The width contracts as ``(width + 1) // 2`` until a single
+    root remains. Too few or leftover siblings raise ValueError. This is the
+    single root-rebuild rule shared by the audit and seal-history compact
+    multi-proofs.
+    """
+    pending = iter(siblings)
+    width = count
+    while width > 1:
+        next_nodes = {}
+        for position in sorted(nodes):
+            parent = position // 2
+            if parent in next_nodes:
+                continue
+            if width % 2 == 1 and position == width - 1:
+                # Odd tail with no companion: pair the node with itself.
+                next_nodes[parent] = node(nodes[position], nodes[position])
+            elif (position ^ 1) in nodes:
+                left = position if position % 2 == 0 else position ^ 1
+                next_nodes[parent] = node(nodes[left], nodes[left ^ 1])
+            else:
+                try:
+                    sibling = next(pending)
+                except StopIteration:
+                    raise ValueError(
+                        "proof.siblings is missing entries"
+                    ) from None
+                if position % 2 == 0:
+                    next_nodes[parent] = node(nodes[position], sibling)
+                else:
+                    next_nodes[parent] = node(sibling, nodes[position])
+        nodes = next_nodes
+        width = (width + 1) // 2
+
+    try:
+        next(pending)
+    except StopIteration:
+        pass
+    else:
+        raise ValueError("proof.siblings has extra entries")
+    return nodes[0]
 
 
 def _validate_audit_multi_proof_structure(
@@ -8352,40 +8428,9 @@ def check_multi_proof(
         index: _audit_proof_leaf(index, message, audit)
         for index, (message, audit) in zip(indices, proof_records)
     }
-    pending = iter(siblings)
-    width = count
-    while width > 1:
-        next_nodes = {}
-        for position in sorted(nodes):
-            parent = position // 2
-            if parent in next_nodes:
-                continue
-            if width % 2 == 1 and position == width - 1:
-                # Odd tail with no companion: pair the node with itself.
-                next_nodes[parent] = _audit_proof_node(nodes[position], nodes[position])
-            elif (position ^ 1) in nodes:
-                left = position if position % 2 == 0 else position ^ 1
-                next_nodes[parent] = _audit_proof_node(nodes[left], nodes[left ^ 1])
-            else:
-                try:
-                    sibling = next(pending)
-                except StopIteration:
-                    raise ValueError("proof.siblings is missing entries") from None
-                if position % 2 == 0:
-                    next_nodes[parent] = _audit_proof_node(nodes[position], sibling)
-                else:
-                    next_nodes[parent] = _audit_proof_node(sibling, nodes[position])
-        nodes = next_nodes
-        width = (width + 1) // 2
+    root = _multi_proof_rebuild_root(count, nodes, siblings, _audit_proof_node)
 
-    try:
-        next(pending)
-    except StopIteration:
-        pass
-    else:
-        raise ValueError("proof.siblings has extra entries")
-
-    signed_message = AUDIT_PROOF_ROOT_TAG + _audit_proof_u64(count) + nodes[0]
+    signed_message = AUDIT_PROOF_ROOT_TAG + _audit_proof_u64(count) + root
     for (message, audit) in proof_records:
         if not check_audit(message, audit, key):
             return False
@@ -14061,23 +14106,7 @@ def make_history_multi_proof(
 
     levels = _history_proof_levels(history.items)
 
-    siblings: list[bytes] = []
-    positions = set(indices)
-    for level in levels[:-1]:
-        width = len(level)
-        padded = level if width % 2 == 0 else level + level[-1:]
-        next_positions = set()
-        for position in sorted(positions):
-            if width % 2 == 1 and position == width - 1:
-                # Odd tail with no companion: the tree pairs it with itself.
-                pass
-            elif (position ^ 1) in positions:
-                # The companion is itself a disclosed node; nothing to send.
-                pass
-            else:
-                siblings.append(padded[position ^ 1])
-            next_positions.add(position // 2)
-        positions = next_positions
+    siblings = _multi_proof_collect_siblings(levels, indices)
 
     root = levels[-1][0]
     proof_seals = tuple(history.items[index] for index in indices)
@@ -14100,26 +14129,11 @@ def _required_history_multi_proof_siblings(
     tail (paired with itself) or its companion is itself a proven node at
     that level. The answer depends only on ``total`` and the disclosed
     positions — never on the seals or the digests — so it is the unique
-    sibling count both makers and checkers can demand.
+    sibling count both makers and checkers can demand. The rule itself is
+    the shared compact multi-proof walk in
+    :func:`_required_multi_proof_siblings`.
     """
-    required = 0
-    positions = set(indices)
-    width = total
-    while width > 1:
-        next_positions = set()
-        for position in sorted(positions):
-            if width % 2 == 1 and position == width - 1:
-                # Odd tail with no companion: the tree pairs it with itself.
-                pass
-            elif (position ^ 1) in positions:
-                # The companion is itself a disclosed node; nothing to send.
-                pass
-            else:
-                required += 1
-            next_positions.add(position // 2)
-        positions = next_positions
-        width = (width + 1) // 2
-    return required
+    return _required_multi_proof_siblings(total, indices)
 
 
 def _validate_history_multi_proof_structure(
@@ -14249,51 +14263,10 @@ def check_history_multi_proof(
         index: _history_proof_leaf(index, seal)
         for index, seal in zip(indices, seals)
     }
-    pending = iter(siblings)
-    width = total
-    while width > 1:
-        next_nodes = {}
-        for position in sorted(nodes):
-            parent = position // 2
-            if parent in next_nodes:
-                continue
-            if width % 2 == 1 and position == width - 1:
-                # Odd tail with no companion: pair the node with itself.
-                next_nodes[parent] = _history_proof_node(
-                    nodes[position], nodes[position]
-                )
-            elif (position ^ 1) in nodes:
-                left = position if position % 2 == 0 else position ^ 1
-                next_nodes[parent] = _history_proof_node(
-                    nodes[left], nodes[left ^ 1]
-                )
-            else:
-                try:
-                    sibling = next(pending)
-                except StopIteration:
-                    raise ValueError(
-                        "proof.siblings is missing entries"
-                    ) from None
-                if position % 2 == 0:
-                    next_nodes[parent] = _history_proof_node(
-                        nodes[position], sibling
-                    )
-                else:
-                    next_nodes[parent] = _history_proof_node(
-                        sibling, nodes[position]
-                    )
-        nodes = next_nodes
-        width = (width + 1) // 2
-
-    try:
-        next(pending)
-    except StopIteration:
-        pass
-    else:
-        raise ValueError("proof.siblings has extra entries")
+    root = _multi_proof_rebuild_root(total, nodes, siblings, _history_proof_node)
 
     signed_message = (
-        SEAL_HISTORY_PROOF_ROOT_TAG + _history_proof_u64(total) + nodes[0]
+        SEAL_HISTORY_PROOF_ROOT_TAG + _history_proof_u64(total) + root
     )
     return verify_signature(
         signed_message,
