@@ -291,6 +291,23 @@ assert verify_round_packet(restored, trusted)
 `R = 1` 均保留现有支持。核验成功的包可直接把 `round_info` 交给
 `verify_signature_share` 与 `aggregate_signature`，结果与原始轮次完全相同。
 
+签名方一侧有对应入口 `sign_round_packet(signer_id, secret_share, nonce,
+packet, context, expected_message)`：只凭本人聚合秘密份额、本人一次性 nonce、
+可独立流转的轮次包与本地可信公开上下文即可产出 `SignatureShare`，不需要完整
+DKG 结果、他人秘密份额或盲化份额，也不依赖任何历史调用。入口先逐项确认包内
+上下文的全部公开字段与可信上下文相等（刷新或重共享后即使联合公钥未变，旧包
+对新上下文也抛 `ValueError`）、包中消息与 `expected_message` 逐字节相同（即使
+修改消息后重新计算了合法挑战也无法绕过）、承诺乘积等于 `R` 且挑战按既有规则
+重算一致；再要求签名者同时属于上下文成员与本轮签名集合，`0 <= s_i <
+field_prime` 且 `g ** s_i` 等于本人验证份额（挑战为零时同样检查），`1 <= r_i
+<= field_prime - 1` 且 `g ** r_i` 等于本人本轮承诺。任何不一致抛 `ValueError`
+且不返回份额；参数或字段类型错误抛 `TypeError`（布尔不视为整数），群参数、
+编号顺序、门限、承诺对应关系及数值范围等结构错误沿用轮次包约束抛
+`ValueError`。合法输入的结果与同一密钥、轮次、秘密份额和 nonce 经
+`create_signature_share` 得到的份额按值相等，可直接交给
+`verify_signature_share` 与 `aggregate_signature`；入口不修改输入、不保存秘密
+或 nonce，重复调用结果确定，nonce 防复用仍由调用方负责。
+
 ### 主动份额刷新
 
 签名密钥长期使用时，可用主动份额刷新（proactive refresh）在不改变联合秘密与
@@ -1608,6 +1625,17 @@ python3 -m thresholdsign
   承诺乘积等于 `R` 并按既有规则重算挑战；完全一致返回 `True`，否则返回
   `False`。核验成功的包可直接用于 `verify_signature_share` 与
   `aggregate_signature`，结果与原始轮次相同
+- `sign_round_packet(signer_id, secret_share, nonce, packet, context, expected_message)`
+  — 签名方一侧的轮次包入口：只凭本人聚合秘密份额、本人一次性 nonce、轮次包与
+  可信公开上下文产出 `SignatureShare`，不需要 DKG 结果或他人秘密。先确认包内
+  上下文全部公开字段与可信上下文相等、包中消息与 `expected_message` 逐字节相同、
+  承诺乘积等于 `R` 且挑战重算一致，再检查签名者同时属于上下文成员与本轮签名
+  集合、`0 <= s_i < field_prime` 且 `g ** s_i` 等于本人验证份额（挑战为零也
+  检查）、`1 <= r_i <= field_prime - 1` 且 `g ** r_i` 等于本人本轮承诺；任何
+  不一致抛 `ValueError` 且不返回份额，类型错误（布尔不视为整数）抛 `TypeError`，
+  结构错误沿用轮次包约束抛 `ValueError`。结果与 `create_signature_share` 对同一
+  密钥、轮次、秘密份额和 nonce 的产出按值相等，可直接进入现有份额验证与聚合；
+  不修改输入、不保存秘密或 nonce，重复调用结果确定，nonce 防复用由调用方负责
 - `SignatureReceipt(message, signature, public_key, field_prime, group_prime, generator)`
   — 冻结数据类，可按位置构造、按值相等；可独立流转的门限 Schnorr 签名凭证：
   `message` 为被签名字节串，`signature` 是 `AggregateSignature(R, z, signer_ids)`，
