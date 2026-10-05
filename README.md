@@ -242,6 +242,55 @@ message、签名集合、聚合 `R`、`Y` 与群参数一致且与上下文相�
 人数不足、上下文不匹配、凭证不一致、承诺不合要求或验签失败抛 `ValueError`，
 绝不返回部分签名；输入顺序不影响结果，也不改变任何输入对象。
 
+### 可独立流转的公开轮次包
+
+第一轮材料也可以脱离 DKG 结果独立传输：`SigningRoundPacket` 冻结记录
+`context`（`SigningPublicContext`：参与者编号、门限、群参数、联合公钥与每人
+一个验证份额）与 `round_info`（`SigningRound`：消息原始字节、签名者集合、每人
+一个轮次一承诺、聚合 `R` 与挑战），可按位置构造、按值相等，不含秘密份额、
+盲化份额、nonce 或任何隐藏状态。接收方只凭公开数据和自己信任的上下文即可
+核验第一轮材料：
+
+```python
+from thresholdsign import (
+    SigningRoundPacket, encode_round_packet, decode_round_packet,
+    verify_round_packet, export_signing_public_context,
+)
+
+# round_info 是 create_signing_round 的结果，key 是 DKG 结果
+packet = SigningRoundPacket(export_signing_public_context(key), round_info)
+
+blob = encode_round_packet(packet)              # bytes，无秘密、唯一编码
+restored = decode_round_packet(blob)
+assert restored == packet                        # 按值相等
+assert encode_round_packet(restored) == blob     # 成功解码必可逐字节复现
+
+# 接收方用自己信任的上下文核验（包内上下文只是声明，不构成身份认证）
+trusted = export_signing_public_context(key)     # 接收方本地持有
+assert verify_round_packet(restored, trusted)
+```
+
+编码以标签 `b"thresholdsign/round-packet/v1"` 开头，随后依次写 4 字节参与者
+计数与各编号、`threshold`、`field_prime`、`group_prime`、`generator`、
+`public_key`、4 字节验证份额计数与各份额、4 字节消息长度与原始消息字节、
+4 字节签名者计数与各编号、4 字节承诺计数与各 `(signer_id, R_i)` 对，最后写
+`R` 与 `challenge`；整数编码规则与签名凭证相同（4 字节长度加最短无符号大端
+正文，零为单字节 `00`）。编码与解码只检查结构：对象或字段类型错误（布尔不
+视为整数）、非 bytes 解码输入抛 `TypeError`；非法群参数、编号越界或乱序
+重复、门限不合法、验证份额数量不符、签名者不属于成员或人数不足、承诺缺失
+重复错位或不符合群约束、`R` 或挑战越界抛 `ValueError`；坏标签、截断、尾随
+字节、长度或计数不符、非规范整数同样抛 `ValueError`。结构合法但聚合 `R` 或
+挑战与内容不匹配的包照常编解码，由 `verify_round_packet` 返回 `False`。
+
+`verify_round_packet(packet, context)` 先检查两者的结构（结构错误照旧抛
+`TypeError`/`ValueError`，承诺元组必须与签名者顺序对齐，错位抛
+`ValueError`），再要求包内上下文的全部公开字段与可信值逐一相等——刷新或
+重共享后即使联合公钥未变，旧包对新上下文也核验为 `False`——最后核对承诺
+乘积等于 `R` 并按既有规则重算 Fiat-Shamir 挑战；完全一致返回 `True`，否则
+返回 `False`。空消息、门限为一、公钥或验证份额为单位元、合法承诺相乘得到
+`R = 1` 均保留现有支持。核验成功的包可直接把 `round_info` 交给
+`verify_signature_share` 与 `aggregate_signature`，结果与原始轮次完全相同。
+
 ### 主动份额刷新
 
 签名密钥长期使用时，可用主动份额刷新（proactive refresh）在不改变联合秘密与
@@ -1534,6 +1583,31 @@ python3 -m thresholdsign
   — 用 `signature.signer_ids` 重建挑战并校验 `g^z = R·Y^c`；合法签名返回 `True`，
   签名被篡改或与消息/公钥/签名者集合不匹配返回 `False`，非法参数抛
   `TypeError`/`ValueError`
+- `SigningRoundPacket(context, round_info)` — 冻结数据类，可按位置构造、按值
+  相等；可独立流转的公开轮次包：`context` 是 `SigningPublicContext`（参与者
+  编号、门限、群参数、联合公钥、每人一个验证份额），`round_info` 是
+  `SigningRound`（消息原始字节、签名者集合、每人一个轮次一承诺、聚合 `R`
+  与挑战）；不含秘密份额、盲化份额、nonce 或隐藏状态，包内上下文只是声明，
+  不构成身份认证
+- `encode_round_packet(packet)` / `decode_round_packet(payload)` — 轮次包的
+  唯一规范编码：标签 `b"thresholdsign/round-packet/v1"` 后依次写 4 字节参与者
+  计数与各编号、`threshold`、`field_prime`、`group_prime`、`generator`、
+  `public_key`、4 字节验证份额计数与各份额、4 字节消息长度与原始消息、4 字节
+  签名者计数与各编号、4 字节承诺计数与各 `(signer_id, R_i)` 对，最后写 `R`
+  与 `challenge`；整数编码规则与签名凭证相同。encode 对非 `SigningRoundPacket`
+  或字段类型错误（布尔不视为整数）抛 `TypeError`，对非法群参数、编号越界或
+  乱序重复、门限不合法、验证份额数量不符、签名者不属于成员或人数不足、承诺
+  缺失/重复/错位/不符合群约束、`R` 或挑战越界抛 `ValueError`，但重推 `R` 与
+  挑战是否匹配不在编码边界检查；decode 对非 bytes 抛 `TypeError`，坏标签、
+  截断、尾随字节、长度或计数不符、非规范整数及上述结构非法抛 `ValueError`，
+  同样只校验结构。成功解码的包重编码逐字节等于输入
+- `verify_round_packet(packet, context)` — 以调用方可信的
+  `SigningPublicContext` 核验轮次包：先检查两者结构（类型错误抛 `TypeError`，
+  数值或结构非法抛 `ValueError`），再要求包内上下文的全部公开字段与可信值
+  逐一相等（刷新/重共享后即使联合公钥未变，旧包也核验为 `False`），最后核对
+  承诺乘积等于 `R` 并按既有规则重算挑战；完全一致返回 `True`，否则返回
+  `False`。核验成功的包可直接用于 `verify_signature_share` 与
+  `aggregate_signature`，结果与原始轮次相同
 - `SignatureReceipt(message, signature, public_key, field_prime, group_prime, generator)`
   — 冻结数据类，可按位置构造、按值相等；可独立流转的门限 Schnorr 签名凭证：
   `message` 为被签名字节串，`signature` 是 `AggregateSignature(R, z, signer_ids)`，

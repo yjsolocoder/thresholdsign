@@ -28,7 +28,11 @@ create_signing_nonce_commitment / create_signing_round / create_signature_share
 / verify_signature_share / aggregate_signature / verify_signature, the
 coordinator-side SigningPublicContext / export_signing_public_context that
 runs round creation, share verification and aggregation from public
-material alone, signing
+material alone, the self-contained SigningRoundPacket /
+encode_round_packet / decode_round_packet / verify_round_packet that
+carries one round's public context and round-one material as a single
+canonical byte string a receiver verifies against its own trusted
+context, signing
 audit receipts: SigningAudit / create_audit / check_audit, and the
 self-contained AuditReceipt / create_audit_receipt /
 verify_audit_receipt that binds an audit record to its public
@@ -292,6 +296,10 @@ __all__ = [
     "aggregate_signature",
     "verify_signature",
     "schnorr_challenge",
+    "SigningRoundPacket",
+    "encode_round_packet",
+    "decode_round_packet",
+    "verify_round_packet",
     "SignatureReceipt",
     "create_signature_receipt",
     "encode_signature_receipt",
@@ -4509,6 +4517,297 @@ def verify_signature(
     return pow(generator, signature.z, group_prime) == (
         signature.R * pow(public_key, challenge, group_prime) % group_prime
     )
+
+
+# ---------------------------------------------------------------------------
+# Public round packets: an independently transferable bundle of one signing
+# round's round-one material together with the public context it was created
+# under. A receiver holding a trusted SigningPublicContext verifies the
+# packet from public data alone — the packet carries the message bytes, the
+# participants, verification shares, threshold, group parameters, public
+# key, signer set, nonce commitments, aggregate R and challenge, and never a
+# secret share, blinding share or nonce.
+# ---------------------------------------------------------------------------
+
+ROUND_PACKET_TAG = b"thresholdsign/round-packet/v1"
+
+
+@dataclass(frozen=True)
+class SigningRoundPacket:
+    """One signing round's public material bundled with its public context.
+
+    ``context`` is the :class:`SigningPublicContext` the round was created
+    under (participants, threshold, group parameters, joint public key and
+    one verification share per participant) and ``round_info`` is the
+    :class:`SigningRound` itself (message bytes, signer set, one nonce
+    commitment per signer, aggregate ``R`` and challenge). The dataclass is
+    frozen, positionally constructible and compared by value, and carries no
+    secret share, blinding share, nonce, network, storage or hidden state.
+    Verification against a trusted context is :func:`verify_round_packet`'s
+    job; the bundled context is a claim to be checked, not an
+    authentication.
+    """
+
+    context: SigningPublicContext
+    round_info: SigningRound
+
+
+def _check_round_packet(packet: SigningRoundPacket) -> None:
+    """Type- and structure-check every field of a SigningRoundPacket.
+
+    The context goes through :func:`_check_signing_public_context` and the
+    round through :func:`_validate_signing_round` against that context, plus
+    one packet-specific rule: the nonce commitment tuple must be aligned
+    with the signer ids position by position. Whether ``R`` is really the
+    commitment product and ``challenge`` the Fiat-Shamir challenge of the
+    contents is deliberately not checked here — that is
+    :func:`verify_round_packet`'s job.
+    """
+    if not isinstance(packet, SigningRoundPacket):
+        raise TypeError("packet must be a SigningRoundPacket instance")
+    if not isinstance(packet.context, SigningPublicContext):
+        raise TypeError("packet context must be a SigningPublicContext instance")
+    if not isinstance(packet.round_info, SigningRound):
+        raise TypeError("packet round_info must be a SigningRound instance")
+    context = packet.context
+    _check_signing_public_context(context)
+    round_info = packet.round_info
+    _validate_signing_round(
+        round_info,
+        context.field_prime,
+        context.group_prime,
+        context.participant_ids,
+        context.threshold,
+    )
+    if any(
+        commitment.signer_id != signer_id
+        for commitment, signer_id in zip(
+            round_info.nonce_commitments, round_info.signer_ids
+        )
+    ):
+        raise ValueError("nonce commitments must be aligned with the signer ids")
+
+
+def encode_round_packet(packet: SigningRoundPacket) -> bytes:
+    """Canonically encode a signing round packet for transport or persistence.
+
+    The encoding starts with the tag ``b"thresholdsign/round-packet/v1"``,
+    then the context: a 4-byte unsigned big-endian participant count and one
+    entry per participant id, then ``threshold``, ``field_prime``,
+    ``group_prime``, ``generator`` and ``public_key``, then a 4-byte count
+    and one entry per verification share. The round follows: a 4-byte
+    message length and the raw message bytes, a 4-byte count and one entry
+    per signer id, a 4-byte count and one ``(signer_id, commitment)`` pair
+    per nonce commitment, and finally ``R`` and ``challenge``. Every integer
+    is a 4-byte unsigned big-endian length followed by its shortest unsigned
+    big-endian value: zero is the single body byte ``00`` and positive
+    values carry no leading zero. The output for a given packet is unique —
+    a decoded packet re-encodes to exactly the same bytes — and it contains
+    no secret share, blinding share, nonce or hidden state.
+
+    Only a structurally valid :class:`SigningRoundPacket` is accepted:
+    wrong field types raise TypeError (``bool`` is not an integer) and an
+    illegal context or round structure raises ValueError, but the ``R`` and
+    ``challenge`` fields are not re-derived — a structurally legal packet
+    whose aggregate or challenge does not match its contents still encodes,
+    and :func:`verify_round_packet` remains the way to test validity.
+    """
+    _check_round_packet(packet)
+    context = packet.context
+    round_info = packet.round_info
+
+    buffer = bytearray(ROUND_PACKET_TAG)
+    buffer += len(context.participant_ids).to_bytes(4, "big", signed=False)
+    for participant_id in context.participant_ids:
+        buffer += _encode_varint(participant_id)
+    for value in (
+        context.threshold,
+        context.field_prime,
+        context.group_prime,
+        context.generator,
+        context.public_key,
+    ):
+        buffer += _encode_varint(value)
+    buffer += len(context.verification_shares).to_bytes(4, "big", signed=False)
+    for verification_share in context.verification_shares:
+        buffer += _encode_varint(verification_share)
+    buffer += len(round_info.message).to_bytes(4, "big", signed=False)
+    buffer += round_info.message
+    buffer += len(round_info.signer_ids).to_bytes(4, "big", signed=False)
+    for signer_id in round_info.signer_ids:
+        buffer += _encode_varint(signer_id)
+    buffer += len(round_info.nonce_commitments).to_bytes(4, "big", signed=False)
+    for commitment in round_info.nonce_commitments:
+        buffer += _encode_varint(commitment.signer_id)
+        buffer += _encode_varint(commitment.commitment)
+    buffer += _encode_varint(round_info.R)
+    buffer += _encode_varint(round_info.challenge)
+    return bytes(buffer)
+
+
+def decode_round_packet(payload: bytes) -> SigningRoundPacket:
+    """Decode the canonical encoding produced by :func:`encode_round_packet`.
+
+    Accepts only the single canonical form: the tag
+    ``b"thresholdsign/round-packet/v1"``, the counted participant ids, the
+    five context integers, the counted verification shares, the
+    length-prefixed message, the counted signer ids, the counted
+    ``(signer_id, commitment)`` pairs, and finally ``R`` and ``challenge``.
+    A non-bytes argument raises TypeError; a wrong or missing tag,
+    truncation, trailing bytes, a non-canonical integer (leading zero or
+    over-long length), a count or length that does not match the stream, an
+    illegal group parameter, an out-of-range, duplicate or out-of-order id,
+    an illegal threshold, a verification-share count mismatch, a signer
+    outside the participants or too few signers, a missing, duplicated,
+    misaligned or group-illegal nonce commitment, or an out-of-range ``R``
+    or challenge raises ValueError. A successfully decoded packet re-encodes
+    to exactly the input bytes.
+
+    Decoding validates structure only, never the cryptography: a packet
+    whose aggregate ``R`` or challenge does not match its contents is
+    returned normally, and :func:`verify_round_packet` reports it as
+    ``False``.
+    """
+    if not isinstance(payload, bytes):
+        raise TypeError("payload must be bytes")
+    if not payload.startswith(ROUND_PACKET_TAG):
+        raise ValueError("bad round packet tag")
+    offset = len(ROUND_PACKET_TAG)
+
+    def read_count(what: str) -> int:
+        nonlocal offset
+        if offset + 4 > len(payload):
+            raise ValueError(f"truncated round packet {what} count")
+        count = int.from_bytes(payload[offset:offset + 4], "big")
+        offset += 4
+        return count
+
+    participant_ids = []
+    for _ in range(read_count("participant")):
+        participant_id, offset = _read_varint(
+            payload, offset, what="round packet participant id"
+        )
+        participant_ids.append(participant_id)
+    threshold, offset = _read_varint(payload, offset, what="round packet threshold")
+    field_prime, offset = _read_varint(payload, offset, what="round packet field prime")
+    group_prime, offset = _read_varint(payload, offset, what="round packet group prime")
+    generator, offset = _read_varint(payload, offset, what="round packet generator")
+    public_key, offset = _read_varint(payload, offset, what="round packet public key")
+    verification_shares = []
+    for _ in range(read_count("verification share")):
+        verification_share, offset = _read_varint(
+            payload, offset, what="round packet verification share"
+        )
+        verification_shares.append(verification_share)
+
+    if offset + 4 > len(payload):
+        raise ValueError("truncated round packet message length")
+    message_length = int.from_bytes(payload[offset:offset + 4], "big")
+    offset += 4
+    if offset + message_length > len(payload):
+        raise ValueError("truncated round packet message")
+    message = payload[offset:offset + message_length]
+    offset += message_length
+
+    signer_ids = []
+    for _ in range(read_count("signer")):
+        signer_id, offset = _read_varint(payload, offset, what="round packet signer id")
+        signer_ids.append(signer_id)
+    nonce_commitments = []
+    for _ in range(read_count("nonce commitment")):
+        commitment_signer, offset = _read_varint(
+            payload, offset, what="round packet nonce commitment signer id"
+        )
+        commitment_value, offset = _read_varint(
+            payload, offset, what="round packet nonce commitment"
+        )
+        nonce_commitments.append(
+            SigningNonceCommitment(signer_id=commitment_signer, commitment=commitment_value)
+        )
+    R, offset = _read_varint(payload, offset, what="round packet R")
+    challenge, offset = _read_varint(payload, offset, what="round packet challenge")
+    if offset != len(payload):
+        raise ValueError("trailing bytes after round packet")
+
+    packet = SigningRoundPacket(
+        context=SigningPublicContext(
+            participant_ids=tuple(participant_ids),
+            threshold=threshold,
+            field_prime=field_prime,
+            group_prime=group_prime,
+            generator=generator,
+            public_key=public_key,
+            verification_shares=tuple(verification_shares),
+        ),
+        round_info=SigningRound(
+            message=message,
+            signer_ids=tuple(signer_ids),
+            nonce_commitments=tuple(nonce_commitments),
+            R=R,
+            challenge=challenge,
+        ),
+    )
+    _check_round_packet(packet)
+    if encode_round_packet(packet) != payload:
+        raise ValueError("non-canonical round packet encoding")
+    return packet
+
+
+def verify_round_packet(
+    packet: SigningRoundPacket,
+    context: SigningPublicContext,
+) -> bool:
+    """Verify a signing round packet against a trusted public context.
+
+    ``context`` is the caller's own trusted :class:`SigningPublicContext`;
+    the packet's bundled context is a claim, not an authentication. Both
+    structures are checked first (TypeError for wrong field types, a boolean
+    is never an integer; ValueError for illegal values, exactly as at the
+    codec boundary). Then every public field of the bundled context —
+    participant ids, threshold, group parameters, joint public key and every
+    verification share — must equal the trusted value, so a packet exported
+    before a refresh or resharing fails verification against the new context
+    even when the joint public key is unchanged. Finally the aggregate
+    ``R`` must be the product of the nonce commitments modulo
+    ``group_prime`` and ``challenge`` must be the Fiat-Shamir challenge
+    recomputed from the message, public key, ``R`` and signer ids, exactly
+    as :func:`create_signing_round` derives them. Everything matches —
+    returns ``True``; any mismatch returns ``False``. A packet that
+    verifies can be handed straight to :func:`verify_signature_share` and
+    :func:`aggregate_signature` with the same context and behaves exactly
+    like the original round.
+    """
+    if not isinstance(context, SigningPublicContext):
+        raise TypeError("context must be a SigningPublicContext instance")
+    _check_round_packet(packet)
+    _check_signing_public_context(context)
+    packet_context = packet.context
+    if (
+        packet_context.participant_ids != context.participant_ids
+        or packet_context.threshold != context.threshold
+        or packet_context.field_prime != context.field_prime
+        or packet_context.group_prime != context.group_prime
+        or packet_context.generator != context.generator
+        or packet_context.public_key != context.public_key
+        or packet_context.verification_shares != context.verification_shares
+    ):
+        return False
+
+    round_info = packet.round_info
+    R = 1
+    for commitment in round_info.nonce_commitments:
+        R = R * commitment.commitment % packet_context.group_prime
+    if R != round_info.R:
+        return False
+    challenge = schnorr_challenge(
+        round_info.message,
+        packet_context.public_key,
+        R,
+        round_info.signer_ids,
+        field_prime=packet_context.field_prime,
+        group_prime=packet_context.group_prime,
+    )
+    return challenge == round_info.challenge
 
 
 # ---------------------------------------------------------------------------
