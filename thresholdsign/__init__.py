@@ -302,6 +302,7 @@ __all__ = [
     "encode_signature_share_receipt",
     "decode_signature_share_receipt",
     "verify_signature_share_receipt",
+    "aggregate_share_receipts",
     "SigningAudit",
     "create_audit",
     "check_audit",
@@ -5163,6 +5164,168 @@ def verify_signature_share_receipt(receipt: SignatureShareReceipt) -> bool:
         % receipt.p
     )
     return pow(receipt.g, receipt.z_i, receipt.p) == expected
+
+
+def aggregate_share_receipts(
+    receipts: Iterable[SignatureShareReceipt],
+    context: SigningPublicContext,
+) -> SignatureReceipt:
+    """Assemble one round's share receipts into a :class:`SignatureReceipt`.
+
+    ``receipts`` is any finite iterable (a one-shot generator is fine) of
+    :class:`SignatureShareReceipt` objects — exactly one per member of the
+    round's signing set, in any order — and ``context`` is the caller's
+    trusted :class:`SigningPublicContext`. No signing round, DKG result,
+    secret share or nonce is needed, and nothing is stored. On success the
+    returned receipt compares equal to what
+    :func:`create_signature_receipt` produces over the same round's
+    :func:`aggregate_signature` output, and it works directly with
+    :func:`encode_signature_receipt`, :func:`decode_signature_receipt` and
+    :func:`verify_signature_receipt`.
+
+    Every receipt must carry the same message bytes, signer set, aggregate
+    ``R``, joint key ``Y`` and group parameters ``q``/``p``/``g``; the key
+    and group parameters must match the context and each receipt's ``Y_i``
+    must equal the context verification share of its ``signer_id`` (so a
+    receipt minted before a refresh or resharing is rejected against the
+    refreshed context even though the joint key is unchanged). The signer
+    set must be strictly increasing and unique, lie entirely in the
+    context's participants and reach the context threshold; each member
+    must provide exactly one receipt — a threshold-sized subset is not
+    accepted. The ``R_i`` values follow the signing round's rules
+    (non-identity order-``q`` subgroup elements, pairwise distinct) and
+    must multiply to the common aggregate ``R``. Every share equation and
+    the final aggregate signature must verify; the response is the sum of
+    the ``z_i`` modulo ``q`` and the message and signer set are kept.
+
+    A non-iterable ``receipts``, a non-:class:`SigningPublicContext`
+    context, a non-:class:`SignatureShareReceipt` element or a wrong field
+    type (``bool`` is not an integer) raises TypeError; an out-of-range
+    value, illegal group parameters, an empty batch, a duplicate, missing
+    or unknown signer, too few signers, a context mismatch, inconsistent
+    receipts, an illegal commitment or any failed verification raises
+    ValueError and no partial signature is ever returned. The input order
+    affects neither the result nor the inputs, which are never mutated.
+    """
+    if not isinstance(context, SigningPublicContext):
+        raise TypeError("context must be a SigningPublicContext instance")
+    _check_signing_public_context(context)
+
+    materialised = list(receipts)
+    if not materialised:
+        raise ValueError("at least one signature share receipt is required")
+    # Type-check the whole batch before any value check, exactly as
+    # aggregate_signature does, so the TypeError/ValueError boundary cannot
+    # depend on the input order.
+    for receipt in materialised:
+        if not isinstance(receipt, SignatureShareReceipt):
+            raise TypeError("receipts must be SignatureShareReceipt instances")
+        if not isinstance(receipt.message, bytes):
+            raise TypeError("receipt message must be bytes")
+        if not isinstance(receipt.signer_ids, tuple):
+            raise TypeError("receipt signer_ids must be a tuple")
+        for name in ("R", "signer_id", "Y_i", "Y", "q", "p", "g", "R_i", "z_i"):
+            value = getattr(receipt, name)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"receipt {name} must be an integer")
+        for member_id in receipt.signer_ids:
+            if not isinstance(member_id, int) or isinstance(member_id, bool):
+                raise TypeError("receipt signer ids must be integers")
+    for receipt in materialised:
+        _check_signature_share_receipt_fields(
+            receipt.message,
+            receipt.R,
+            receipt.signer_ids,
+            receipt.signer_id,
+            receipt.Y_i,
+            receipt.Y,
+            receipt.q,
+            receipt.p,
+            receipt.g,
+            receipt.R_i,
+            receipt.z_i,
+        )
+
+    first = materialised[0]
+    for receipt in materialised[1:]:
+        if receipt.message != first.message:
+            raise ValueError("all receipts must carry the same message")
+        if receipt.signer_ids != first.signer_ids:
+            raise ValueError("all receipts must carry the same signer set")
+        if receipt.R != first.R:
+            raise ValueError("all receipts must carry the same aggregate R")
+        if receipt.Y != first.Y:
+            raise ValueError("all receipts must carry the same public key")
+        if (receipt.q, receipt.p, receipt.g) != (first.q, first.p, first.g):
+            raise ValueError("all receipts must carry the same group parameters")
+
+    if (first.q, first.p, first.g) != (
+        context.field_prime,
+        context.group_prime,
+        context.generator,
+    ):
+        raise ValueError("receipt group parameters must match the context")
+    if first.Y != context.public_key:
+        raise ValueError("receipt public key must match the context public key")
+
+    signer_ids = first.signer_ids
+    for signer_id in signer_ids:
+        if signer_id not in context.participant_ids:
+            raise ValueError("every signer must be a context participant")
+    if len(signer_ids) < context.threshold:
+        raise ValueError("at least threshold signers are required")
+
+    receipt_ids = [receipt.signer_id for receipt in materialised]
+    if len(set(receipt_ids)) != len(receipt_ids):
+        raise ValueError("duplicate signature share receipt from the same signer")
+    if set(receipt_ids) != set(signer_ids):
+        raise ValueError("each signer must provide exactly one receipt")
+
+    for receipt in materialised:
+        index = context.participant_ids.index(receipt.signer_id)
+        if receipt.Y_i != context.verification_shares[index]:
+            raise ValueError(
+                "receipt verification share must match the context"
+            )
+
+    commitments = [receipt.R_i for receipt in materialised]
+    if len(set(commitments)) != len(commitments):
+        raise ValueError("nonce commitments must be distinct")
+    R = 1
+    for commitment in commitments:
+        R = R * commitment % context.group_prime
+    if R != first.R:
+        raise ValueError("nonce commitments must multiply to the aggregate R")
+
+    # Verify in ascending signer order so the outcome cannot depend on the
+    # input order; the result itself is order-independent either way.
+    ordered = sorted(materialised, key=lambda receipt: receipt.signer_id)
+    z_total = 0
+    for receipt in ordered:
+        if not verify_signature_share_receipt(receipt):
+            raise ValueError(
+                "signature share receipt does not verify against its contents"
+            )
+        z_total = (z_total + receipt.z_i) % context.field_prime
+
+    signature = AggregateSignature(R=first.R, z=z_total, signer_ids=signer_ids)
+    if not verify_signature(
+        first.message,
+        signature,
+        context.public_key,
+        group_prime=context.group_prime,
+        generator=context.generator,
+        prime=context.field_prime,
+    ):
+        raise ValueError("aggregated signature does not verify")
+    return SignatureReceipt(
+        message=first.message,
+        signature=signature,
+        public_key=context.public_key,
+        field_prime=context.field_prime,
+        group_prime=context.group_prime,
+        generator=context.generator,
+    )
 
 
 # ---------------------------------------------------------------------------

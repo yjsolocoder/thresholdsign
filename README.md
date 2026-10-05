@@ -228,6 +228,20 @@ Lagrange 权重）；消息不匹配、上下文不一致或方程失败抛 `Val
 `Y_i`、`R_i`、`z_i`、`Y` 或群参数均返回 `False`，类型错误抛 `TypeError`、结构非法
 抛 `ValueError`。
 
+同一轮的完整份额凭证集合也可以直接聚合成签名凭证：
+`aggregate_share_receipts(receipts, context)` 接受任意有限可迭代对象（包括只能
+遍历一次的生成器）装的 `SignatureShareReceipt`，以及调用方提供的可信
+`SigningPublicContext`，无需原始签名轮次、DKG 结果或任何秘密。它要求所有凭证的
+message、签名集合、聚合 `R`、`Y` 与群参数一致且与上下文相符、每人的 `Y_i` 等于
+上下文中对应编号的当前验证份额（刷新或重共享前的旧凭证即使联合公钥相同也被
+拒绝），签名集合严格递增、全部属于上下文且人数达到门限、每人恰好一份凭证，
+各 `R_i` 互不相同且乘积等于聚合 `R`；全部份额方程与最终聚合签名验证通过后返回
+`SignatureReceipt`（`z = Σ z_i mod q`），与同轮经 `aggregate_signature` 和
+`create_signature_receipt` 得到的结果按值相等，可直接用于现有编码、解码与验签
+入口。类型错误抛 `TypeError`，数值越界、空集合、重复或缺失凭证、未知成员、
+人数不足、上下文不匹配、凭证不一致、承诺不合要求或验签失败抛 `ValueError`，
+绝不返回部分签名；输入顺序不影响结果，也不改变任何输入对象。
+
 ### 主动份额刷新
 
 签名密钥长期使用时，可用主动份额刷新（proactive refresh）在不改变联合秘密与
@@ -1572,6 +1586,21 @@ python3 -m thresholdsign
   `True`，替换 message、签名集合、聚合 `R`、`Y_i`、`R_i`、`z_i`、`Y` 或群参数的
   凭证返回 `False`；非 `SignatureShareReceipt` 或字段类型错误抛 `TypeError`，
   越界或结构非法抛 `ValueError`
+- `aggregate_share_receipts(receipts, context)` — 把同一轮的完整
+  `SignatureShareReceipt` 集合（任意有限可迭代对象，含一次性生成器，顺序无关）
+  与调用方提供的可信 `SigningPublicContext` 聚合成 `SignatureReceipt`，无需签名
+  轮次、DKG 结果或任何秘密，也不保存状态。要求所有凭证的 message、签名集合、
+  聚合 `R`、`Y` 与 `q`/`p`/`g` 一致且与上下文相符，每人的 `Y_i` 等于上下文中
+  对应编号的验证份额（刷新/重共享前的旧凭证即使联合公钥相同也被拒绝）；签名
+  集合严格递增、全部属于上下文参与者且人数达到门限，每人恰好一份凭证（只取够
+  门限的子集不被接受）；各 `R_i` 为互不相同的非单位子群元素且乘积等于聚合
+  `R`；全部份额方程与最终聚合签名均验证通过才返回，响应为 `z = Σ z_i mod q`。
+  结果与同轮经 `aggregate_signature` + `create_signature_receipt` 得到的凭证按值
+  相等，可直接用于 `encode_signature_receipt` / `decode_signature_receipt` /
+  `verify_signature_receipt`。不可迭代输入、错误的上下文或凭证类型、字段类型
+  错误（布尔不视为整数）抛 `TypeError`；数值越界、群参数非法、空集合、重复或
+  缺失凭证、未知成员、人数不足、上下文不匹配、凭证间不一致、承诺不合要求或
+  任何验签失败抛 `ValueError`，绝不返回部分签名
 - `SigningAudit(payload)` — 冻结数据类，仅含 `payload` 一个字段；一次签名轮次第
   二轮校验的审计回执，自包含的字节编码中不含 nonce、秘密份额或系数
 - `create_audit(message, shares, round_info, dkg_result)` — `message` 必须与轮次
