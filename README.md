@@ -228,6 +228,38 @@ Lagrange 权重）；消息不匹配、上下文不一致或方程失败抛 `Val
 `Y_i`、`R_i`、`z_i`、`Y` 或群参数均返回 `False`，类型错误抛 `TypeError`、结构非法
 抛 `ValueError`。
 
+### 份额凭证聚合为签名凭证
+
+持有同一轮**完整**份额凭证集合的协调方可以只凭 `SigningPublicContext` 把整轮
+份额凭证聚合成一张 `SignatureReceipt`，无需原始签名轮次、DKG 结果或任何秘密：
+
+```python
+from thresholdsign import (
+    aggregate_share_receipts, export_signing_public_context,
+    verify_signature_receipt,
+)
+
+context = export_signing_public_context(key)   # 或直接用公开字段构造
+# receipts 是同一轮每位签名者恰好一份的 SignatureShareReceipt，顺序任意，
+# 也可以是只能遍历一次的生成器
+receipt = aggregate_share_receipts(receipts, context)
+assert verify_signature_receipt(receipt)       # 可直接编码、解码、验签
+```
+
+所有凭证的 message、签名者集合、聚合 `R`、联合公钥与群参数必须一致，公钥与群
+参数必须与上下文相符，且每人的 `Y_i` 必须与上下文中对应编号的当前验证份额一致
+——刷新或重共享后，仅凭联合公钥相同不能挽救携带旧 `Y_i` 的凭证。签名集合沿用
+严格递增且唯一、全部成员属于上下文、人数达到门限的规则，集合中每人必须恰好
+提供一份凭证（只取够门限的子集不被接受）；各人的 `R_i` 必须是非单位子群元素、
+互不相同且乘积等于聚合 `R`。只有全部份额方程与最终聚合签名都验证通过才返回
+结果，响应值为各份额响应之和模 `field_prime`，与同轮经 `aggregate_signature` 加
+`create_signature_receipt` 得到的结果按值相等；失败绝不返回部分签名。不可迭代
+输入、错误的上下文或凭证类型、字段类型错误（布尔不视为整数）抛 `TypeError`；
+数值越界、群参数非法、空集合、重复或缺失凭证、未知成员、人数不足、上下文不
+匹配、凭证间不一致、承诺不合要求或任何验签失败抛 `ValueError`。输入顺序不影响
+结果与所抛异常，也不改变任何输入对象；空消息、`threshold = 1` 与超过门限的完整
+签名集合均受支持。本入口不保存状态，也不负责认证上下文来源。
+
 ### 主动份额刷新
 
 签名密钥长期使用时，可用主动份额刷新（proactive refresh）在不改变联合秘密与
@@ -1572,6 +1604,17 @@ python3 -m thresholdsign
   `True`，替换 message、签名集合、聚合 `R`、`Y_i`、`R_i`、`z_i`、`Y` 或群参数的
   凭证返回 `False`；非 `SignatureShareReceipt` 或字段类型错误抛 `TypeError`，
   越界或结构非法抛 `ValueError`
+- `aggregate_share_receipts(receipts, context)` — 只凭 `SigningPublicContext`
+  把同一轮完整的 `SignatureShareReceipt` 集合聚合成 `SignatureReceipt`：`receipts`
+  是任意有限可迭代对象（含一次性生成器），签名集合中每人恰好一份、顺序任意；
+  要求所有凭证的 message、签名者集合、聚合 `R`、联合公钥与群参数一致且与上下文
+  相符，每人 `Y_i` 等于上下文当前验证份额，签名集合严格递增、全部成员属于上下文、
+  人数达到门限，各 `R_i` 为非单位子群元素、互不相同且乘积等于聚合 `R`；全部份额
+  方程与最终聚合签名验证通过才返回结果（`z = Σ z_i mod q`），与同轮
+  `aggregate_signature` 加 `create_signature_receipt` 的结果按值相等，失败不返回
+  部分签名；类型错误（布尔不视为整数）抛 `TypeError`，越界、空集合、重复/缺失
+  凭证、未知成员、人数不足、上下文不匹配、凭证不一致、承诺不合要求或验签失败抛
+  `ValueError`；支持空消息、`threshold = 1` 与超过门限的完整集合，不保存状态
 - `SigningAudit(payload)` — 冻结数据类，仅含 `payload` 一个字段；一次签名轮次第
   二轮校验的审计回执，自包含的字节编码中不含 nonce、秘密份额或系数
 - `create_audit(message, shares, round_info, dkg_result)` — `message` 必须与轮次
