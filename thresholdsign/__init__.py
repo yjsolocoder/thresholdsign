@@ -272,6 +272,8 @@ __all__ = [
     "diagnose_signing_contributions",
     "create_refresh",
     "refresh",
+    "RefreshFault",
+    "diagnose_refresh_contributions",
     "create_reshare",
     "reshare",
     "ReshareFault",
@@ -2442,6 +2444,162 @@ def refresh(
         public_key=key.public_key,
         verification_shares=verification_shares,
     )
+
+
+@dataclass(frozen=True)
+class RefreshFault:
+    """One failing check in a participant's refresh contribution.
+
+    The fields, in order, are ``sender_id`` (the contribution's sender),
+    ``check`` (``"pedersen"`` for the double share against the sender's
+    Pedersen commitment, ``"feldman"`` for the share against the sender's
+    Feldman commitment, or ``"constant"`` for the sender's Feldman
+    constant-term commitment against the required value ``1``) and
+    ``receiver_id`` (the participant id the failing double-share position is
+    addressed to, in the contribution's own ``participant_ids`` order;
+    ``None`` for the sender-level constant check, which is tied to no
+    receiver). The position checks are exactly the pair of checks behind a
+    :class:`DKGRejection` in :func:`refresh`, while the constant check is
+    that function's zero-constant-term comparison. The dataclass is frozen,
+    positionally constructible and compared by value, and carries no secret
+    share, network, storage or hidden state.
+    """
+
+    sender_id: int
+    check: str
+    receiver_id: int | None
+
+
+def diagnose_refresh_contributions(
+    contributions: Iterable[SigningContribution],
+    key: SigningDKGResult,
+) -> tuple[RefreshFault, ...]:
+    """Locate every failing check in refresh contributions before aggregation.
+
+    Accepts exactly the arguments of :func:`refresh` and applies its
+    validation boundary unchanged: a non-:class:`SigningDKGResult` ``key``, a
+    non-:class:`SigningContribution` contribution element, or any wrong field
+    type raises TypeError; an empty contribution iterable, missing or
+    duplicate senders, participant ids, threshold or group parameters
+    disagreeing with ``key``, and any out-of-range value or structurally
+    illegal field raise ValueError. Such inputs are never reported as faults
+    — they reject the whole call just as in :func:`refresh`.
+
+    For structurally legal contributions, every sender is examined in
+    ascending ``sender_id`` order regardless of input order, and within each
+    contribution the double-share positions are examined in the
+    contribution's original ``participant_ids`` order. At every
+    ``receiver_id`` position the double share is first checked against the
+    sender's Pedersen commitment (the same :func:`verify_dkg_received_share`
+    check :func:`refresh` runs, including the receiver-addressing
+    coordinate), then the share alone against the sender's Feldman
+    commitment with :func:`verify_share`. Independently of the positions,
+    the sender's Feldman constant-term commitment is compared with ``1``
+    (the zero sharing constant term every refresh contribution must commit
+    to). Each failed check yields one :class:`RefreshFault` —
+    ``check="pedersen"`` or ``check="feldman"`` with ``receiver_id`` the
+    participant id, or ``check="constant"`` with ``receiver_id=None`` — so a
+    sender failing at several positions produces several faults, a position
+    failing both commitments produces two faults (the Pedersen fault first),
+    and a sender rejected by :func:`refresh` is listed with every check it
+    failed: no failure masks another.
+
+    Faults are ordered by sender, then by receiver position with the
+    Pedersen fault before the Feldman fault at the same position, and each
+    sender's constant fault (when present) last. The function never mutates
+    its input and neither generates keys or shares nor consumes randomness
+    or stores state: :func:`refresh`, :func:`create_refresh`,
+    :func:`reshare`, :func:`diagnose_reshare_contributions`, the
+    contribution codecs and the signing entries keep their existing return
+    values and exception behaviour. The returned tuple is empty if and only
+    if :func:`refresh` would return a :class:`SigningDKGResult` on the same
+    input, and otherwise the distinct fault senders are exactly the senders
+    of its rejection list.
+    """
+    if not isinstance(key, SigningDKGResult):
+        raise TypeError("key must be a SigningDKGResult instance")
+    _check_signing_setup(key)
+    _check_signing_dkg_structure(key)
+
+    materialised = list(contributions)
+    if not materialised:
+        raise ValueError("at least one contribution is required")
+    for contribution in materialised:
+        _check_signing_contribution_types(contribution)
+    for contribution in materialised:
+        _check_signing_contribution_structure(contribution)
+
+    # Structural consistency with the current key (participant ids,
+    # threshold, group parameters, exactly one contribution per participant)
+    # is validated exactly as in refresh, so the scan below only sees a
+    # legal contribution set.
+    old_result = key.result
+    old_pedersen = old_result.commitment
+    participant_ids = old_result.participant_ids
+    threshold = len(old_pedersen.values)
+    dealings = [contribution.contribution for contribution in materialised]
+    for dealing in dealings:
+        commitment = dealing.commitment
+        if dealing.participant_ids != participant_ids:
+            raise ValueError("contributions must agree on the same participant ids")
+        if (
+            commitment.field_prime != old_pedersen.field_prime
+            or commitment.group_prime != old_pedersen.group_prime
+            or commitment.generator != old_pedersen.generator
+            or commitment.blinding_generator != old_pedersen.blinding_generator
+        ):
+            raise ValueError("contributions must share the same group parameters")
+        if len(commitment.values) != threshold:
+            raise ValueError("contributions must share the same threshold")
+    sender_ids = [dealing.sender_id for dealing in dealings]
+    if len(set(sender_ids)) != len(sender_ids):
+        raise ValueError("duplicate contribution from the same participant")
+    if set(sender_ids) != set(participant_ids):
+        raise ValueError("each participant must contribute exactly once")
+
+    # Sort by sender so the reported order cannot depend on the input order.
+    ordered = sorted(materialised, key=lambda item: item.contribution.sender_id)
+
+    faults: list[RefreshFault] = []
+    for item in ordered:
+        dealing = item.contribution
+        for index, receiver_id in enumerate(dealing.participant_ids):
+            received = DKGReceivedShare(
+                sender_id=dealing.sender_id,
+                receiver_id=receiver_id,
+                share=dealing.shares[index],
+                blinding_share=dealing.blinding_shares[index],
+            )
+            # Both position checks run for every participant, and the
+            # constant check runs independently afterwards, so one failure
+            # never masks another.
+            if not verify_dkg_received_share(received, dealing.commitment):
+                faults.append(
+                    RefreshFault(
+                        sender_id=dealing.sender_id,
+                        check="pedersen",
+                        receiver_id=receiver_id,
+                    )
+                )
+            if not verify_share(dealing.shares[index], item.feldman_commitment):
+                faults.append(
+                    RefreshFault(
+                        sender_id=dealing.sender_id,
+                        check="feldman",
+                        receiver_id=receiver_id,
+                    )
+                )
+        # A refresh contribution must commit to a zero sharing constant
+        # term, whose Feldman constant-term commitment is g ** 0 == 1.
+        if item.feldman_commitment.values[0] != 1:
+            faults.append(
+                RefreshFault(
+                    sender_id=dealing.sender_id,
+                    check="constant",
+                    receiver_id=None,
+                )
+            )
+    return tuple(faults)
 
 
 # ---------------------------------------------------------------------------
