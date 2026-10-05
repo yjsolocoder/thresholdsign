@@ -155,6 +155,29 @@ assert verify_signature(
 支持 `threshold = 1`。一次性随机数由可注入的 `randbelow` 在 `prime - 1` 个值上
 抽取并自动排除零（返回值加一），复用防护需要调用方保证——本实现不保存任何状态。
 
+### 公开签名上下文
+
+协调方无需持有含秘密份额的 `SigningDKGResult`：`export_signing_public_context(key)`
+从合法签名 DKG 结果（含刷新、重共享产物）提取冻结的 `SigningPublicContext`，仅保存
+`participant_ids`、`threshold`、`field_prime`、`group_prime`、`generator`、
+`public_key` 与按编号对齐的 `verification_shares`，不包含或引用秘密份额、盲化份额、
+nonce 或原始 DKG 结果。也可以直接用公开字段构造等值对象。`create_signing_round`、
+`verify_signature_share` 与 `aggregate_signature` 的密钥参数同时接受该上下文：同源
+密钥与上下文产生的轮次、逐份验证结论、聚合签名及拒绝列表完全一致。三个入口与导出
+函数都会检查上下文的公开字段（类型错误抛 `TypeError`，布尔冒充整数同样拒绝；成员
+为空、未严格递增、编号越界、门限越界、验证份额数量不匹配、非法群参数、公钥或验证
+份额越界或不在子群内抛 `ValueError`，群单位元仍允许），直接构造的对象在使用时执行
+相同检查——这些检查只验证结构，不构成来源认证。
+
+```python
+from thresholdsign import export_signing_public_context
+
+context = export_signing_public_context(key)        # SigningPublicContext
+round_info = create_signing_round(message, signer_ids, commitments, context)
+assert all(verify_signature_share(share, round_info, context) for share in shares)
+signature = aggregate_signature(shares, round_info, context)
+```
+
 ### 可独立流转的签名凭证
 
 门限签名的持有方可以把一次签名打包成自包含的 `SignatureReceipt`：凭证冻结记录
