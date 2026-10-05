@@ -1455,6 +1455,26 @@ python3 -m thresholdsign
   全部通过返回空元组；顺序只由该排序确定，与输入顺序无关。函数不修改输入，也不改变
   `aggregate_signing_dkg` 等任何既有入口的返回值与异常；返回空元组当且仅当
   `aggregate_signing_dkg` 对同一输入聚合成功
+- `LocalDKGPacket(participant_ids, received, commitment, feldman_commitment)` —
+  冻结数据类，可按位置构造、按值相等；保存接收者从一份 `SigningContribution`
+  中取出的本地材料：全体参与者编号元组、发给本人的 `DKGReceivedShare`、发送者的
+  Pedersen 承诺与 Feldman 承诺；不含其他接收者的份额，也不含网络、存储或隐藏状态
+- `aggregate_local_dkg(receiver_id, packets)` — 接收者本地聚合：输入目标成员编号
+  与每名参与者恰好一份的 `LocalDKGPacket` 可迭代集合（支持单次迭代器，顺序无关）。
+  先校验全部输入结构：对象或字段类型错误抛 `TypeError`（布尔值不视为整数）；空
+  输入、成员编号非严格递增或越界、目标不在成员中、发送者缺失/重复/不在成员中、
+  接收编号或份额坐标不等于目标、非法群参数或承诺、份额值越界、成员集合/门限/群
+  参数不一致均抛 `ValueError`；门限由两类承诺的相同长度确定并沿用
+  `1 <= threshold <= 人数` 的现有限制。结构合法后逐发送者检查本人的 Pedersen 双
+  份额与 Feldman 份额，任一不匹配返回按 `sender_id` 升序去重的
+  `list[DKGRejection]`（列全失败发送者，不返回部分聚合结果）。成功返回三元组
+  `(share, blinding_share, context)`：两个份额坐标均为目标编号，值为收到的对应份
+  额在域内之和；`context` 是由全部公开承诺确定的 `SigningPublicContext`。对同一
+  批合法签名贡献，各成员分别聚合所得份额与 `aggregate_signing_dkg` 结果的对应项
+  相等，`context` 与 `export_signing_public_context` 相等，可直接配合
+  `sign_round_packet` 完成签名；门限为一、零份额与单位元承诺边界同样合法。成功
+  只证明本人的份额通过检查，不声称其他成员已收到有效份额；函数不修改输入、不
+  保存状态
 - `create_refresh(sender_id, key, *, randbelow=secrets.randbelow)` — 用既有
   `SigningDKGResult` `key` 的群参数、参与者编号与 threshold 创建一份主动刷新贡献
   `SigningContribution`；共享多项式常数项固定为 0 且不抽样（Feldman 常数项承诺为
