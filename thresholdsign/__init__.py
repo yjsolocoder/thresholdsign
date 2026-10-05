@@ -25,7 +25,10 @@ out-of-range, non-subgroup or copied R_i commitment and every expected
 signer missing from the round-one batch) / SigningRound /
 SignatureShare / SignatureShareRejection / AggregateSignature /
 create_signing_nonce_commitment / create_signing_round / create_signature_share
-/ verify_signature_share / aggregate_signature / verify_signature, signing
+/ verify_signature_share / aggregate_signature / verify_signature, the
+coordinator-side SigningPublicContext / export_signing_public_context that
+runs round creation, share verification and aggregation from public
+material alone, signing
 audit receipts: SigningAudit / create_audit / check_audit, and the
 self-contained AuditReceipt / create_audit_receipt /
 verify_audit_receipt that binds an audit record to its public
@@ -259,6 +262,8 @@ __all__ = [
     "SigningDKGResult",
     "create_signing_contribution",
     "aggregate_signing_dkg",
+    "SigningPublicContext",
+    "export_signing_public_context",
     "ContributionFault",
     "diagnose_signing_contributions",
     "create_refresh",
@@ -3441,6 +3446,152 @@ class AggregateSignature:
     signer_ids: tuple[int, ...]
 
 
+@dataclass(frozen=True)
+class SigningPublicContext:
+    """The public material a signing coordinator needs, and nothing more.
+
+    ``participant_ids`` is the strictly increasing tuple of DKG participant
+    ids; ``threshold`` is the minimum signing-set size; ``field_prime``,
+    ``group_prime`` and ``generator`` describe the Schnorr group;
+    ``public_key`` is the joint verification key ``Y``; and
+    ``verification_shares`` holds one ``Y_i`` per participant, aligned with
+    ``participant_ids`` by position. The object carries no secret share,
+    blinding share, nonce or DKG result: every field is a plain integer or a
+    tuple of integers, so a coordinator holding only this context can run
+    :func:`create_signing_round`, :func:`verify_signature_share` and
+    :func:`aggregate_signature`. Obtain it from
+    :func:`export_signing_public_context` or construct it directly from
+    public fields; either way the three entry points re-validate the fields
+    on every call (structural checks only — they do not authenticate the
+    context's origin).
+    """
+
+    participant_ids: tuple[int, ...]
+    threshold: int
+    field_prime: int
+    group_prime: int
+    generator: int
+    public_key: int
+    verification_shares: tuple[int, ...]
+
+
+def _check_signing_public_context(context: SigningPublicContext) -> None:
+    """Type- and value-check every public field of a SigningPublicContext.
+
+    Wrong field types (a boolean is never an integer, and the two aligned
+    fields must be tuples of integers) raise TypeError; an empty or
+    non-increasing id tuple, an id outside ``1 .. field_prime - 1``, a
+    threshold outside ``1 .. len(participant_ids)``, a verification-share
+    count mismatch, illegal group parameters, or a public key / verification
+    share outside ``0 < v < group_prime`` or outside the
+    order-``field_prime`` subgroup raises ValueError. The group identity
+    ``1`` remains a legal public key or verification share, exactly as in
+    :func:`_check_signing_dkg_structure`.
+    """
+    if not isinstance(context.participant_ids, tuple):
+        raise TypeError("participant_ids must be a tuple")
+    for participant_id in context.participant_ids:
+        if not isinstance(participant_id, int) or isinstance(participant_id, bool):
+            raise TypeError("participant ids must be integers")
+    for name in ("threshold", "field_prime", "group_prime", "generator", "public_key"):
+        value = getattr(context, name)
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"{name} must be an integer")
+    if not isinstance(context.verification_shares, tuple):
+        raise TypeError("verification_shares must be a tuple")
+    for value in context.verification_shares:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError("verification shares must be integers")
+
+    ids = context.participant_ids
+    if not ids:
+        raise ValueError("participant ids must be a non-empty tuple")
+    if any(ids[index] >= ids[index + 1] for index in range(len(ids) - 1)):
+        raise ValueError("participant ids must be strictly increasing and unique")
+    _validate_feldman_parameters(
+        context.field_prime, context.group_prime, context.generator
+    )
+    for participant_id in ids:
+        if not 0 < participant_id < context.field_prime:
+            raise ValueError("participant ids must satisfy 1 <= id <= field_prime - 1")
+    if not 1 <= context.threshold <= len(ids):
+        raise ValueError("threshold must satisfy 1 <= threshold <= number of participants")
+    if len(context.verification_shares) != len(ids):
+        raise ValueError("one verification share per participant is required")
+    if not 0 < context.public_key < context.group_prime:
+        raise ValueError("public_key must satisfy 0 < Y < group_prime")
+    if pow(context.public_key, context.field_prime, context.group_prime) != 1:
+        raise ValueError("public_key must lie in the order-field_prime subgroup")
+    for value in context.verification_shares:
+        if not 0 < value < context.group_prime:
+            raise ValueError("verification shares must satisfy 0 < Y_i < group_prime")
+        if pow(value, context.field_prime, context.group_prime) != 1:
+            raise ValueError("verification shares must lie in the order-field_prime subgroup")
+
+
+def export_signing_public_context(key: SigningDKGResult) -> SigningPublicContext:
+    """Extract the public signing context of a valid :class:`SigningDKGResult`.
+
+    The key is validated exactly as at the signing entry points (TypeError
+    for structural type violations, ValueError for illegal values); the
+    returned :class:`SigningPublicContext` copies only public fields —
+    participant ids, threshold, group parameters, joint public key and
+    verification shares — and never references the secret shares, blinding
+    shares or the DKG result itself. A context built directly from the same
+    public fields compares equal and behaves identically.
+    """
+    if not isinstance(key, SigningDKGResult):
+        raise TypeError("key must be a SigningDKGResult instance")
+    _check_signing_setup(key)
+    _check_signing_dkg_structure(key)
+    pedersen = key.result.commitment
+    return SigningPublicContext(
+        participant_ids=key.result.participant_ids,
+        threshold=len(pedersen.values),
+        field_prime=pedersen.field_prime,
+        group_prime=pedersen.group_prime,
+        generator=pedersen.generator,
+        public_key=key.public_key,
+        verification_shares=key.verification_shares,
+    )
+
+
+def _signing_key_parts(
+    key: SigningDKGResult | SigningPublicContext,
+) -> tuple[tuple[int, ...], int, int, int, int, int, tuple[int, ...]]:
+    """Validate a signing key or public context and return its public parts.
+
+    Returns ``(participant_ids, threshold, field_prime, group_prime,
+    generator, public_key, verification_shares)``. A
+    :class:`SigningPublicContext` is checked field by field; anything else
+    goes through the unchanged :class:`SigningDKGResult` checks, so calls
+    with the old key type keep their exact return values and exception
+    behaviour.
+    """
+    if isinstance(key, SigningPublicContext):
+        _check_signing_public_context(key)
+        return (
+            key.participant_ids,
+            key.threshold,
+            key.field_prime,
+            key.group_prime,
+            key.generator,
+            key.public_key,
+            key.verification_shares,
+        )
+    result, public_key, field_prime, group_prime, generator = _check_signing_setup(key)
+    _check_signing_dkg_structure(key)
+    return (
+        result.participant_ids,
+        len(result.commitment.values),
+        field_prime,
+        group_prime,
+        generator,
+        public_key,
+        key.verification_shares,
+    )
+
+
 def _draw_nonzero_nonce(randbelow: Callable[[int], int], prime: int) -> int:
     """Draw a one-off nonce uniformly from ``1 .. prime - 1``.
 
@@ -3885,22 +4036,30 @@ def create_signing_round(
     message: bytes,
     signer_ids: Iterable[int],
     nonce_commitments: Iterable[SigningNonceCommitment],
-    dkg_result: SigningDKGResult,
+    dkg_result: SigningDKGResult | SigningPublicContext,
 ) -> SigningRound:
     """Assemble the round-one commitments into a fixed :class:`SigningRound`.
 
-    ``signer_ids`` must be unique DKG participants, strictly increasing, and
-    number at least ``threshold``; ``nonce_commitments`` must contain exactly
-    one round-one commitment per signer, whose ``R_i`` values are distinct
-    non-identity elements of the order-``field_prime`` subgroup. Distinct
-    ``R_i`` stop one signer copying another's commitment. The aggregate
-    ``R`` is the product of every ``R_i`` and the challenge binds the tag,
-    the message SHA-256 digest, ``Y``, ``R`` and the L-byte encodings of the
-    signer ids.
+    ``dkg_result`` may be a :class:`SigningDKGResult` or a
+    :class:`SigningPublicContext` holding the same public material; both are
+    validated and give identical rounds. ``signer_ids`` must be unique DKG
+    participants, strictly increasing, and number at least ``threshold``;
+    ``nonce_commitments`` must contain exactly one round-one commitment per
+    signer, whose ``R_i`` values are distinct non-identity elements of the
+    order-``field_prime`` subgroup. Distinct ``R_i`` stop one signer copying
+    another's commitment. The aggregate ``R`` is the product of every
+    ``R_i`` and the challenge binds the tag, the message SHA-256 digest,
+    ``Y``, ``R`` and the L-byte encodings of the signer ids.
     """
-    result, public_key, field_prime, group_prime, _generator = _check_signing_setup(dkg_result)
-    _check_signing_dkg_structure(dkg_result)
-    threshold = len(result.commitment.values)
+    (
+        participant_ids,
+        threshold,
+        field_prime,
+        group_prime,
+        _generator,
+        public_key,
+        _verification_shares,
+    ) = _signing_key_parts(dkg_result)
 
     ids = signer_ids if isinstance(signer_ids, tuple) else tuple(signer_ids)
     commitments = (
@@ -3914,7 +4073,7 @@ def create_signing_round(
         commitments,
         field_prime,
         group_prime,
-        result.participant_ids,
+        participant_ids,
         threshold,
     )
 
@@ -4006,16 +4165,18 @@ def create_signature_share(
 def verify_signature_share(
     share: SignatureShare,
     round_info: SigningRound,
-    dkg_result: SigningDKGResult,
+    dkg_result: SigningDKGResult | SigningPublicContext,
 ) -> bool:
     """Check one signature share: ``g ** z_i == R_i * Y_i ** (c * lambda_i)``.
 
-    Returns ``True`` on a match. A share with a tampered ``z`` or wrong
-    nonce commitment, one produced for another message or signing round, or
-    a signer absent from the DKG returns ``False`` for well-formed inputs;
-    malformed arguments raise TypeError/ValueError. The round's ``R`` and
-    challenge are re-derived from its contents so a hand-edited round cannot
-    validate.
+    ``dkg_result`` may be a :class:`SigningDKGResult` or a
+    :class:`SigningPublicContext` holding the same public material; both
+    give identical verdicts. Returns ``True`` on a match. A share with a
+    tampered ``z`` or wrong nonce commitment, one produced for another
+    message or signing round, or a signer absent from the DKG returns
+    ``False`` for well-formed inputs; malformed arguments raise
+    TypeError/ValueError. The round's ``R`` and challenge are re-derived
+    from its contents so a hand-edited round cannot validate.
     """
     if not isinstance(share, SignatureShare):
         raise TypeError("share must be a SignatureShare instance")
@@ -4025,14 +4186,21 @@ def verify_signature_share(
         raise TypeError("share.z must be an integer")
     if not isinstance(share.nonce_commitment, int) or isinstance(share.nonce_commitment, bool):
         raise TypeError("share.nonce_commitment must be an integer")
-    result, public_key, field_prime, group_prime, generator = _check_signing_setup(dkg_result)
-    _check_signing_dkg_structure(dkg_result)
+    (
+        participant_ids,
+        threshold,
+        field_prime,
+        group_prime,
+        generator,
+        public_key,
+        verification_shares,
+    ) = _signing_key_parts(dkg_result)
     _validate_signing_round(
         round_info,
         field_prime,
         group_prime,
-        result.participant_ids,
-        len(result.commitment.values),
+        participant_ids,
+        threshold,
     )
 
     if not 0 < share.signer_id < field_prime:
@@ -4044,7 +4212,7 @@ def verify_signature_share(
 
     if share.signer_id not in round_info.signer_ids:
         return False
-    if share.signer_id not in result.participant_ids:
+    if share.signer_id not in participant_ids:
         return False
     index = round_info.signer_ids.index(share.signer_id)
     if share.nonce_commitment != round_info.nonce_commitments[index].commitment:
@@ -4067,8 +4235,8 @@ def verify_signature_share(
         return False
 
     weight = _lagrange_weight(share.signer_id, round_info.signer_ids, field_prime)
-    share_index = result.participant_ids.index(share.signer_id)
-    Y_i = dkg_result.verification_shares[share_index]
+    share_index = participant_ids.index(share.signer_id)
+    Y_i = verification_shares[share_index]
     expected = (
         share.nonce_commitment
         * pow(Y_i, challenge * weight % field_prime, group_prime)
@@ -4080,27 +4248,36 @@ def verify_signature_share(
 def aggregate_signature(
     shares: Iterable[SignatureShare],
     round_info: SigningRound,
-    dkg_result: SigningDKGResult,
+    dkg_result: SigningDKGResult | SigningPublicContext,
 ) -> AggregateSignature | list[SignatureShareRejection]:
     """Verify and sum the round-two shares of a signing round.
 
-    Every signer of ``round_info`` must contribute exactly once, in any
-    order; duplicate or missing signers raise ValueError and wrong types
-    raise TypeError. Each share is checked with
-    :func:`verify_signature_share` and every failure is returned in a
-    signer-id-sorted :class:`SignatureShareRejection` list, never silently
-    dropped, independently of the input order. On success the ``z_i`` are
-    summed modulo ``field_prime`` and returned with the round's ``R`` and
-    signer set as the :class:`AggregateSignature`.
+    ``dkg_result`` may be a :class:`SigningDKGResult` or a
+    :class:`SigningPublicContext` holding the same public material; both
+    give identical signatures and rejection lists. Every signer of
+    ``round_info`` must contribute exactly once, in any order; duplicate or
+    missing signers raise ValueError and wrong types raise TypeError. Each
+    share is checked with :func:`verify_signature_share` and every failure
+    is returned in a signer-id-sorted :class:`SignatureShareRejection` list,
+    never silently dropped, independently of the input order. On success the
+    ``z_i`` are summed modulo ``field_prime`` and returned with the round's
+    ``R`` and signer set as the :class:`AggregateSignature`.
     """
-    result, _public_key, field_prime, group_prime, _generator = _check_signing_setup(dkg_result)
-    _check_signing_dkg_structure(dkg_result)
+    (
+        participant_ids,
+        threshold,
+        field_prime,
+        group_prime,
+        _generator,
+        _public_key,
+        _verification_shares,
+    ) = _signing_key_parts(dkg_result)
     _validate_signing_round(
         round_info,
         field_prime,
         group_prime,
-        result.participant_ids,
-        len(result.commitment.values),
+        participant_ids,
+        threshold,
     )
 
     materialised = list(shares)
