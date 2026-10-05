@@ -32,7 +32,9 @@ material alone, the self-contained SigningRoundPacket /
 encode_round_packet / decode_round_packet / verify_round_packet that
 carries one round's public context and round-one material as a single
 canonical byte string a receiver verifies against its own trusted
-context, signing
+context, and the packet-based signer entry point sign_round_packet that
+produces a round-two share from a verified packet, the signer's own
+secret share and nonce, and the trusted public context alone, signing
 audit receipts: SigningAudit / create_audit / check_audit, and the
 self-contained AuditReceipt / create_audit_receipt /
 verify_audit_receipt that binds an audit record to its public
@@ -302,6 +304,7 @@ __all__ = [
     "encode_round_packet",
     "decode_round_packet",
     "verify_round_packet",
+    "sign_round_packet",
     "SignatureReceipt",
     "create_signature_receipt",
     "encode_signature_receipt",
@@ -4967,6 +4970,131 @@ def verify_round_packet(
         group_prime=packet_context.group_prime,
     )
     return challenge == round_info.challenge
+
+
+def sign_round_packet(
+    signer_id: int,
+    secret_share: int,
+    nonce: int,
+    packet: SigningRoundPacket,
+    context: SigningPublicContext,
+    expected_message: bytes,
+) -> SignatureShare:
+    """Produce one signer's round-two share from a verified round packet.
+
+    This is the packet-based counterpart of :func:`create_signature_share`:
+    the signer needs only its own ``secret_share`` ``s_i``, its one-off
+    ``nonce`` ``r_i``, the received :class:`SigningRoundPacket` and its own
+    trusted :class:`SigningPublicContext` — never the full DKG result,
+    anyone else's secret or blinding share, or any state from earlier
+    calls. ``expected_message`` is the exact byte string the signer agrees
+    to sign. On success the returned :class:`SignatureShare` is equal by
+    value to the share :func:`create_signature_share` produces for the same
+    key, round, secret share and nonce, and can be handed straight to
+    :func:`verify_signature_share` and :func:`aggregate_signature`.
+
+    Every check is a boundary check that raises: a wrong argument or field
+    type raises TypeError (a boolean is never an integer); every structural
+    or consistency violation raises ValueError and no share is returned.
+    The packet is first validated exactly as at the codec boundary
+    (:func:`_check_round_packet`: group parameters, id ordering, threshold,
+    commitment alignment and numeric ranges), then every public field of
+    its bundled context — participant ids, threshold, group parameters,
+    joint public key and every verification share — must equal the trusted
+    ``context``, so a packet exported before a refresh or resharing is
+    rejected against the new context even when the joint public key is
+    unchanged. The packet's message must equal ``expected_message`` byte
+    for byte; recomputing a valid challenge over a modified message does
+    not bypass this check. The aggregate ``R`` must be the product of the
+    nonce commitments and ``challenge`` the Fiat-Shamir challenge of the
+    round contents, exactly as :func:`create_signing_round` derives them.
+
+    The signer must belong both to the context participants and to the
+    round's signing set. ``secret_share`` must satisfy
+    ``0 <= s_i < field_prime`` and ``generator ** s_i`` must equal the
+    signer's verification share — this match is enforced even when the
+    round challenge is zero. ``nonce`` must satisfy
+    ``1 <= r_i <= field_prime - 1`` and ``generator ** r_i`` must equal the
+    signer's round-one commitment in the packet. The function never mutates
+    its inputs, stores no secret or nonce, and is deterministic across
+    repeated calls; nonce reuse prevention remains the caller's
+    responsibility.
+    """
+    if not isinstance(signer_id, int) or isinstance(signer_id, bool):
+        raise TypeError("signer_id must be an integer")
+    if not isinstance(secret_share, int) or isinstance(secret_share, bool):
+        raise TypeError("secret_share must be an integer")
+    if not isinstance(nonce, int) or isinstance(nonce, bool):
+        raise TypeError("nonce must be an integer")
+    if not isinstance(expected_message, bytes):
+        raise TypeError("expected_message must be bytes")
+    _check_round_packet(packet)
+    if not isinstance(context, SigningPublicContext):
+        raise TypeError("context must be a SigningPublicContext instance")
+    _check_signing_public_context(context)
+
+    packet_context = packet.context
+    if (
+        packet_context.participant_ids != context.participant_ids
+        or packet_context.threshold != context.threshold
+        or packet_context.field_prime != context.field_prime
+        or packet_context.group_prime != context.group_prime
+        or packet_context.generator != context.generator
+        or packet_context.public_key != context.public_key
+        or packet_context.verification_shares != context.verification_shares
+    ):
+        raise ValueError("packet context must equal the trusted public context")
+
+    round_info = packet.round_info
+    if round_info.message != expected_message:
+        raise ValueError("packet message must equal the expected message")
+
+    field_prime = context.field_prime
+    group_prime = context.group_prime
+    generator = context.generator
+
+    R = 1
+    for commitment in round_info.nonce_commitments:
+        R = R * commitment.commitment % group_prime
+    if R != round_info.R:
+        raise ValueError("round R must be the product of the nonce commitments")
+    challenge = schnorr_challenge(
+        round_info.message,
+        context.public_key,
+        R,
+        round_info.signer_ids,
+        field_prime=field_prime,
+        group_prime=group_prime,
+    )
+    if challenge != round_info.challenge:
+        raise ValueError(
+            "round challenge must be the Fiat-Shamir challenge of the round contents"
+        )
+
+    if signer_id not in context.participant_ids:
+        raise ValueError("signer must be a context participant")
+    if signer_id not in round_info.signer_ids:
+        raise ValueError("signer must take part in the signing round")
+    if not 0 <= secret_share < field_prime:
+        raise ValueError("secret_share must satisfy 0 <= s_i < field_prime")
+    if not 0 < nonce < field_prime:
+        raise ValueError("nonce must satisfy 1 <= r_i <= field_prime - 1")
+
+    share_index = context.participant_ids.index(signer_id)
+    Y_i = context.verification_shares[share_index]
+    # Unconditional: a zero challenge must not let a wrong secret share
+    # through, so the share is matched against its verification share first.
+    if pow(generator, secret_share, group_prime) != Y_i:
+        raise ValueError("secret share does not match the signer's verification share")
+
+    index = round_info.signer_ids.index(signer_id)
+    R_i = round_info.nonce_commitments[index].commitment
+    if pow(generator, nonce, group_prime) != R_i:
+        raise ValueError("nonce does not match the published round-one commitment")
+
+    weight = _lagrange_weight(signer_id, round_info.signer_ids, field_prime)
+    z = (nonce + round_info.challenge * weight * secret_share) % field_prime
+    return SignatureShare(signer_id=signer_id, nonce_commitment=R_i, z=z)
 
 
 # ---------------------------------------------------------------------------
