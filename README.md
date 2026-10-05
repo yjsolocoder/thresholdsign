@@ -308,6 +308,56 @@ field_prime` 且 `g ** s_i` 等于本人验证份额（挑战为零时同样检�
 `verify_signature_share` 与 `aggregate_signature`；入口不修改输入、不保存秘密
 或 nonce，重复调用结果确定，nonce 防复用仍由调用方负责。
 
+### 接收方本地 DKG 聚合
+
+完整聚合 `aggregate_signing_dkg` 需要全体贡献里的所有双份额；而每名参与者其实
+只需要**发给自己的**那一份双份额。`LocalDKGPacket` 冻结记录一个发送者针对本人
+的材料：参与者编号元组 `participant_ids`、本人的 `DKGReceivedShare`、发送者的
+Pedersen 承诺与 Feldman 承诺（后两者即其 `SigningContribution` 中的公开承诺），
+可按位置构造、按值相等，不含其他接收者的份额。`aggregate_local_dkg(receiver_id,
+packets)` 凭每个发送者各一个包，在本地算出与完整聚合一致的结果：
+
+```python
+from thresholdsign import (
+    DKGReceivedShare, LocalDKGPacket, aggregate_local_dkg,
+    export_signing_public_context,
+)
+
+# contributions 是各发送者的 SigningContribution；取出发给本人（如 2 号）的包
+packets = []
+for contribution in contributions:
+    dealing = contribution.contribution
+    index = dealing.participant_ids.index(2)
+    packets.append(LocalDKGPacket(
+        participant_ids=dealing.participant_ids,
+        received=DKGReceivedShare(
+            sender_id=dealing.sender_id,
+            receiver_id=2,
+            share=dealing.shares[index],
+            blinding_share=dealing.blinding_shares[index],
+        ),
+        commitment=dealing.commitment,
+        feldman_commitment=contribution.feldman_commitment,
+    ))
+
+share, blinding_share, context = aggregate_local_dkg(2, packets)
+# share / blinding_share 与 key.result 中本人那两项按值相等
+assert context == export_signing_public_context(key)
+# share.y 可直接作为 sign_round_packet 的 secret_share 使用
+```
+
+入口先校验全部输入结构：对象或字段类型错误（布尔不视为整数）抛 `TypeError`；
+空批次、成员编号为空/非严格递增/越界、目标编号不在成员中、发送者缺失/重复/
+不属于成员、接收编号或份额坐标不等于目标、份额值越界、非法群参数或承诺、
+成员集合/门限/群参数不一致均抛 `ValueError`（门限为两类承诺的相同长度，沿用
+`1 <= threshold <= 参与人数` 的现有限制）。结构合法后逐发送者核验本人的
+Pedersen 双份额与 Feldman 份额，任一不匹配返回按发送者编号升序、去重的
+`DKGRejection` 列表，列全失败发送者且不返回部分聚合结果；成功只证明本人的
+份额通过检查，不声称其他成员已收到有效份额。成功时返回
+`(share, blinding_share, context)`：两个份额坐标均为目标编号，值为收到的对应
+份额在域内之和；公开上下文由全部公开承诺确定。输入顺序不影响结果，支持单次
+迭代器、门限为一、零份额与单位元承诺值；入口不修改输入、不保存状态。
+
 ### 主动份额刷新
 
 签名密钥长期使用时，可用主动份额刷新（proactive refresh）在不改变联合秘密与
@@ -1636,6 +1686,26 @@ python3 -m thresholdsign
   结构错误沿用轮次包约束抛 `ValueError`。结果与 `create_signature_share` 对同一
   密钥、轮次、秘密份额和 nonce 的产出按值相等，可直接进入现有份额验证与聚合；
   不修改输入、不保存秘密或 nonce，重复调用结果确定，nonce 防复用由调用方负责
+- `LocalDKGPacket(participant_ids, received, commitment, feldman_commitment)` —
+  冻结数据类，可按位置构造、按值相等；一个发送者针对某接收者的本地 DKG 材料：
+  参与者编号元组、发给本人的 `DKGReceivedShare`、发送者的 Pedersen 承诺与
+  Feldman 承诺（即其 `SigningContribution` 的公开部分）；不含其他接收者的份额、
+  多项式系数或隐藏状态
+- `aggregate_local_dkg(receiver_id, packets)` — 接收方本地 DKG 聚合：凭每个
+  发送者各一个 `LocalDKGPacket`（只需发给本人的双份额与各发送者公开承诺）算出
+  `(share, blinding_share, context)`；两个份额坐标均为 `receiver_id`，值为收到的
+  对应份额在域内之和，`context` 为由全部公开承诺确定的 `SigningPublicContext`。
+  对同一批合法签名贡献，各成员本地聚合所得份额与 `aggregate_signing_dkg` 结果
+  的对应项按值相等，上下文与 `export_signing_public_context` 相等，可直接配合
+  `sign_round_packet` 完成签名。先校验全部输入结构：类型错误（布尔不视为整数）
+  抛 `TypeError`；空批次、成员编号为空/非严格递增/越界、目标不在成员中、发送者
+  缺失/重复/不属于成员、接收编号或份额坐标不等于目标、份额值越界、非法群参数
+  或承诺、成员集合/门限/群参数不一致抛 `ValueError`（门限为两类承诺的相同长度，
+  沿用 `1 <= threshold <= 参与人数`）。结构合法后逐发送者核验本人 Pedersen 双
+  份额与 Feldman 份额，任一不匹配返回按发送者编号升序、去重的 `DKGRejection`
+  列表（列全失败发送者，不返回部分聚合结果）；成功只证明本人份额通过检查。
+  输入顺序不影响结果，支持单次迭代器、门限为一、零份额与单位元承诺值；不修改
+  输入、不保存状态
 - `SignatureReceipt(message, signature, public_key, field_prime, group_prime, generator)`
   — 冻结数据类，可按位置构造、按值相等；可独立流转的门限 Schnorr 签名凭证：
   `message` 为被签名字节串，`signature` 是 `AggregateSignature(R, z, signer_ids)`，

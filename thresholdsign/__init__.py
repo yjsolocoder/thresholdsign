@@ -28,7 +28,11 @@ create_signing_nonce_commitment / create_signing_round / create_signature_share
 / verify_signature_share / aggregate_signature / verify_signature, the
 coordinator-side SigningPublicContext / export_signing_public_context that
 runs round creation, share verification and aggregation from public
-material alone, the self-contained SigningRoundPacket /
+material alone, the receiver-side LocalDKGPacket / aggregate_local_dkg
+that lets each DKG participant aggregate only the double shares addressed
+to them, together with the senders' public commitments, into their own
+signing share, blinding share and the same public signing context, the
+self-contained SigningRoundPacket /
 encode_round_packet / decode_round_packet / verify_round_packet that
 carries one round's public context and round-one material as a single
 canonical byte string a receiver verifies against its own trusted
@@ -270,6 +274,8 @@ __all__ = [
     "aggregate_signing_dkg",
     "SigningPublicContext",
     "export_signing_public_context",
+    "LocalDKGPacket",
+    "aggregate_local_dkg",
     "ContributionFault",
     "diagnose_signing_contributions",
     "create_refresh",
@@ -3760,6 +3766,296 @@ def _signing_key_parts(
         generator,
         public_key,
         key.verification_shares,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Receiver-local DKG aggregation: each participant combines only the double
+# shares addressed to them — one LocalDKGPacket per sender — into their own
+# aggregated signing share, blinding share and the public signing context,
+# without ever seeing another receiver's share.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LocalDKGPacket:
+    """One sender's signing DKG material as seen by one receiver.
+
+    ``participant_ids`` is the strictly increasing, duplicate-free tuple of
+    every DKG participant's id (the same tuple every sender used);
+    ``received`` is the :class:`DKGReceivedShare` the sender addressed to the
+    aggregating participant; ``commitment`` is the sender's Pedersen
+    commitment and ``feldman_commitment`` the Feldman commitment to the same
+    sharing polynomial — both exactly as published in the sender's
+    :class:`SigningContribution`. The dataclass is frozen, positionally
+    constructible and compared by value, and carries no other receiver's
+    share, no polynomial coefficient and no hidden state.
+    """
+
+    participant_ids: tuple[int, ...]
+    received: DKGReceivedShare
+    commitment: PedersenCommitment
+    feldman_commitment: FeldmanCommitment
+
+
+def _check_local_dkg_packet_types(packet: LocalDKGPacket) -> None:
+    """Type-check every field of a LocalDKGPacket, raising TypeError.
+
+    A boolean is never accepted as an integer.
+    """
+    if not isinstance(packet, LocalDKGPacket):
+        raise TypeError("packets must be LocalDKGPacket instances")
+    if not isinstance(packet.participant_ids, tuple):
+        raise TypeError("participant_ids must be a tuple")
+    for participant_id in packet.participant_ids:
+        if not isinstance(participant_id, int) or isinstance(participant_id, bool):
+            raise TypeError("participant ids must be integers")
+    received = packet.received
+    if not isinstance(received, DKGReceivedShare):
+        raise TypeError("received must be a DKGReceivedShare instance")
+    for name, value in (
+        ("sender_id", received.sender_id),
+        ("receiver_id", received.receiver_id),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"{name} must be an integer")
+    for name, share in (
+        ("received.share", received.share),
+        ("received.blinding_share", received.blinding_share),
+    ):
+        if not isinstance(share, Share):
+            raise TypeError(f"{name} must be a Share instance")
+        for coordinate_name, coordinate in (("x", share.x), ("y", share.y)):
+            if not isinstance(coordinate, int) or isinstance(coordinate, bool):
+                raise TypeError(f"{name}.{coordinate_name} must be an integer")
+    commitment = packet.commitment
+    if not isinstance(commitment, PedersenCommitment):
+        raise TypeError("commitment must be a PedersenCommitment instance")
+    for name, value in (
+        ("field_prime", commitment.field_prime),
+        ("group_prime", commitment.group_prime),
+        ("generator", commitment.generator),
+        ("blinding_generator", commitment.blinding_generator),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"{name} must be an integer")
+    if not isinstance(commitment.values, tuple):
+        raise TypeError("commitment values must be a tuple")
+    for value in commitment.values:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError("commitment values must be integers")
+    feldman = packet.feldman_commitment
+    if not isinstance(feldman, FeldmanCommitment):
+        raise TypeError("feldman_commitment must be a FeldmanCommitment instance")
+    for name, value in (
+        ("field_prime", feldman.field_prime),
+        ("group_prime", feldman.group_prime),
+        ("generator", feldman.generator),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"{name} must be an integer")
+    if not isinstance(feldman.values, tuple):
+        raise TypeError("feldman commitment values must be a tuple")
+    for value in feldman.values:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError("feldman commitment values must be integers")
+
+
+def _check_local_dkg_packet_structure(
+    packet: LocalDKGPacket, receiver_id: int
+) -> None:
+    """Value-check one packet's ids, addressing, shares and commitments.
+
+    Every violation raises ValueError: empty or non-increasing participant
+    ids, an id outside ``1 .. field_prime - 1``, a sender outside the
+    participant set, a received share not addressed to ``receiver_id`` (in
+    its ``receiver_id`` or either share coordinate), a share value outside
+    ``0 .. field_prime - 1``, a threshold outside ``1 .. participant count``
+    (the threshold is the common length of the two commitments), the two
+    commitments disagreeing on the group or the threshold, or an illegal
+    group parameter or commitment value.
+    """
+    ids = packet.participant_ids
+    if not ids:
+        raise ValueError("participant ids must not be empty")
+    if any(ids[index] >= ids[index + 1] for index in range(len(ids) - 1)):
+        raise ValueError("participant ids must be strictly increasing and unique")
+    commitment = packet.commitment
+    feldman = packet.feldman_commitment
+    field_prime = commitment.field_prime
+    for participant_id in ids:
+        if not 0 < participant_id < field_prime:
+            raise ValueError("participant ids must satisfy 1 <= id <= field_prime - 1")
+    received = packet.received
+    if received.sender_id not in ids:
+        raise ValueError("sender_id must be one of the participant ids")
+    if received.receiver_id != receiver_id:
+        raise ValueError("received shares must be addressed to the aggregating participant")
+    if received.share.x != receiver_id or received.blinding_share.x != receiver_id:
+        raise ValueError("share coordinates must equal the aggregating participant id")
+    for name, share in (
+        ("share", received.share),
+        ("blinding_share", received.blinding_share),
+    ):
+        if not 0 <= share.y < field_prime:
+            raise ValueError(f"{name} values must satisfy 0 <= y <= field_prime - 1")
+    if len(commitment.values) != len(feldman.values):
+        raise ValueError("the two commitments must share the same threshold")
+    if not 1 <= len(commitment.values) <= len(ids):
+        raise ValueError("threshold must satisfy 1 <= threshold <= participant count")
+    if (
+        feldman.field_prime != field_prime
+        or feldman.group_prime != commitment.group_prime
+        or feldman.generator != commitment.generator
+    ):
+        raise ValueError("the two commitments must share the same group parameters")
+    _validate_commitment_setup(
+        commitment.values,
+        field_prime,
+        commitment.group_prime,
+        (commitment.generator, commitment.blinding_generator),
+    )
+    _validate_commitment_setup(
+        feldman.values, feldman.field_prime, feldman.group_prime, (feldman.generator,)
+    )
+
+
+def aggregate_local_dkg(
+    receiver_id: int,
+    packets: Iterable[LocalDKGPacket],
+) -> tuple[Share, Share, SigningPublicContext] | list[DKGRejection]:
+    """Aggregate one participant's own received DKG shares into signing material.
+
+    ``receiver_id`` is the aggregating participant and ``packets`` carries
+    exactly one :class:`LocalDKGPacket` per participant, each holding the
+    double share that sender addressed to ``receiver_id`` together with the
+    sender's public Pedersen and Feldman commitments — the material a
+    receiver can extract from the senders' :class:`SigningContribution`
+    objects without ever seeing another receiver's share.
+
+    All inputs are validated structurally first: wrong object or field
+    types raise TypeError (a boolean is never an integer); an empty batch,
+    empty, non-increasing or out-of-range participant ids, a ``receiver_id``
+    that is not one of the participants, a missing, duplicated or
+    non-member sender, a received share whose ``receiver_id`` or share
+    coordinates do not equal ``receiver_id``, illegal group parameters or
+    commitments, an out-of-range share value, or packets disagreeing on the
+    participant ids, the threshold (the common length of the two
+    commitments, bounded by ``1 <= threshold <= participant count`` as
+    everywhere else) or the group parameters raise ValueError.
+
+    Once the structure is legal, each sender's double share is checked
+    against that sender's Pedersen commitment and the secret share against
+    the Feldman commitment. Failures are never dropped and no partial
+    result is returned: if any check fails, the result is a sender-sorted,
+    duplicate-free ``list`` of :class:`DKGRejection` naming every sender
+    whose packet failed. Success certifies only the aggregating
+    participant's own shares — it says nothing about whether any other
+    member received valid shares.
+
+    On success returns ``(share, blinding_share, context)``: the
+    receiver's aggregated :class:`Share` and aggregated blinding
+    :class:`Share`, both with coordinate ``receiver_id`` and values the
+    sums of the received shares modulo ``field_prime``, and the
+    :class:`SigningPublicContext` determined by the public commitments
+    alone (the joint public key is the product of the constant-term
+    Feldman commitments, each verification share the product of the
+    Feldman evaluations at that participant id). For the same batch of
+    valid signing contributions each member's locally aggregated shares
+    equal the corresponding entries of the :class:`SigningDKGResult` that
+    :func:`aggregate_signing_dkg` produces, the context equals
+    :func:`export_signing_public_context` of that result, and both drop
+    straight into :func:`sign_round_packet` and the other signing entry
+    points. The input order does not affect the result, single-pass
+    iterators are accepted, and a threshold of one, zero shares and
+    identity commitment values remain legal exactly as in the full
+    aggregation. The function does not mutate its inputs and keeps no
+    state between calls.
+    """
+    if not isinstance(receiver_id, int) or isinstance(receiver_id, bool):
+        raise TypeError("receiver_id must be an integer")
+    materialised = list(packets)
+    if not materialised:
+        raise ValueError("at least one packet is required")
+    for packet in materialised:
+        _check_local_dkg_packet_types(packet)
+    for packet in materialised:
+        _check_local_dkg_packet_structure(packet, receiver_id)
+
+    first = materialised[0]
+    participant_ids = first.participant_ids
+    first_commitment = first.commitment
+    threshold = len(first_commitment.values)
+    if receiver_id not in participant_ids:
+        raise ValueError("receiver_id must be one of the participant ids")
+    for packet in materialised:
+        commitment = packet.commitment
+        if packet.participant_ids != participant_ids:
+            raise ValueError("packets must agree on the same participant ids")
+        if (
+            commitment.field_prime != first_commitment.field_prime
+            or commitment.group_prime != first_commitment.group_prime
+            or commitment.generator != first_commitment.generator
+            or commitment.blinding_generator != first_commitment.blinding_generator
+        ):
+            raise ValueError("packets must share the same group parameters")
+        if len(commitment.values) != threshold:
+            raise ValueError("packets must share the same threshold")
+
+    sender_ids = [packet.received.sender_id for packet in materialised]
+    if len(set(sender_ids)) != len(sender_ids):
+        raise ValueError("duplicate packet from the same participant")
+    if set(sender_ids) != set(participant_ids):
+        raise ValueError("each participant must send exactly one packet")
+
+    # Sort by sender so the input order cannot influence the outcome.
+    ordered = sorted(materialised, key=lambda packet: packet.received.sender_id)
+
+    rejections: list[DKGRejection] = []
+    for packet in ordered:
+        received = packet.received
+        if not verify_pedersen_share(
+            received.share, received.blinding_share, packet.commitment
+        ) or not verify_share(received.share, packet.feldman_commitment):
+            rejections.append(DKGRejection(sender_id=received.sender_id))
+    if rejections:
+        return rejections
+
+    field_prime = first_commitment.field_prime
+    group_prime = first_commitment.group_prime
+    y = 0
+    y_blinding = 0
+    for packet in ordered:
+        y = (y + packet.received.share.y) % field_prime
+        y_blinding = (y_blinding + packet.received.blinding_share.y) % field_prime
+
+    public_key = 1
+    verification_shares: list[int] = [1 for _ in participant_ids]
+    for packet in ordered:
+        feldman = packet.feldman_commitment
+        public_key = public_key * feldman.values[0] % group_prime
+        for index, participant_id in enumerate(participant_ids):
+            x_power = 1
+            evaluation = 1
+            for value in feldman.values:
+                evaluation = evaluation * pow(value, x_power, group_prime) % group_prime
+                x_power = x_power * participant_id % field_prime
+            verification_shares[index] = (
+                verification_shares[index] * evaluation % group_prime
+            )
+    context = SigningPublicContext(
+        participant_ids=participant_ids,
+        threshold=threshold,
+        field_prime=field_prime,
+        group_prime=group_prime,
+        generator=first_commitment.generator,
+        public_key=public_key,
+        verification_shares=tuple(verification_shares),
+    )
+    return (
+        Share(x=receiver_id, y=y),
+        Share(x=receiver_id, y=y_blinding),
+        context,
     )
 
 
