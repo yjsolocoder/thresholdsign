@@ -31,7 +31,11 @@ runs round creation, share verification and aggregation from public
 material alone, the receiver-side LocalDKGPacket / aggregate_local_dkg
 that lets each DKG participant aggregate only the double shares addressed
 to them, together with the senders' public commitments, into their own
-signing share, blinding share and the same public signing context, the
+signing share, blinding share and the same public signing context, and
+the receiver-side refresh_local that proactively refreshes one
+participant's own double share, the aggregated Pedersen commitment and
+the public signing context from that participant's old material, a
+trusted SigningPublicContext and the refresh packets addressed to them, the
 self-contained SigningRoundPacket /
 encode_round_packet / decode_round_packet / verify_round_packet that
 carries one round's public context and round-one material as a single
@@ -276,6 +280,7 @@ __all__ = [
     "export_signing_public_context",
     "LocalDKGPacket",
     "aggregate_local_dkg",
+    "refresh_local",
     "ContributionFault",
     "diagnose_signing_contributions",
     "create_refresh",
@@ -3773,7 +3778,10 @@ def _signing_key_parts(
 # Receiver-local DKG aggregation: each participant combines only the double
 # shares addressed to them — one LocalDKGPacket per sender — into their own
 # aggregated signing share, blinding share and the public signing context,
-# without ever seeing another receiver's share.
+# without ever seeing another receiver's share. The same packet form carries
+# zero-secret refresh contributions, so a receiver can also refresh their own
+# double share, the aggregated Pedersen commitment and the public context
+# locally with refresh_local.
 # ---------------------------------------------------------------------------
 
 
@@ -4056,6 +4064,224 @@ def aggregate_local_dkg(
         Share(x=receiver_id, y=y),
         Share(x=receiver_id, y=y_blinding),
         context,
+    )
+
+
+def refresh_local(
+    receiver_id: int,
+    share: Share,
+    blinding_share: Share,
+    commitment: PedersenCommitment,
+    context: SigningPublicContext,
+    packets: Iterable[LocalDKGPacket],
+) -> tuple[Share, Share, PedersenCommitment, SigningPublicContext] | list[DKGRejection]:
+    """Refresh one participant's own shares with zero-secret refresh packets.
+
+    ``receiver_id`` is the refreshing participant; ``share`` and
+    ``blinding_share`` are their current double share, ``commitment`` the
+    current aggregated Pedersen commitment of the whole group, ``context``
+    the trusted current :class:`SigningPublicContext`, and ``packets``
+    carries exactly one :class:`LocalDKGPacket` per participant, each
+    holding the zero-secret double share that sender addressed to
+    ``receiver_id`` together with the sender's public Pedersen and Feldman
+    refresh commitments — the material a receiver can extract from the
+    senders' :func:`create_refresh` contributions without ever seeing
+    another receiver's share, old or new.
+
+    All inputs are validated structurally first, with the same legal-value
+    rules as the public context, commitment and local-packet checks:
+    wrong object or field types raise TypeError (a boolean is never an
+    integer); an empty packet batch, an illegal value in any object, a
+    ``receiver_id`` that is not one of the context's participants, an old
+    share or blinding share whose coordinate does not equal
+    ``receiver_id``, a missing, duplicated or non-member packet sender, or
+    packets disagreeing with the context on the participant ids, the
+    threshold or the group parameters — including the old commitment's
+    blinding generator — raise ValueError.
+
+    Once the structure is legal, the old double share is checked against
+    the old aggregated Pedersen commitment and the old secret share against
+    the receiver's own verification share in ``context``; either failure
+    raises ValueError, because the caller's own trusted material — not any
+    sender's packet — is at fault. Only then are the packets examined: a
+    packet whose double share fails its Pedersen commitment, whose secret
+    share fails its Feldman commitment, or whose Feldman constant-term
+    commitment is not ``1`` (the zero-secret proof every refresh
+    contribution must carry) names its sender in the result — a
+    sender-sorted, duplicate-free ``list`` of :class:`DKGRejection`
+    covering every failing sender, with no partial result.
+
+    On success returns ``(share, blinding_share, commitment, context)``:
+    the receiver's new :class:`Share` and blinding :class:`Share`, both
+    with coordinate ``receiver_id`` and values the old values plus the
+    received refresh shares summed modulo ``field_prime``; the new
+    aggregated :class:`PedersenCommitment`, the old commitment multiplied
+    groupwise by every packet's Pedersen commitment; and the new
+    :class:`SigningPublicContext`, which keeps the participants, threshold,
+    group parameters and joint public key of the old one while each
+    verification share is the old verification share multiplied by every
+    packet's Feldman evaluation at that participant id. For the same batch
+    of valid refresh contributions each member's local result equals the
+    corresponding entries of the :class:`SigningDKGResult` that
+    :func:`refresh` produces — the shares and blinding shares of
+    ``result``, the aggregated commitment of ``result.commitment`` and the
+    :func:`export_signing_public_context` of that result — so the refreshed
+    material drops straight into another :func:`refresh_local` round and
+    into :func:`sign_round_packet`, while signatures made under the old key
+    remain valid. The packet order does not affect the result, single-pass
+    iterators are accepted, and a threshold of one, zero shares and
+    identity commitment values remain legal exactly as in the full refresh.
+    Success certifies only the receiver's own refresh material. The
+    function does not mutate its inputs and keeps no state between calls.
+    """
+    if not isinstance(receiver_id, int) or isinstance(receiver_id, bool):
+        raise TypeError("receiver_id must be an integer")
+    for name, old_share in (("share", share), ("blinding_share", blinding_share)):
+        if not isinstance(old_share, Share):
+            raise TypeError(f"{name} must be a Share instance")
+        for coordinate_name, coordinate in (("x", old_share.x), ("y", old_share.y)):
+            if not isinstance(coordinate, int) or isinstance(coordinate, bool):
+                raise TypeError(f"{name}.{coordinate_name} must be an integer")
+    if not isinstance(commitment, PedersenCommitment):
+        raise TypeError("commitment must be a PedersenCommitment instance")
+    for name, value in (
+        ("field_prime", commitment.field_prime),
+        ("group_prime", commitment.group_prime),
+        ("generator", commitment.generator),
+        ("blinding_generator", commitment.blinding_generator),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"{name} must be an integer")
+    if not isinstance(commitment.values, tuple):
+        raise TypeError("commitment values must be a tuple")
+    for value in commitment.values:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError("commitment values must be integers")
+    if not isinstance(context, SigningPublicContext):
+        raise TypeError("context must be a SigningPublicContext instance")
+    _check_signing_public_context(context)
+    materialised = list(packets)
+    if not materialised:
+        raise ValueError("at least one packet is required")
+    for packet in materialised:
+        _check_local_dkg_packet_types(packet)
+
+    participant_ids = context.participant_ids
+    threshold = context.threshold
+    field_prime = commitment.field_prime
+    group_prime = commitment.group_prime
+    _validate_commitment_setup(
+        commitment.values,
+        field_prime,
+        group_prime,
+        (commitment.generator, commitment.blinding_generator),
+    )
+    if (
+        field_prime != context.field_prime
+        or group_prime != context.group_prime
+        or commitment.generator != context.generator
+    ):
+        raise ValueError("commitment must share the context's group parameters")
+    if len(commitment.values) != threshold:
+        raise ValueError("commitment must share the context's threshold")
+    if receiver_id not in participant_ids:
+        raise ValueError("receiver_id must be one of the participant ids")
+    for name, old_share in (("share", share), ("blinding_share", blinding_share)):
+        if old_share.x != receiver_id:
+            raise ValueError(f"{name} coordinate must equal receiver_id")
+        if not 0 <= old_share.y < field_prime:
+            raise ValueError(f"{name} value must satisfy 0 <= y <= field_prime - 1")
+    for packet in materialised:
+        _check_local_dkg_packet_structure(packet, receiver_id)
+    for packet in materialised:
+        packet_commitment = packet.commitment
+        if packet.participant_ids != participant_ids:
+            raise ValueError("packets must agree on the same participant ids")
+        if (
+            packet_commitment.field_prime != field_prime
+            or packet_commitment.group_prime != group_prime
+            or packet_commitment.generator != commitment.generator
+            or packet_commitment.blinding_generator != commitment.blinding_generator
+        ):
+            raise ValueError("packets must share the same group parameters")
+        if len(packet_commitment.values) != threshold:
+            raise ValueError("packets must share the same threshold")
+    sender_ids = [packet.received.sender_id for packet in materialised]
+    if len(set(sender_ids)) != len(sender_ids):
+        raise ValueError("duplicate packet from the same participant")
+    if set(sender_ids) != set(participant_ids):
+        raise ValueError("each participant must send exactly one packet")
+
+    # The caller's own old material is trusted input: a failure here is an
+    # illegal argument, not a sender rejection.
+    if not verify_pedersen_share(share, blinding_share, commitment):
+        raise ValueError("old double share must verify against the old commitment")
+    index = participant_ids.index(receiver_id)
+    if pow(context.generator, share.y, group_prime) != context.verification_shares[index]:
+        raise ValueError("old share must match the receiver's verification share")
+
+    # Sort by sender so the input order cannot influence the outcome.
+    ordered = sorted(materialised, key=lambda packet: packet.received.sender_id)
+
+    rejections: list[DKGRejection] = []
+    for packet in ordered:
+        received = packet.received
+        if (
+            not verify_pedersen_share(
+                received.share, received.blinding_share, packet.commitment
+            )
+            or not verify_share(received.share, packet.feldman_commitment)
+            or packet.feldman_commitment.values[0] != 1
+        ):
+            rejections.append(DKGRejection(sender_id=received.sender_id))
+    if rejections:
+        return rejections
+
+    y = share.y
+    y_blinding = blinding_share.y
+    for packet in ordered:
+        y = (y + packet.received.share.y) % field_prime
+        y_blinding = (y_blinding + packet.received.blinding_share.y) % field_prime
+
+    new_values = list(commitment.values)
+    verification_shares = list(context.verification_shares)
+    for packet in ordered:
+        for position in range(threshold):
+            new_values[position] = (
+                new_values[position] * packet.commitment.values[position] % group_prime
+            )
+        feldman = packet.feldman_commitment
+        for member_index, participant_id in enumerate(participant_ids):
+            x_power = 1
+            evaluation = 1
+            for value in feldman.values:
+                evaluation = evaluation * pow(value, x_power, group_prime) % group_prime
+                x_power = x_power * participant_id % field_prime
+            verification_shares[member_index] = (
+                verification_shares[member_index] * evaluation % group_prime
+            )
+
+    # Every packet shares the zero secret, so the product of the Feldman
+    # constant-term commitments is 1 and the public key is unchanged.
+    return (
+        Share(x=receiver_id, y=y),
+        Share(x=receiver_id, y=y_blinding),
+        PedersenCommitment(
+            values=tuple(new_values),
+            field_prime=field_prime,
+            group_prime=group_prime,
+            generator=commitment.generator,
+            blinding_generator=commitment.blinding_generator,
+        ),
+        SigningPublicContext(
+            participant_ids=participant_ids,
+            threshold=threshold,
+            field_prime=field_prime,
+            group_prime=group_prime,
+            generator=commitment.generator,
+            public_key=context.public_key,
+            verification_shares=tuple(verification_shares),
+        ),
     )
 
 
