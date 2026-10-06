@@ -387,6 +387,48 @@ else:
 `DKGRejection`。支持 `threshold = 1`。库不保存任何隐藏状态，旧份额的销毁与替换由
 调用方负责。
 
+#### 接收方本地刷新
+
+完整 `refresh` 仍需 `SigningDKGResult` 与全体贡献；与本地 DKG 聚合一样，接收方
+其实只凭自己的旧材料和发给自己的刷新包即可完成刷新。
+`refresh_local(receiver_id, share, blinding_share, commitment, context, packets)`
+的前四项是本人的旧秘密份额 `Share`、旧盲化份额、旧聚合 Pedersen 承诺与可信的
+`SigningPublicContext`，`packets` 为每名旧成员各一个的 `LocalDKGPacket` 可迭代
+对象——与 `aggregate_local_dkg` 相同，可从各 `create_refresh` 贡献中按接收者位置
+提取，不含任何其他成员的秘密：
+
+```python
+from thresholdsign import export_signing_public_context, refresh_local
+
+# 2 号持有自己的旧双份额、旧聚合 Pedersen 承诺与可信公开上下文，
+# packets 是从各成员 create_refresh 贡献中提取的、发给 2 号的本地包
+outcome = refresh_local(
+    2, old_share, old_blinding_share, old_commitment, old_context, packets
+)
+if isinstance(outcome, list):
+    ...                    # list[DKGRejection]，按 sender_id 定位失败成员
+new_share, new_blinding_share, new_commitment, new_context = outcome
+```
+
+成功返回依次为新秘密份额、新盲化份额、新聚合 Pedersen 承诺与新公开上下文的四元组：
+两个新份额坐标仍为本人编号，值为旧值与各包刷新份额的域内和；新承诺为旧承诺与各包
+承诺逐项的群内乘积，盲化生成元保持不变；新上下文保留成员、门限、群参数与联合公钥，
+各验证份额等于旧验证份额乘以各包 Feldman 承诺在该成员编号处的求值。对同一批有效
+贡献，四元组中本人份额、聚合承诺与上下文分别与完整 `refresh` 输出的对应项按值一致；
+输出可直接再做一次本地刷新，新份额配合 `sign_round_packet` 完成签名，公钥不变故旧
+签名依旧可验证。
+
+入口先校验全部输入结构，沿用 `SigningPublicContext`、Pedersen 承诺与本地包的现有
+合法值约束：对象或字段类型错误（布尔不视为整数）抛 `TypeError`；空批次、非法值、
+本人不在上下文成员中、旧份额或包内份额坐标不等于本人、发送者缺失或重复、成员集合/
+门限/群参数（含盲化生成元）不一致均抛 `ValueError`。结构合法后再核验本人旧材料：
+旧双份额不满足旧承诺、旧秘密份额不对应上下文中本人的验证份额均抛 `ValueError`；
+随后检查全部刷新包，双份额不匹配 Pedersen 承诺、秘密份额不匹配 Feldman 承诺或
+Feldman 常数项承诺不为 1 时，返回按发送者升序去重的 `DKGRejection` 列表，列全失败
+发送者且不返回部分结果。成功仅证明本人的刷新材料有效，不声称其他成员收到的材料有效。
+包顺序不影响结果，支持单次迭代器、门限为一、零份额与单位元承诺；入口不修改输入、
+不保存状态，贡献生成与传输仍沿用 `create_refresh` 贡献的现有边界。
+
 ### 成员重共享
 
 刷新只能原班人马、原 threshold；要**更换成员集合或 threshold**（如 2-of-3 改为
@@ -1706,6 +1748,25 @@ python3 -m thresholdsign
   列表（列全失败发送者，不返回部分聚合结果）；成功只证明本人份额通过检查。
   输入顺序不影响结果，支持单次迭代器、门限为一、零份额与单位元承诺值；不修改
   输入、不保存状态
+- `refresh_local(receiver_id, share, blinding_share, commitment, context, packets)`
+  — 接收方本地主动刷新：仅凭本人的旧双份额（两个 `Share`）、旧聚合 Pedersen
+  承诺、可信 `SigningPublicContext` 与每名旧成员各一个的 `LocalDKGPacket`（可从
+  `create_refresh` 贡献中按接收者位置提取）完成刷新，无需其他成员的秘密。成功
+  返回 `(new_share, new_blinding_share, new_commitment, new_context)`：双份额坐标
+  保持为本人编号，值为旧值加各包刷新份额的域内和；新承诺为旧承诺与各包承诺逐项
+  的群内乘积（盲化生成元不变）；新上下文保留成员、门限、群参数与联合公钥，各验证
+  份额等于旧验证份额乘以各包 Feldman 承诺在对应成员编号处的求值。对同一批有效
+  贡献，本人份额、聚合承诺与上下文与完整 `refresh` 的对应输出按值一致，输出可继续
+  本地刷新并配合 `sign_round_packet` 签名，公钥不变故旧签名仍可验证。先校验全部
+  输入结构，沿用公开上下文、承诺与本地包的合法值约束：对象或字段类型错误（布尔不
+  视为整数）抛 `TypeError`；空批次、非法值、本人不在成员中、旧份额或包坐标不等于
+  本人、发送者缺失或重复、成员/门限/群参数（含盲化生成元）不一致抛 `ValueError`。
+  结构合法后，旧双份额未通过旧承诺验证或旧秘密份额不对应上下文中本人验证份额均抛
+  `ValueError`；随后检查全部刷新包，双份额不匹配 Pedersen 承诺、秘密份额不匹配
+  Feldman 承诺或 Feldman 常数项承诺不为 1 时，返回按发送者升序去重的
+  `DKGRejection` 列表（列全失败发送者，不返回部分结果）。成功仅证明本人的刷新材料
+  有效；包顺序不影响结果，支持单次迭代器、门限为一、零份额与单位元承诺；不修改
+  输入、不保存状态，贡献生成与传输仍沿用 `create_refresh` 的现有边界
 - `SignatureReceipt(message, signature, public_key, field_prime, group_prime, generator)`
   — 冻结数据类，可按位置构造、按值相等；可独立流转的门限 Schnorr 签名凭证：
   `message` 为被签名字节串，`signature` 是 `AggregateSignature(R, z, signer_ids)`，
