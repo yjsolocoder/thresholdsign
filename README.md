@@ -1665,6 +1665,26 @@ python3 -m thresholdsign
   合法的单位元公钥与验证份额不被额外排除。结论不证明上下文来源可信，也不
   指向任何成员；支持非连续编号、门限等于成员数、门限为一与单成员上下文；
   不修改输入、不保存状态、不产生文件，重复核验同一对象结果相同
+- `encode_signing_public_context(context)` / `decode_signing_public_context(payload)`
+  — 公开签名上下文的唯一规范编码，用于在尚未创建签名轮次时交换公开密钥
+  材料：标签 `b"thresholdsign/signing-public-context/v1"` 后紧接公开轮次包
+  格式中完整的上下文部分（4 字节参与者计数与各编号、`threshold`、
+  `field_prime`、`group_prime`、`generator`、`public_key`、4 字节验证份额
+  计数与各份额），到验证份额序列结束，不附带轮次部分；整数编码规则与签名
+  凭证相同，成员顺序与验证份额位置按给定值写入，不排序、补全或归一化。
+  完整 DKG、接收方本地聚合、刷新或重共享得到的上下文以及直接构造的同值
+  对象编码相同；输出不含秘密份额、盲化份额、nonce 或轮次消息，不创建文件
+  或保存状态。encode 对非 `SigningPublicContext` 或字段类型错误（布尔不
+  视为整数）抛 `TypeError`，对空成员、编号重复/乱序/越界、门限非法、验证
+  份额数量不符、非法群参数、公钥或验证份额越界或不在规定子群抛
+  `ValueError`；decode 对非 bytes 抛 `TypeError`，坏标签、截断、尾随字节、
+  非最短整数、计数与内容不符、长度或计数超出格式范围及上述结构非法抛
+  `ValueError`。编解码只检查结构：结构合法但公钥与验证份额不满足门限多项式
+  关系的上下文仍可往返，由 `verify_signing_public_context` 返回 `False`；
+  成功解码不认证来源，且重编码逐字节复现输入。解码对象可直接用于
+  `verify_signing_public_context`、`create_signing_round`、
+  `verify_signature_share` 与 `aggregate_signature`，结果与原对象一致；
+  保留单成员、门限为一及公钥或验证份额为单位元的合法情形
 - `SigningRoundPacket(context, round_info)` — 冻结数据类，可按位置构造、按值
   相等；可独立流转的公开轮次包：`context` 是 `SigningPublicContext`（参与者
   编号、门限、群参数、联合公钥、每人一个验证份额），`round_info` 是

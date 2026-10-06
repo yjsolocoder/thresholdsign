@@ -30,7 +30,10 @@ coordinator-side SigningPublicContext / export_signing_public_context that
 runs round creation, share verification and aggregation from public
 material alone, plus the optional verify_signing_public_context check that
 confirms the joint key and every verification share lie on one
-degree-below-threshold polynomial, the receiver-side LocalDKGPacket / aggregate_local_dkg
+degree-below-threshold polynomial, and the canonical transport encoding
+encode_signing_public_context / decode_signing_public_context that carries
+the public context alone as one self-delimiting byte string, the
+receiver-side LocalDKGPacket / aggregate_local_dkg
 that lets each DKG participant aggregate only the double shares addressed
 to them, together with the senders' public commitments, into their own
 signing share, blinding share and the same public signing context, and
@@ -286,6 +289,8 @@ __all__ = [
     "SigningPublicContext",
     "export_signing_public_context",
     "verify_signing_public_context",
+    "encode_signing_public_context",
+    "decode_signing_public_context",
     "LocalDKGPacket",
     "aggregate_local_dkg",
     "encode_local_dkg_packet",
@@ -3814,6 +3819,152 @@ def verify_signing_public_context(context: SigningPublicContext) -> bool:
         if expected != value:
             return False
     return True
+
+
+SIGNING_PUBLIC_CONTEXT_TAG = b"thresholdsign/signing-public-context/v1"
+
+
+def encode_signing_public_context(context: SigningPublicContext) -> bytes:
+    """Canonically encode a public signing context for transport or persistence.
+
+    The encoding starts with the tag
+    ``b"thresholdsign/signing-public-context/v1"`` and then writes exactly
+    the context section of the :func:`encode_round_packet` format, with no
+    round part: a 4-byte unsigned big-endian participant count and one
+    entry per participant id, then ``threshold``, ``field_prime``,
+    ``group_prime``, ``generator`` and ``public_key``, then a 4-byte count
+    and one entry per verification share. Every integer is a 4-byte
+    unsigned big-endian length followed by its shortest unsigned big-endian
+    value: zero is the single body byte ``00`` and positive values carry no
+    leading zero. Member order, verification-share positions and integer
+    encodings are taken exactly as given — the input is never sorted,
+    completed or normalised — so the output for a given context is unique
+    and a decoded context re-encodes to exactly the same bytes. The output
+    contains no secret share, blinding share, nonce, round message or
+    hidden state, and encoding creates no files and keeps no state.
+
+    Only a structurally valid :class:`SigningPublicContext` is accepted: a
+    non-:class:`SigningPublicContext` argument or wrong field types
+    (``bool`` is not an integer, tuples stay tuples) raise TypeError, and
+    an empty, duplicated, out-of-order or out-of-range id tuple, an illegal
+    threshold, a verification-share count mismatch, illegal group
+    parameters, or a public key / verification share outside the
+    order-``field_prime`` subgroup raise ValueError. The check is
+    structural only: a context whose public key and verification shares do
+    not satisfy the threshold-polynomial relation still encodes, and
+    :func:`verify_signing_public_context` remains the way to test that
+    relation.
+    """
+    if not isinstance(context, SigningPublicContext):
+        raise TypeError("context must be a SigningPublicContext instance")
+    _check_signing_public_context(context)
+    if len(context.participant_ids) > 0xFFFFFFFF:
+        raise ValueError("too many participant ids")
+    if len(context.verification_shares) > 0xFFFFFFFF:
+        raise ValueError("too many verification shares")
+
+    buffer = bytearray(SIGNING_PUBLIC_CONTEXT_TAG)
+    buffer += len(context.participant_ids).to_bytes(4, "big", signed=False)
+    for participant_id in context.participant_ids:
+        buffer += _encode_varint(participant_id)
+    for value in (
+        context.threshold,
+        context.field_prime,
+        context.group_prime,
+        context.generator,
+        context.public_key,
+    ):
+        buffer += _encode_varint(value)
+    buffer += len(context.verification_shares).to_bytes(4, "big", signed=False)
+    for verification_share in context.verification_shares:
+        buffer += _encode_varint(verification_share)
+    return bytes(buffer)
+
+
+def decode_signing_public_context(payload: bytes) -> SigningPublicContext:
+    """Decode the canonical encoding produced by :func:`encode_signing_public_context`.
+
+    Accepts only the single canonical form: the tag
+    ``b"thresholdsign/signing-public-context/v1"`` followed by the counted
+    participant ids, the five context integers and the counted verification
+    shares — exactly the context section of the
+    :func:`decode_round_packet` format, with nothing after it. A non-bytes
+    argument raises TypeError; a wrong or missing tag, truncation, trailing
+    bytes, a non-canonical integer (leading zero or over-long length), a
+    count or length that does not match the stream or exceeds the 4-byte
+    format range, an empty, duplicated, out-of-order or out-of-range id
+    tuple, an illegal threshold, a verification-share count mismatch,
+    illegal group parameters, or a public key / verification share outside
+    the order-``field_prime`` subgroup raises ValueError. A successfully
+    decoded context re-encodes to exactly the input bytes.
+
+    Decoding validates structure only, never the cryptography and never the
+    origin: a structurally legal context whose public key and verification
+    shares do not lie on one degree-below-threshold polynomial is returned
+    normally, and :func:`verify_signing_public_context` reports it as
+    ``False``. The returned object is a plain :class:`SigningPublicContext`
+    that compares equal to an equal-valued original and can be used
+    directly with :func:`verify_signing_public_context`,
+    :func:`create_signing_round`, :func:`verify_signature_share` and
+    :func:`aggregate_signature` with identical results.
+    """
+    if not isinstance(payload, bytes):
+        raise TypeError("payload must be bytes")
+    if not payload.startswith(SIGNING_PUBLIC_CONTEXT_TAG):
+        raise ValueError("bad signing public context tag")
+    offset = len(SIGNING_PUBLIC_CONTEXT_TAG)
+
+    def read_count(what: str) -> int:
+        nonlocal offset
+        if offset + 4 > len(payload):
+            raise ValueError(f"truncated signing public context {what} count")
+        count = int.from_bytes(payload[offset:offset + 4], "big")
+        offset += 4
+        return count
+
+    participant_ids = []
+    for _ in range(read_count("participant")):
+        participant_id, offset = _read_varint(
+            payload, offset, what="signing public context participant id"
+        )
+        participant_ids.append(participant_id)
+    threshold, offset = _read_varint(
+        payload, offset, what="signing public context threshold"
+    )
+    field_prime, offset = _read_varint(
+        payload, offset, what="signing public context field prime"
+    )
+    group_prime, offset = _read_varint(
+        payload, offset, what="signing public context group prime"
+    )
+    generator, offset = _read_varint(
+        payload, offset, what="signing public context generator"
+    )
+    public_key, offset = _read_varint(
+        payload, offset, what="signing public context public key"
+    )
+    verification_shares = []
+    for _ in range(read_count("verification share")):
+        verification_share, offset = _read_varint(
+            payload, offset, what="signing public context verification share"
+        )
+        verification_shares.append(verification_share)
+    if offset != len(payload):
+        raise ValueError("trailing bytes after signing public context")
+
+    context = SigningPublicContext(
+        participant_ids=tuple(participant_ids),
+        threshold=threshold,
+        field_prime=field_prime,
+        group_prime=group_prime,
+        generator=generator,
+        public_key=public_key,
+        verification_shares=tuple(verification_shares),
+    )
+    _check_signing_public_context(context)
+    if encode_signing_public_context(context) != payload:
+        raise ValueError("non-canonical signing public context encoding")
+    return context
 
 
 def _signing_key_parts(
