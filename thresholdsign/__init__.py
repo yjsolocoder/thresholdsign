@@ -280,6 +280,8 @@ __all__ = [
     "export_signing_public_context",
     "LocalDKGPacket",
     "aggregate_local_dkg",
+    "encode_local_dkg_packet",
+    "decode_local_dkg_packet",
     "refresh_local",
     "reshare_local",
     "ContributionFault",
@@ -4066,6 +4068,187 @@ def aggregate_local_dkg(
         Share(x=receiver_id, y=y_blinding),
         context,
     )
+
+
+LOCAL_DKG_PACKET_TAG = b"thresholdsign/local-dkg-packet/v1"
+
+
+def _check_local_dkg_packet_for_codec(packet: LocalDKGPacket) -> None:
+    """Full type/structure validation of an encodable LocalDKGPacket.
+
+    The packet is self-addressed: its own ``received.receiver_id`` is the
+    aggregating participant the structure rules are checked against, and
+    that receiver must be one of the participant ids just like the sender.
+    """
+    _check_local_dkg_packet_types(packet)
+    _check_local_dkg_packet_structure(packet, packet.received.receiver_id)
+    if packet.received.receiver_id not in packet.participant_ids:
+        raise ValueError("receiver_id must be one of the participant ids")
+
+
+def encode_local_dkg_packet(packet: LocalDKGPacket) -> bytes:
+    """Canonically encode one receiver's local DKG packet for confidential transport.
+
+    The encoding starts with the tag
+    ``b"thresholdsign/local-dkg-packet/v1"`` and then writes, in order, the
+    4-byte unsigned big-endian participant count followed by one canonical
+    VARINT per strictly increasing participant id, ``sender_id`` and
+    ``receiver_id`` as VARINTs, the secret share as ``VARINT(x) ||
+    VARINT(y)``, the blinding share the same way, the Pedersen commitment
+    (the 4-byte value count, one VARINT per value in the original order,
+    then ``field_prime``, ``group_prime``, ``generator`` and
+    ``blinding_generator``) and finally the Feldman commitment (the same
+    layout without ``blinding_generator``). A VARINT is a 4-byte unsigned
+    big-endian body length followed by the shortest unsigned big-endian
+    value: zero is the single byte ``00`` and positive values carry no
+    leading zero. The packet carries only this receiver's double share and
+    the sender's public commitments — no full contribution and no other
+    receiver's share.
+
+    Only a structurally valid :class:`LocalDKGPacket` is accepted: a
+    non-packet argument or a wrong field type raises TypeError (a boolean
+    is never an integer), and an empty, non-increasing or out-of-range
+    participant set, a sender or receiver outside the participant set, a
+    share coordinate that does not equal the receiver, an out-of-range
+    share value, a threshold outside ``1 .. participant count``, the two
+    commitments disagreeing on the group parameters, or an illegal group
+    parameter or commitment value raises ValueError. A count or integer
+    body that does not fit the 4-byte length field also raises ValueError.
+    A well-formed packet whose double share does not match its commitments
+    still encodes — that is a cryptographic verdict for
+    :func:`aggregate_local_dkg`, not a structural one. Equal packets encode
+    to equal bytes and the output for a given packet is unique. The
+    encoding contains the double share in the clear: it is meant for a
+    confidential authenticated channel only, is not encrypted or
+    authenticated, must not be written to disk, and the library keeps no
+    state for it.
+    """
+    if not isinstance(packet, LocalDKGPacket):
+        raise TypeError("packet must be a LocalDKGPacket instance")
+    _check_local_dkg_packet_for_codec(packet)
+
+    participant_ids = packet.participant_ids
+    if len(participant_ids) > 0xFFFFFFFF:
+        raise ValueError("too many participant ids")
+    received = packet.received
+    commitment = packet.commitment
+    feldman = packet.feldman_commitment
+    buffer = bytearray(LOCAL_DKG_PACKET_TAG)
+    buffer += len(participant_ids).to_bytes(4, "big", signed=False)
+    for participant_id in participant_ids:
+        buffer += _encode_varint(participant_id)
+    buffer += _encode_varint(received.sender_id)
+    buffer += _encode_varint(received.receiver_id)
+    buffer += _encode_varint(received.share.x)
+    buffer += _encode_varint(received.share.y)
+    buffer += _encode_varint(received.blinding_share.x)
+    buffer += _encode_varint(received.blinding_share.y)
+    buffer += _encode_commitment_fields(
+        commitment.values,
+        commitment.field_prime,
+        commitment.group_prime,
+        commitment.generator,
+        commitment.blinding_generator,
+    )
+    buffer += _encode_commitment_fields(
+        feldman.values,
+        feldman.field_prime,
+        feldman.group_prime,
+        feldman.generator,
+    )
+    return bytes(buffer)
+
+
+def decode_local_dkg_packet(payload: bytes) -> LocalDKGPacket:
+    """Decode the canonical encoding produced by :func:`encode_local_dkg_packet`.
+
+    Accepts only the single canonical form tagged
+    ``b"thresholdsign/local-dkg-packet/v1"``. A non-bytes argument raises
+    TypeError; a wrong or missing tag, truncation, trailing bytes, a count
+    or VARINT frame length that does not match the stream, a non-canonical
+    integer (a zero-length or over-long body, or a leading zero), a zero,
+    non-increasing or duplicate participant id, or any of the structural
+    violations rejected on encode (a sender or receiver outside the
+    participant set, a share coordinate that does not equal the receiver,
+    an out-of-range share value, a threshold outside ``1 .. participant
+    count``, disagreeing or illegal commitment setups) raises ValueError.
+    A successfully decoded packet is equal by value to the encoded one and
+    re-encodes to exactly the input bytes, so it drops straight into
+    :func:`aggregate_local_dkg`, :func:`refresh_local` and
+    :func:`reshare_local`, which then produce the same success result or
+    rejection list as for the original batch.
+
+    Decoding does not check the cryptographic relation between the double
+    share and the commitments: a packet whose shares do not verify is
+    returned normally and the aggregation entry points keep producing
+    their usual :class:`DKGRejection` list for it.
+    """
+    if not isinstance(payload, bytes):
+        raise TypeError("payload must be bytes")
+    if not payload.startswith(LOCAL_DKG_PACKET_TAG):
+        raise ValueError("bad local DKG packet tag")
+    offset = len(LOCAL_DKG_PACKET_TAG)
+
+    participant_ids, offset = _read_codec_id_list(
+        payload, offset, what="local DKG packet participant id"
+    )
+    sender_id, offset = _read_varint(payload, offset, what="local DKG packet sender id")
+    receiver_id, offset = _read_varint(
+        payload, offset, what="local DKG packet receiver id"
+    )
+    share, offset = _read_codec_share(payload, offset, what="local DKG packet share")
+    blinding_share, offset = _read_codec_share(
+        payload, offset, what="local DKG packet blinding share"
+    )
+    (
+        values,
+        field_prime,
+        group_prime,
+        generator,
+        blinding_generator,
+        offset,
+    ) = _read_codec_commitment_fields(
+        payload, offset, what="local DKG packet Pedersen commitment", pedersen=True
+    )
+    (
+        feldman_values,
+        feldman_field_prime,
+        feldman_group_prime,
+        feldman_generator,
+        _unused,
+        offset,
+    ) = _read_codec_commitment_fields(
+        payload, offset, what="local DKG packet Feldman commitment", pedersen=False
+    )
+    if offset != len(payload):
+        raise ValueError("trailing bytes after local DKG packet")
+
+    packet = LocalDKGPacket(
+        participant_ids=participant_ids,
+        received=DKGReceivedShare(
+            sender_id=sender_id,
+            receiver_id=receiver_id,
+            share=share,
+            blinding_share=blinding_share,
+        ),
+        commitment=PedersenCommitment(
+            values=values,
+            field_prime=field_prime,
+            group_prime=group_prime,
+            generator=generator,
+            blinding_generator=blinding_generator,
+        ),
+        feldman_commitment=FeldmanCommitment(
+            values=feldman_values,
+            field_prime=feldman_field_prime,
+            group_prime=feldman_group_prime,
+            generator=feldman_generator,
+        ),
+    )
+    _check_local_dkg_packet_for_codec(packet)
+    if encode_local_dkg_packet(packet) != payload:
+        raise ValueError("non-canonical local DKG packet encoding")
+    return packet
 
 
 def refresh_local(

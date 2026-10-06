@@ -1706,6 +1706,25 @@ python3 -m thresholdsign
   列表（列全失败发送者，不返回部分聚合结果）；成功只证明本人份额通过检查。
   输入顺序不影响结果，支持单次迭代器、门限为一、零份额与单位元承诺值；不修改
   输入、不保存状态
+- `encode_local_dkg_packet(packet)` / `decode_local_dkg_packet(payload)` —
+  `LocalDKGPacket` 的唯一字节编码，只承载指定接收者的双份额与发送者公开承诺，
+  不含完整贡献或其他接收者的份额：标签 `thresholdsign/local-dkg-packet/v1` 后
+  依次写参与者计数与严格递增无重复的参与者编号、`sender_id`、`receiver_id`、
+  秘密份额 `(x, y)`、盲化份额 `(x, y)`、Pedersen 承诺（值计数、按原顺序的各值、
+  `field_prime`、`group_prime`、`generator`、`blinding_generator`）与 Feldman
+  承诺（值计数、各值、`field_prime`、`group_prime`、`generator`）。计数为 4 字节
+  无符号大端，整数为 4 字节长度加最短无符号大端正文（零为单字节 `00`，正数无
+  前导零）。encode 对非 `LocalDKGPacket` 或字段类型错误（布尔不视为整数）抛
+  `TypeError`，空/非严格递增成员集、编号越界、收发双方不在成员中、份额坐标不
+  等于接收者、份额值越界、门限越出 `1..参与人数`、两类承诺门限或群参数不一致、
+  非法群参数或承诺值、计数或整数正文超出 4 字节长度均抛 `ValueError`；decode 对
+  非 bytes 抛 `TypeError`，坏标签、截断、尾随字节、非规范整数、非法长度或数量
+  及恢复对象的上述结构错误统一抛 `ValueError`。相等对象编码相同，成功解码的包
+  重编码逐字节等于输入，可直接进入 `aggregate_local_dkg` / `refresh_local` /
+  `reshare_local`，同批包往返前后成功结果或拒绝列表一致。解码不验证双份额与
+  承诺的密码学关系——结构合法但密码学不匹配的包正常往返，由聚合入口沿用既有
+  判定；门限为一、零份额与单位元承诺值保持合法。编码以明文承载双份额，只用于
+  保密认证通道，不加密、不认证、不落盘、不保存状态
 - `SignatureReceipt(message, signature, public_key, field_prime, group_prime, generator)`
   — 冻结数据类，可按位置构造、按值相等；可独立流转的门限 Schnorr 签名凭证：
   `message` 为被签名字节串，`signature` 是 `AggregateSignature(R, z, signer_ids)`，
