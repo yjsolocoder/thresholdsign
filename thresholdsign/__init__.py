@@ -28,7 +28,9 @@ create_signing_nonce_commitment / create_signing_round / create_signature_share
 / verify_signature_share / aggregate_signature / verify_signature, the
 coordinator-side SigningPublicContext / export_signing_public_context that
 runs round creation, share verification and aggregation from public
-material alone, the receiver-side LocalDKGPacket / aggregate_local_dkg
+material alone, together with the optional verify_signing_public_context
+that checks whether the verification shares and joint public key of such
+a context are consistent with its declared threshold, the receiver-side LocalDKGPacket / aggregate_local_dkg
 that lets each DKG participant aggregate only the double shares addressed
 to them, together with the senders' public commitments, into their own
 signing share, blinding share and the same public signing context, and
@@ -278,6 +280,7 @@ __all__ = [
     "aggregate_signing_dkg",
     "SigningPublicContext",
     "export_signing_public_context",
+    "verify_signing_public_context",
     "LocalDKGPacket",
     "aggregate_local_dkg",
     "encode_local_dkg_packet",
@@ -3739,6 +3742,80 @@ def export_signing_public_context(key: SigningDKGResult) -> SigningPublicContext
         public_key=key.public_key,
         verification_shares=key.verification_shares,
     )
+
+
+def verify_signing_public_context(context: SigningPublicContext) -> bool:
+    """Check public-key consistency of a :class:`SigningPublicContext`.
+
+    Returns True exactly when, over the finite field modulo
+    ``field_prime``, there exists a polynomial ``f`` of degree strictly
+    less than ``threshold`` such that every participant id ``x`` satisfies
+    ``verification_shares[x] == generator ** f(x) mod group_prime`` and
+    ``public_key == generator ** f(0) mod group_prime``. The check uses
+    only the context's public fields — no DKG result, secret share,
+    blinding share or signing round is needed — and it covers every
+    participant's verification share, never just a threshold-sized
+    subset: a context whose shares are mutually consistent but disagree
+    with the joint public key, or where only some shares match the key,
+    returns False. A polynomial of degree lower than ``threshold - 1``
+    still passes, and the group identity remains a legal public key or
+    verification share. The verdict says nothing about whether the
+    context's origin is trustworthy, and a False result is not attributed
+    to any particular participant.
+
+    The context is validated with the same structural checks as the
+    signing entry points before any consistency judgement: a
+    non-:class:`SigningPublicContext` argument or a wrong field type
+    raises TypeError, and an illegal field value raises ValueError —
+    invalid input is never masked as a False result. The function is
+    pure: it does not modify the context, keeps no state and produces no
+    files, so repeated calls on the same object return the same result.
+    """
+    if not isinstance(context, SigningPublicContext):
+        raise TypeError("context must be a SigningPublicContext instance")
+    _check_signing_public_context(context)
+
+    ids = context.participant_ids
+    shares = context.verification_shares
+    threshold = context.threshold
+    field_prime = context.field_prime
+    group_prime = context.group_prime
+    # Any ``threshold`` shares determine the unique candidate polynomial of
+    # degree < threshold; interpolate in the exponent from the first
+    # ``threshold`` participants and check every share and the joint key
+    # against it. Denominators depend only on the basis ids, so compute
+    # their inverses once.
+    basis_ids = ids[:threshold]
+    basis_shares = shares[:threshold]
+    inverses = []
+    for index, participant_id in enumerate(basis_ids):
+        denominator = 1
+        for other_index, other_id in enumerate(basis_ids):
+            if other_index != index:
+                denominator = (
+                    denominator * ((participant_id - other_id) % field_prime)
+                ) % field_prime
+        inverses.append(pow(denominator, -1, field_prime))
+
+    def evaluate_at(point: int) -> int:
+        value = 1
+        for index, participant_id in enumerate(basis_ids):
+            numerator = 1
+            for other_index, other_id in enumerate(basis_ids):
+                if other_index != index:
+                    numerator = (
+                        numerator * ((point - other_id) % field_prime)
+                    ) % field_prime
+            weight = numerator * inverses[index] % field_prime
+            value = value * pow(basis_shares[index], weight, group_prime) % group_prime
+        return value
+
+    if evaluate_at(0) != context.public_key:
+        return False
+    for participant_id, share in zip(ids, shares):
+        if evaluate_at(participant_id) != share:
+            return False
+    return True
 
 
 def _signing_key_parts(
