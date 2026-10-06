@@ -28,7 +28,9 @@ create_signing_nonce_commitment / create_signing_round / create_signature_share
 / verify_signature_share / aggregate_signature / verify_signature, the
 coordinator-side SigningPublicContext / export_signing_public_context that
 runs round creation, share verification and aggregation from public
-material alone, the receiver-side LocalDKGPacket / aggregate_local_dkg
+material alone, plus the optional verify_signing_public_context check that
+confirms the joint key and every verification share lie on one
+degree-below-threshold polynomial, the receiver-side LocalDKGPacket / aggregate_local_dkg
 that lets each DKG participant aggregate only the double shares addressed
 to them, together with the senders' public commitments, into their own
 signing share, blinding share and the same public signing context, and
@@ -278,6 +280,7 @@ __all__ = [
     "aggregate_signing_dkg",
     "SigningPublicContext",
     "export_signing_public_context",
+    "verify_signing_public_context",
     "LocalDKGPacket",
     "aggregate_local_dkg",
     "encode_local_dkg_packet",
@@ -3739,6 +3742,72 @@ def export_signing_public_context(key: SigningDKGResult) -> SigningPublicContext
         public_key=key.public_key,
         verification_shares=key.verification_shares,
     )
+
+
+def _lagrange_weight_at(x: int, index: int, xs: Sequence[int], prime: int) -> int:
+    """Lagrange coefficient of basis point ``index`` evaluated at ``x`` mod ``prime``."""
+    numerator = 1
+    denominator = 1
+    for position, other in enumerate(xs):
+        if position == index:
+            continue
+        numerator = numerator * (x - other) % prime
+        denominator = denominator * (xs[index] - other) % prime
+    return numerator * pow(denominator, -1, prime) % prime
+
+
+def verify_signing_public_context(context: SigningPublicContext) -> bool:
+    """Check whether a public context's key material is threshold-consistent.
+
+    Returns ``True`` exactly when there exists a polynomial ``f`` over
+    ``GF(context.field_prime)`` of degree strictly below
+    ``context.threshold`` such that
+    ``verification_shares[i] == generator ** f(participant_ids[i]) mod
+    group_prime`` for every participant and
+    ``public_key == generator ** f(0) mod group_prime``. The check
+    interpolates in the exponent across the joint key (the share at
+    ``x = 0``) and every verification share at once — never across a subset
+    of signers — so a context whose shares are mutually consistent but
+    disagree with the joint key, or where only some shares fit the key,
+    returns ``False``. A polynomial of actual degree below the declared
+    threshold still passes, and the group identity remains a legal public
+    key or verification share. The verdict is purely mathematical: it says
+    nothing about the context's origin and does not single out any
+    participant as faulty.
+
+    The full structural validation of :func:`_check_signing_public_context`
+    runs first: a non-:class:`SigningPublicContext` argument or wrong field
+    types (a boolean is never an integer, tuples stay tuples) raise
+    ``TypeError``, and empty/duplicate/out-of-range ids, an out-of-range
+    threshold, a verification-share count mismatch, illegal group
+    parameters, or a public key / verification share outside the
+    order-``field_prime`` subgroup raise ``ValueError`` — illegal input is
+    never masked by a plain ``False``. The function is pure: it does not
+    mutate the context, keeps no state and produces no files, so repeated
+    calls on the same object agree.
+    """
+    if not isinstance(context, SigningPublicContext):
+        raise TypeError("context must be a SigningPublicContext instance")
+    _check_signing_public_context(context)
+    prime = context.field_prime
+    modulus = context.group_prime
+    # The joint key is the share at x = 0; each verification share sits at
+    # its participant id. Because the generator has order exactly
+    # field_prime and every value was checked into that subgroup, the
+    # points lie on one degree-below-threshold polynomial over
+    # GF(field_prime) exactly when their group elements interpolate.
+    points = [(0, context.public_key)]
+    points.extend(zip(context.participant_ids, context.verification_shares))
+    basis = points[: context.threshold]
+    basis_x = [x for x, _ in basis]
+    for x, value in points[context.threshold:]:
+        expected = 1
+        for index in range(context.threshold):
+            weight = _lagrange_weight_at(x, index, basis_x, prime)
+            expected = expected * pow(basis[index][1], weight, modulus) % modulus
+        if expected != value:
+            return False
+    return True
 
 
 def _signing_key_parts(

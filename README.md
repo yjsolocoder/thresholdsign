@@ -1650,6 +1650,21 @@ python3 -m thresholdsign
   — 用 `signature.signer_ids` 重建挑战并校验 `g^z = R·Y^c`；合法签名返回 `True`，
   签名被篡改或与消息/公钥/签名者集合不匹配返回 `False`，非法参数抛
   `TypeError`/`ValueError`
+- `verify_signing_public_context(context) -> bool` — 独立的公开上下文一致性
+  核验，只读取 `SigningPublicContext` 的公开字段，不需要 DKG 结果、秘密份额、
+  盲化份额或签名轮次。先完整执行与签名入口相同的结构校验（非上下文对象、
+  字段类型错误、布尔冒充整数、元组字段传入列表抛 `TypeError`；空成员、编号
+  重复/非递增/越界、门限越界、验证份额数量不符、非法群参数、公钥或验证份额
+  越界或不属于指定子群抛 `ValueError`，绝不以 `False` 掩盖非法输入），再判断
+  公开密钥材料是否共同符合声明门限：返回 `True` 当且仅当在 `field_prime` 上
+  存在次数严格小于 `threshold` 的多项式 `f`，使每个成员编号 `x` 的验证份额
+  等于 `generator ** f(x) mod group_prime` 且 `public_key` 等于
+  `generator ** f(0) mod group_prime`。判断在联合公钥与全体成员份额上一次性
+  做指数插值，不取任何签名子集，因此份额彼此一致却与联合公钥不符、或只有
+  部分份额符合该公钥时返回 `False`；实际次数低于声明门限仍返回 `True`，
+  合法的单位元公钥与验证份额不被额外排除。结论不证明上下文来源可信，也不
+  指向任何成员；支持非连续编号、门限等于成员数、门限为一与单成员上下文；
+  不修改输入、不保存状态、不产生文件，重复核验同一对象结果相同
 - `SigningRoundPacket(context, round_info)` — 冻结数据类，可按位置构造、按值
   相等；可独立流转的公开轮次包：`context` 是 `SigningPublicContext`（参与者
   编号、门限、群参数、联合公钥、每人一个验证份额），`round_info` 是
