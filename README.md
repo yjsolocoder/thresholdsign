@@ -1701,6 +1701,26 @@ python3 -m thresholdsign
   结构错误沿用轮次包约束抛 `ValueError`。结果与 `create_signature_share` 对同一
   密钥、轮次、秘密份额和 nonce 的产出按值相等，可直接进入现有份额验证与聚合；
   不修改输入、不保存秘密或 nonce，重复调用结果确定，nonce 防复用由调用方负责
+- `SigningSession(signer_id, context, message, *, randbelow=secrets.randbelow)` —
+  单个签名者的一次性有状态签名会话：创建时绑定本人编号、可信
+  `SigningPublicContext` 与预期消息字节，并按 `create_signing_nonce_commitment`
+  的非零语义私下抽取 nonce（拒绝零抽取）。创建即校验上下文结构、公开份额与
+  联合公钥的一致性（`verify_signing_public_context`）及本人成员资格：类型错误
+  （布尔不视为整数）抛 `TypeError`，非法值、非成员或不一致上下文抛
+  `ValueError`。会话只公开只读属性 `commitment`（可直接交给
+  `create_signing_round` 的 `SigningNonceCommitment`）与 `state`（初值
+  `"ready"`，终止后为 `"used"` 或 `"cancelled"`），不公开 nonce；两属性赋值抛
+  `AttributeError`，浅复制、深复制与 pickle 均抛 `TypeError`。
+  `sign(secret_share, packet)` 按 `sign_round_packet` 的全部规则核验上下文字段、
+  预期消息、签名集合、承诺乘积、挑战与本人份额，并要求包中本人轮次承诺等于会话
+  承诺，成功返回与之相同的 `SignatureShare`（可直接进入现有验证、聚合与回执
+  生成）并把状态置为 `"used"`；失败不返回份额且保持 `"ready"`，修正输入后可
+  重试。`cancel()` 将 `"ready"` 置为 `"cancelled"`，对终止状态重复取消不产生
+  影响。状态终止后 `sign` 无论输入是否合法都先抛 `RuntimeError`；内部锁串行化
+  并发的 `sign` 与 `cancel`，同一会话至多返回一份签名份额，取消先完成则不能再
+  签名。会话绑定的上下文不可被刷新或重共享后的上下文替换（即使联合公钥不变）；
+  零秘密份额、零挑战与门限为一继续支持。状态仅限当前会话对象，不跨会话或进程
+  去重，不涉及网络或落盘；既有无状态入口行为不变
 - `LocalDKGPacket(participant_ids, received, commitment, feldman_commitment)` —
   冻结数据类，可按位置构造、按值相等；一个发送者针对某接收者的本地 DKG 材料：
   参与者编号元组、发给本人的 `DKGReceivedShare`、发送者的 Pedersen 承诺与

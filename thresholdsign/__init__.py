@@ -44,7 +44,11 @@ carries one round's public context and round-one material as a single
 canonical byte string a receiver verifies against its own trusted
 context, and the signer-side sign_round_packet that produces one
 signer's SignatureShare from a verified packet holding only their own
-secret share, one-off nonce and the trusted public context, signing
+secret share, one-off nonce and the trusted public context, plus the
+stateful single-use SigningSession that binds one signer's id, trusted
+context and expected message to a privately drawn nonce, publishing
+only the round-one commitment and producing at most one SignatureShare
+before closing, signing
 audit receipts: SigningAudit / create_audit / check_audit, and the
 self-contained AuditReceipt / create_audit_receipt /
 verify_audit_receipt that binds an audit record to its public
@@ -249,6 +253,7 @@ from __future__ import annotations
 
 import hashlib
 import secrets
+import threading
 from dataclasses import dataclass
 from itertools import combinations
 from typing import Callable, Iterable, Sequence
@@ -322,6 +327,7 @@ __all__ = [
     "decode_round_packet",
     "verify_round_packet",
     "sign_round_packet",
+    "SigningSession",
     "SignatureReceipt",
     "create_signature_receipt",
     "encode_signature_receipt",
@@ -6102,6 +6108,168 @@ def sign_round_packet(
     weight = _lagrange_weight(signer_id, round_info.signer_ids, field_prime)
     z = (nonce + round_info.challenge * weight * secret_share) % field_prime
     return SignatureShare(signer_id=signer_id, nonce_commitment=R_i, z=z)
+
+
+# ---------------------------------------------------------------------------
+# SigningSession: one signer's stateful, single-use handle for producing one
+# signature share. The session draws and retains the one-off nonce at
+# creation, publishes only the round-one commitment, and produces at most one
+# SignatureShare — after a successful sign (or a cancel) the session is
+# terminally closed and sign raises RuntimeError, so the nonce can never be
+# reused through the session. The state is per-session and in-memory only:
+# no cross-session or cross-process deduplication, no network, no storage.
+# The stateless entry points (create_signing_nonce_commitment,
+# create_signing_round, sign_round_packet, ...) are unaffected.
+# ---------------------------------------------------------------------------
+
+
+class SigningSession:
+    """One signer's bound, single-use signing state for one expected message.
+
+    Creation binds the signer's own ``signer_id``, a trusted
+    :class:`SigningPublicContext` and the exact ``message`` bytes the signer
+    consents to sign, and draws the one-off nonce ``r_i`` with the same
+    non-zero semantics as :func:`create_signing_nonce_commitment` (the
+    injected ``randbelow`` works over ``field_prime - 1`` values and a zero
+    draw is rejected). The context is validated at creation: wrong argument
+    or field types raise TypeError (a boolean is never an integer), illegal
+    values, a ``signer_id`` that is not a context participant, or a context
+    whose verification shares are inconsistent with the joint public key
+    (see :func:`verify_signing_public_context`) raise ValueError. Because
+    the context is bound by value at creation, a refreshed or reshared
+    context — even one with an unchanged joint public key — never replaces
+    it: packets exported under the old context fail against the new session
+    and vice versa, exactly as in :func:`sign_round_packet`.
+
+    The only public attributes are the read-only :attr:`commitment` — the
+    :class:`SigningNonceCommitment` to hand to the existing
+    :func:`create_signing_round` flow — and :attr:`state`, one of
+    ``"ready"``, ``"used"`` or ``"cancelled"``. The nonce is never exposed,
+    and neither attribute can be assigned to. The object cannot be copied,
+    deep-copied or pickled.
+
+    :meth:`sign` takes the signer's own aggregated ``secret_share`` and an
+    independently transferred :class:`SigningRoundPacket` and returns the
+    same :class:`SignatureShare` :func:`sign_round_packet` would, after the
+    full packet verification of that function (every context field, the
+    expected message, the signer set, the commitment product, the challenge
+    and the signer's own secret share) plus one session rule: the signer's
+    round-one commitment in the packet must equal :attr:`commitment`. A
+    failed attempt returns no share and leaves the session ``"ready"``, so
+    corrected input can be retried. A successful attempt flips the state to
+    ``"used"``; :meth:`cancel` flips a ready session to ``"cancelled"`` and
+    is a no-op on a terminal state. Once the state is terminal, :meth:`sign`
+    raises RuntimeError before looking at its arguments, however valid.
+    Concurrent :meth:`sign` and :meth:`cancel` calls are serialised by an
+    internal lock, so at most one signature share is ever returned, and a
+    cancel that completes first makes every later sign fail. Zero secret
+    shares, zero challenges and threshold-one contexts remain supported,
+    exactly as at the stateless entry points.
+    """
+
+    __slots__ = (
+        "_signer_id",
+        "_context",
+        "_message",
+        "_nonce",
+        "_commitment",
+        "_state",
+        "_lock",
+    )
+
+    def __init__(
+        self,
+        signer_id: int,
+        context: SigningPublicContext,
+        message: bytes,
+        *,
+        randbelow: Callable[[int], int] = secrets.randbelow,
+    ) -> None:
+        if not isinstance(signer_id, int) or isinstance(signer_id, bool):
+            raise TypeError("signer_id must be an integer")
+        if not isinstance(message, bytes):
+            raise TypeError("message must be bytes")
+        if not verify_signing_public_context(context):
+            raise ValueError(
+                "context verification shares are inconsistent with the public key"
+            )
+        if signer_id not in context.participant_ids:
+            raise ValueError("signer must be a context participant")
+        nonce = _draw_nonzero_nonce(randbelow, context.field_prime)
+        self._signer_id = signer_id
+        self._context = context
+        self._message = message
+        self._nonce = nonce
+        self._commitment = SigningNonceCommitment(
+            signer_id=signer_id,
+            commitment=pow(context.generator, nonce, context.group_prime),
+        )
+        self._state = "ready"
+        self._lock = threading.Lock()
+
+    @property
+    def commitment(self) -> SigningNonceCommitment:
+        """This session's round-one commitment, readable in any state."""
+        return self._commitment
+
+    @property
+    def state(self) -> str:
+        """``"ready"``, ``"used"`` or ``"cancelled"``; read-only."""
+        return self._state
+
+    def sign(self, secret_share: int, packet: SigningRoundPacket) -> SignatureShare:
+        """Produce this signer's one share, then close the session.
+
+        Runs every check of :func:`sign_round_packet` against the bound
+        context, message and nonce, and additionally requires the signer's
+        round-one commitment in ``packet`` to equal :attr:`commitment`.
+        TypeError/ValueError propagate exactly as at the stateless entry
+        point and leave the session ``"ready"``; success flips the state to
+        ``"used"``. On a terminated session RuntimeError is raised before
+        the arguments are examined.
+        """
+        with self._lock:
+            if self._state != "ready":
+                raise RuntimeError("signing session is no longer ready")
+            share = sign_round_packet(
+                self._signer_id,
+                secret_share,
+                self._nonce,
+                packet,
+                self._context,
+                self._message,
+            )
+            # sign_round_packet already proved g ** nonce == R_i, so the
+            # round commitment is the session commitment; state it
+            # explicitly as the session's own binding rule.
+            index = packet.round_info.signer_ids.index(self._signer_id)
+            if packet.round_info.nonce_commitments[index] != self._commitment:
+                raise ValueError(
+                    "round commitment does not match the session commitment"
+                )
+            self._state = "used"
+            return share
+
+    def cancel(self) -> None:
+        """Close a ready session without signing; a no-op once terminated."""
+        with self._lock:
+            if self._state == "ready":
+                self._state = "cancelled"
+
+    def __copy__(self) -> SigningSession:
+        raise TypeError("signing sessions cannot be copied")
+
+    def __deepcopy__(self, memo: dict) -> SigningSession:
+        raise TypeError("signing sessions cannot be copied")
+
+    def __reduce__(self) -> None:
+        raise TypeError("signing sessions cannot be pickled")
+
+    def __reduce_ex__(self, protocol: int) -> None:
+        raise TypeError("signing sessions cannot be pickled")
+
+    def __repr__(self) -> str:
+        return f"SigningSession(signer_id={self._signer_id}, state={self._state!r})"
 
 
 # ---------------------------------------------------------------------------
