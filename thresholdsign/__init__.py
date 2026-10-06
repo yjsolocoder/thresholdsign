@@ -281,6 +281,7 @@ __all__ = [
     "LocalDKGPacket",
     "aggregate_local_dkg",
     "refresh_local",
+    "reshare_local",
     "ContributionFault",
     "diagnose_signing_contributions",
     "create_refresh",
@@ -4275,6 +4276,240 @@ def refresh_local(
         ),
         SigningPublicContext(
             participant_ids=participant_ids,
+            threshold=threshold,
+            field_prime=field_prime,
+            group_prime=group_prime,
+            generator=commitment.generator,
+            public_key=context.public_key,
+            verification_shares=tuple(verification_shares),
+        ),
+    )
+
+
+def reshare_local(
+    receiver_id: int,
+    packets: Iterable[LocalDKGPacket],
+    dealers: Iterable[int],
+    context: SigningPublicContext,
+    commitment: PedersenCommitment,
+) -> tuple[Share, Share, PedersenCommitment, SigningPublicContext] | list[DKGRejection]:
+    """Migrate one receiver to the new member set using only their own shares.
+
+    ``receiver_id`` is the migrating participant (one of the new members);
+    ``packets`` carries exactly one :class:`LocalDKGPacket` per dealer, each
+    holding the double share that dealer addressed to ``receiver_id``
+    together with the dealer's public Pedersen and Feldman commitments — the
+    material a receiver can extract from the dealers'
+    :func:`create_reshare` contributions without ever seeing the old joint
+    key, their own old share or another receiver's share. ``dealers`` is the
+    strictly increasing, duplicate-free quorum re-dealing the secret: it
+    must number at least the old threshold and every dealer must be both an
+    old participant of ``context`` and one of the new members named by the
+    packets. ``context`` is the trusted old :class:`SigningPublicContext`
+    and ``commitment`` the old aggregated :class:`PedersenCommitment`; the
+    new member set and the new threshold are determined by the packets, not
+    by the caller.
+
+    All inputs are validated structurally first, with the same legal-value
+    rules as the public context, commitment and local-packet checks: wrong
+    object or field types raise TypeError (a boolean is never an integer);
+    an empty packet batch, an illegal value in any object, an empty,
+    duplicated, unsorted or too-small dealer quorum, a dealer outside the
+    old participants or the new members, a missing, duplicated or extra
+    packet sender, a ``receiver_id`` that is not one of the new members, a
+    received share whose ``receiver_id`` or share coordinates do not equal
+    ``receiver_id``, an out-of-range share value, illegal group parameters
+    or commitments, packets disagreeing on the new member ids or the new
+    threshold (the common length of the two commitments), packets not
+    reusing the old group parameters and blinding generator, or an old
+    commitment disagreeing with the old context on the threshold or the
+    shared group parameters raise ValueError.
+
+    Once the structure is legal, each dealer's packet is examined: the
+    double share must verify against the dealer's Pedersen commitment, the
+    secret share against the dealer's Feldman commitment, and the Feldman
+    constant-term commitment must equal the dealer's old verification share
+    in ``context`` raised to its Lagrange weight at zero over ``dealers``
+    (``Y_i ** lambda_i``). Failures are never dropped and no partial result
+    is returned: if any check fails, the result is a sender-sorted,
+    duplicate-free ``list`` of :class:`DKGRejection` naming every dealer
+    whose packet failed. With no failures, the product of the constant-term
+    commitments must equal the old joint public key — otherwise the old
+    public material itself is inconsistent and ValueError is raised.
+
+    On success returns ``(share, blinding_share, commitment, context)``:
+    the receiver's new :class:`Share` and blinding :class:`Share`, both with
+    coordinate ``receiver_id`` and values the received shares summed modulo
+    ``field_prime``; the new aggregated :class:`PedersenCommitment`, the
+    groupwise product of every dealer's Pedersen commitment; and the new
+    :class:`SigningPublicContext` over the new members and threshold, whose
+    joint public key is the unchanged old one and whose verification shares
+    are the products of the dealers' Feldman evaluations at each new member
+    id. For the same batch of valid resharing contributions each new
+    member's local result equals the corresponding entries of the
+    :class:`SigningDKGResult` that :func:`reshare` produces — the shares and
+    blinding shares of ``result``, the aggregated commitment of
+    ``result.commitment`` and the :func:`export_signing_public_context` of
+    that result — so the joint public key is unchanged, old signatures
+    remain valid, and the new material drops straight into
+    :func:`sign_round_packet` and a further :func:`refresh_local` round. The
+    input order does not affect the result, single-pass iterators are
+    accepted, and a threshold of one, zero shares and identity commitment
+    values remain legal exactly as in the full resharing. Success certifies
+    only the receiver's own resharing material — it says nothing about
+    whether any other member received valid shares. The function does not
+    mutate its inputs and keeps no state between calls.
+    """
+    if not isinstance(receiver_id, int) or isinstance(receiver_id, bool):
+        raise TypeError("receiver_id must be an integer")
+    if not isinstance(context, SigningPublicContext):
+        raise TypeError("context must be a SigningPublicContext instance")
+    _check_signing_public_context(context)
+    if not isinstance(commitment, PedersenCommitment):
+        raise TypeError("commitment must be a PedersenCommitment instance")
+    for name, value in (
+        ("field_prime", commitment.field_prime),
+        ("group_prime", commitment.group_prime),
+        ("generator", commitment.generator),
+        ("blinding_generator", commitment.blinding_generator),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"{name} must be an integer")
+    if not isinstance(commitment.values, tuple):
+        raise TypeError("commitment values must be a tuple")
+    for value in commitment.values:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError("commitment values must be integers")
+    materialised = list(packets)
+    if not materialised:
+        raise ValueError("at least one packet is required")
+    for packet in materialised:
+        _check_local_dkg_packet_types(packet)
+
+    old_ids = context.participant_ids
+    field_prime = commitment.field_prime
+    group_prime = commitment.group_prime
+    _validate_commitment_setup(
+        commitment.values,
+        field_prime,
+        group_prime,
+        (commitment.generator, commitment.blinding_generator),
+    )
+    if (
+        field_prime != context.field_prime
+        or group_prime != context.group_prime
+        or commitment.generator != context.generator
+    ):
+        raise ValueError("commitment must share the context's group parameters")
+    old_threshold = len(commitment.values)
+    if old_threshold != context.threshold:
+        raise ValueError("commitment must share the context's threshold")
+
+    for packet in materialised:
+        _check_local_dkg_packet_structure(packet, receiver_id)
+
+    first = materialised[0]
+    member_ids = first.participant_ids
+    threshold = len(first.commitment.values)
+    if receiver_id not in member_ids:
+        raise ValueError("receiver_id must be one of the new member ids")
+    for packet in materialised:
+        packet_commitment = packet.commitment
+        if packet.participant_ids != member_ids:
+            raise ValueError("packets must agree on the same participant ids")
+        if (
+            packet_commitment.field_prime != field_prime
+            or packet_commitment.group_prime != group_prime
+            or packet_commitment.generator != commitment.generator
+            or packet_commitment.blinding_generator != commitment.blinding_generator
+        ):
+            raise ValueError("packets must reuse the old group parameters")
+        if len(packet_commitment.values) != threshold:
+            raise ValueError("packets must share the same threshold")
+
+    dealer_list = _check_reshare_dealers(dealers, old_ids, old_threshold, member_ids)
+    sender_ids = [packet.received.sender_id for packet in materialised]
+    if len(set(sender_ids)) != len(sender_ids):
+        raise ValueError("duplicate packet from the same dealer")
+    if set(sender_ids) != set(dealer_list):
+        raise ValueError("each dealer must send exactly one packet")
+
+    # Sort by sender so the input order cannot influence the outcome.
+    ordered = sorted(materialised, key=lambda packet: packet.received.sender_id)
+    weights = {
+        dealer: _lagrange_weight(dealer, dealer_list, field_prime)
+        for dealer in dealer_list
+    }
+
+    rejections: list[DKGRejection] = []
+    for packet in ordered:
+        received = packet.received
+        # The Feldman constant must commit to lambda_i * s_i: exactly the
+        # dealer's old verification share Y_i raised to its Lagrange weight.
+        expected_constant = pow(
+            context.verification_shares[old_ids.index(received.sender_id)],
+            weights[received.sender_id],
+            group_prime,
+        )
+        if (
+            not verify_pedersen_share(
+                received.share, received.blinding_share, packet.commitment
+            )
+            or not verify_share(received.share, packet.feldman_commitment)
+            or packet.feldman_commitment.values[0] != expected_constant
+        ):
+            rejections.append(DKGRejection(sender_id=received.sender_id))
+    if rejections:
+        return rejections
+
+    # Every Feldman constant was verified as Y_i ** lambda_i, so their
+    # product is g ** (sum lambda_i * s_i); it must equal the old public key
+    # of the caller-supplied context, which is public but unauthenticated.
+    public_key = 1
+    for packet in ordered:
+        public_key = public_key * packet.feldman_commitment.values[0] % group_prime
+    if public_key != context.public_key:
+        raise ValueError(
+            "the constant-term commitments must multiply to the old public key"
+        )
+
+    y = 0
+    y_blinding = 0
+    for packet in ordered:
+        y = (y + packet.received.share.y) % field_prime
+        y_blinding = (y_blinding + packet.received.blinding_share.y) % field_prime
+
+    new_values = []
+    for position in range(threshold):
+        value = 1
+        for packet in ordered:
+            value = value * packet.commitment.values[position] % group_prime
+        new_values.append(value)
+
+    verification_shares = []
+    for member_id in member_ids:
+        verification = 1
+        for packet in ordered:
+            x_power = 1
+            evaluation = 1
+            for value in packet.feldman_commitment.values:
+                evaluation = evaluation * pow(value, x_power, group_prime) % group_prime
+                x_power = x_power * member_id % field_prime
+            verification = verification * evaluation % group_prime
+        verification_shares.append(verification)
+
+    return (
+        Share(x=receiver_id, y=y),
+        Share(x=receiver_id, y=y_blinding),
+        PedersenCommitment(
+            values=tuple(new_values),
+            field_prime=field_prime,
+            group_prime=group_prime,
+            generator=commitment.generator,
+            blinding_generator=commitment.blinding_generator,
+        ),
+        SigningPublicContext(
+            participant_ids=member_ids,
             threshold=threshold,
             field_prime=field_prime,
             group_prime=group_prime,
