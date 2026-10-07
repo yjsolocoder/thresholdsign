@@ -371,6 +371,30 @@ Pedersen 记录在前，一项失败不遮蔽另一项，也不停止检查其�
 的检查，不推断其他成员是否收到有效份额，不产生聚合份额，不修改输入、不保存
 状态、不返回秘密值。
 
+### 跨接收者的公开承诺冲突诊断
+
+本地诊断只能检查发给本人的份额；要发现**同一发送者向不同接收者出示了不同公开
+承诺**（equivocation）而又不汇集任何秘密份额，可让各接收者先导出公开视图再集中
+比对。`export_dkg_view(packet)` 把一个 `LocalDKGPacket` 剥离为冻结的
+`DKGView(sender_id, receiver_id, participant_ids, commitment, feldman_commitment)`
+——可按位置构造、按值相等，只含发送者的公开声明，不携带原包、双份额或系数。导出
+沿用 `encode_local_dkg_packet` 的类型与结构校验（类型错误抛 `TypeError`，布尔不
+视为整数；成员、编号、门限、群参数与承诺合法性错误抛 `ValueError`），但不验证
+份额方程——密码学判定仍归 `aggregate_local_dkg` / `diagnose_local_dkg`。调用方
+负责确认各视图来自同一轮 DKG 并认证来源。
+
+`diagnose_dkg_views(views)` 接受若干接收者导出的视图（支持单次迭代器），先校验
+全部视图：对象或字段类型错误抛 `TypeError`；空输入、重复的 `(sender_id,
+receiver_id)` 组合（即使两视图完全相同）、任意视图间成员集合/门限/群参数不一致，
+以及任何视图公开字段违反本地包约束，均抛 `ValueError`，绝不返回部分诊断。结构
+合法后按发送者独立比对——不同发送者的承诺互不比较，也允许只提交部分成员的视图；
+对同一发送者的每对不同接收者分别比较两类承诺的值元组，每类不相等各产生一条
+`DKGEquivocation(sender_id, receiver_ids, check)`（`receiver_ids` 为升序二元组，
+`check` 为 `"pedersen"` 或 `"feldman"`）。结果按发送者、接收者编号对升序排列，
+同一对的 Pedersen 记录在前，所有冲突均保留，输入顺序不影响结果；某发送者仅有
+一个视图时不产生记录，全部无冲突返回空元组。空结果不代表份额有效或材料收集
+完整；入口不修改输入、不保存状态。
+
 ### 按显式贡献者集合的本地聚合
 
 `aggregate_qualified_local_dkg(receiver_id, packets, qualified_ids)` 在
@@ -1871,6 +1895,28 @@ python3 -m thresholdsign
   核验两类承诺，失败返回按发送者编号升序去重的 `DKGRejection` 列表，不返回
   部分结果。成功只证明本人材料核验通过，不证明共识或他人份额；支持单次
   迭代器、顺序无关、门限为一、零份额与单位元承诺；不修改输入、不保存状态
+- `DKGView(sender_id, receiver_id, participant_ids, commitment, feldman_commitment)`
+  — 冻结数据类，可按位置构造、按值相等；一个发送者向某接收者出示的公开 DKG
+  声明：双方编号、参与者编号元组、Pedersen 承诺与 Feldman 承诺；不携带原包、
+  双份额、多项式系数或隐藏状态
+- `export_dkg_view(packet)` — 把一个 `LocalDKGPacket` 剥离为 `DKGView`：沿用
+  `encode_local_dkg_packet` 的类型与结构校验（类型错误抛 `TypeError`，布尔不
+  视为整数；成员、编号、门限、群参数与承诺合法性错误抛 `ValueError`），但不
+  验证份额方程；调用方负责确认材料来自同一轮并认证来源；不修改输入、不保存
+  状态
+- `DKGEquivocation(sender_id, receiver_ids, check)` — 冻结数据类，可按位置构造、
+  按值相等；同一发送者向两个接收者出示冲突承诺的记录：`receiver_ids` 为升序
+  二元组，`check` 为 `"pedersen"` 或 `"feldman"`
+- `diagnose_dkg_views(views)` — 跨接收者的公开承诺冲突诊断：接受若干
+  `DKGView`（支持单次迭代器），先校验全部视图——类型错误抛 `TypeError`；空
+  输入、重复的 `(sender_id, receiver_id)` 组合（即使完全相同）、视图间成员
+  集合/门限/群参数不一致或任何视图公开字段违反本地包约束均抛 `ValueError`，
+  不返回部分诊断。结构合法后按发送者独立比对（不同发送者互不比较，允许只
+  提交部分成员的视图），对同一发送者的每对不同接收者分别比较两类承诺的值
+  元组，每类不相等各产生一条 `DKGEquivocation`；结果按发送者、接收者编号对
+  升序排列，同一对的 Pedersen 记录在前，所有冲突均保留，输入顺序不影响结果；
+  某发送者仅有一个视图时不产生记录，全部无冲突返回空元组——空结果不代表
+  份额有效或材料收集完整；不修改输入、不保存状态
 - `encode_local_dkg_packet(packet)` / `decode_local_dkg_packet(payload)` —
   `LocalDKGPacket` 的唯一字节编码，只承载指定接收者的双份额与发送者公开承诺，
   不含完整贡献或其他接收者的份额：标签 `thresholdsign/local-dkg-packet/v1` 后
