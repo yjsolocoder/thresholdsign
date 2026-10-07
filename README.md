@@ -358,6 +358,19 @@ Pedersen 双份额与 Feldman 份额，任一不匹配返回按发送者编号�
 份额在域内之和；公开上下文由全部公开承诺确定。输入顺序不影响结果，支持单次
 迭代器、门限为一、零份额与单位元承诺值；入口不修改输入、不保存状态。
 
+`diagnose_local_dkg(receiver_id, packets)` 是它的聚合前诊断伴侣：接受相同参数，
+输入边界与 `aggregate_local_dkg` 完全一致（类型错误抛 `TypeError`，结构错误抛
+`ValueError`，绝不以诊断记录掩盖整批非法输入）。对结构合法的包，按发送者编号
+升序逐包独立核验 Pedersen 双份额与 Feldman 份额两项检查，每项失败各返回一条
+`ContributionFault`（`sender_id` 指向发送者、`receiver_id` 等于目标编号、
+`check` 为 `"pedersen"` 或 `"feldman"`）；同一包两项失败时两条都保留且
+Pedersen 记录在前，一项失败不遮蔽另一项，也不停止检查其余发送者。全部通过
+返回空元组——空元组当且仅当 `aggregate_local_dkg` 对同一输入聚合成功，非空时
+去重后的发送者序列与其拒绝列表一致；从完整贡献提取某接收者的包做本地诊断，
+结果等于 `diagnose_signing_contributions` 中属于该接收者的记录。诊断只描述本人
+的检查，不推断其他成员是否收到有效份额，不产生聚合份额，不修改输入、不保存
+状态、不返回秘密值。
+
 ### 主动份额刷新
 
 签名密钥长期使用时，可用主动份额刷新（proactive refresh）在不改变联合秘密与

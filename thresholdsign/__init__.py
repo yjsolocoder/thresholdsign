@@ -36,7 +36,10 @@ the public context alone as one self-delimiting byte string, the
 receiver-side LocalDKGPacket / aggregate_local_dkg
 that lets each DKG participant aggregate only the double shares addressed
 to them, together with the senders' public commitments, into their own
-signing share, blinding share and the same public signing context, and
+signing share, blinding share and the same public signing context, plus
+its stateless pre-aggregation diagnoser diagnose_local_dkg that names
+every failing Pedersen or Feldman check in one receiver's own packets
+without producing any aggregated share, and
 the receiver-side refresh_local that proactively refreshes one
 participant's own double share, the aggregated Pedersen commitment and
 the public signing context from that participant's old material, a
@@ -293,6 +296,7 @@ __all__ = [
     "decode_signing_public_context",
     "LocalDKGPacket",
     "aggregate_local_dkg",
+    "diagnose_local_dkg",
     "encode_local_dkg_packet",
     "decode_local_dkg_packet",
     "refresh_local",
@@ -4296,6 +4300,124 @@ def aggregate_local_dkg(
         Share(x=receiver_id, y=y_blinding),
         context,
     )
+
+
+def diagnose_local_dkg(
+    receiver_id: int,
+    packets: Iterable[LocalDKGPacket],
+) -> tuple[ContributionFault, ...]:
+    """Locate every failing check in one receiver's own DKG packets.
+
+    Accepts exactly the arguments of :func:`aggregate_local_dkg` and
+    applies its validation boundary unchanged: a non-integer
+    ``receiver_id`` (a boolean is never an integer), a
+    non-:class:`LocalDKGPacket` packet element, a non-iterable
+    ``packets`` or any wrong field type raises TypeError; an empty batch,
+    empty, non-increasing or out-of-range participant ids, a
+    ``receiver_id`` that is not one of the participants, a missing,
+    duplicated or non-member sender, a received share whose
+    ``receiver_id`` or share coordinates do not equal ``receiver_id``, an
+    out-of-range share value, illegal group parameters or commitments, or
+    packets disagreeing on the participant ids, the threshold or the
+    group parameters raise ValueError. Such inputs are never reported as
+    faults — they reject the whole call just as in
+    :func:`aggregate_local_dkg`, and all structural validation completes
+    before any fault is returned.
+
+    For structurally legal packets, every sender's packet is examined in
+    ascending ``sender_id`` order regardless of input order, and both
+    checks run for every packet — no failure masks another and one
+    sender's failure never stops the remaining senders from being
+    checked. The received double share is checked against the sender's
+    Pedersen commitment (``check="pedersen"``) and the secret share alone
+    against the sender's Feldman commitment (``check="feldman"``). Each
+    failed check yields one :class:`ContributionFault` whose
+    ``sender_id`` names the packet's sender and whose ``receiver_id`` is
+    the aggregating ``receiver_id``; a packet failing both checks
+    produces two faults, the Pedersen fault first. The diagnosis
+    certifies only the receiver's own packets: it says nothing about
+    whether any other member received valid shares, and it produces no
+    aggregated shares.
+
+    The returned tuple is empty if and only if
+    :func:`aggregate_local_dkg` would return its success triple on the
+    same input, and the deduplicated fault senders are exactly that
+    function's rejection list otherwise. Diagnosing the packets one
+    receiver extracts from a batch of :class:`SigningContribution`
+    objects yields exactly the faults
+    :func:`diagnose_signing_contributions` reports for that receiver.
+    The function never mutates its input, keeps no state between calls,
+    returns no secret values, and changes no other entry point:
+    :func:`aggregate_local_dkg`, :func:`aggregate_signing_dkg`,
+    :func:`diagnose_signing_contributions`, :func:`refresh_local`,
+    :func:`reshare_local`, the signing and audit entries, the codecs and
+    the command-line demo keep their existing return values and exception
+    behaviour.
+    """
+    if not isinstance(receiver_id, int) or isinstance(receiver_id, bool):
+        raise TypeError("receiver_id must be an integer")
+    materialised = list(packets)
+    if not materialised:
+        raise ValueError("at least one packet is required")
+    for packet in materialised:
+        _check_local_dkg_packet_types(packet)
+    for packet in materialised:
+        _check_local_dkg_packet_structure(packet, receiver_id)
+
+    first = materialised[0]
+    participant_ids = first.participant_ids
+    first_commitment = first.commitment
+    threshold = len(first_commitment.values)
+    if receiver_id not in participant_ids:
+        raise ValueError("receiver_id must be one of the participant ids")
+    for packet in materialised:
+        commitment = packet.commitment
+        if packet.participant_ids != participant_ids:
+            raise ValueError("packets must agree on the same participant ids")
+        if (
+            commitment.field_prime != first_commitment.field_prime
+            or commitment.group_prime != first_commitment.group_prime
+            or commitment.generator != first_commitment.generator
+            or commitment.blinding_generator != first_commitment.blinding_generator
+        ):
+            raise ValueError("packets must share the same group parameters")
+        if len(commitment.values) != threshold:
+            raise ValueError("packets must share the same threshold")
+
+    sender_ids = [packet.received.sender_id for packet in materialised]
+    if len(set(sender_ids)) != len(sender_ids):
+        raise ValueError("duplicate packet from the same participant")
+    if set(sender_ids) != set(participant_ids):
+        raise ValueError("each participant must send exactly one packet")
+
+    # Sort by sender so the reported order cannot depend on the input order.
+    ordered = sorted(materialised, key=lambda packet: packet.received.sender_id)
+
+    faults: list[ContributionFault] = []
+    for packet in ordered:
+        received = packet.received
+        # Both checks run for every packet, so one failure never masks
+        # another; a packet's faults are listed pedersen first, then
+        # feldman.
+        if not verify_pedersen_share(
+            received.share, received.blinding_share, packet.commitment
+        ):
+            faults.append(
+                ContributionFault(
+                    sender_id=received.sender_id,
+                    receiver_id=receiver_id,
+                    check="pedersen",
+                )
+            )
+        if not verify_share(received.share, packet.feldman_commitment):
+            faults.append(
+                ContributionFault(
+                    sender_id=received.sender_id,
+                    receiver_id=receiver_id,
+                    check="feldman",
+                )
+            )
+    return tuple(faults)
 
 
 LOCAL_DKG_PACKET_TAG = b"thresholdsign/local-dkg-packet/v1"
