@@ -14,7 +14,10 @@ plus ContributionFault / diagnose_signing_contributions, the stateless
 pre-aggregation diagnoser that reports every failing Pedersen or Feldman
 double-share pairing without one bad pairing masking the others,
 proactive share refresh via create_refresh / refresh, member resharing via
-create_reshare / reshare, and the canonical confidential-channel
+create_reshare / reshare, and the sender-local create_local_reshare that
+deals one dealer's resharing from only that dealer's own old share plus
+public material as one LocalDKGPacket per new member, and the canonical
+confidential-channel
 transport encodings encode_dkg_contribution / decode_dkg_contribution and
 encode_signing_contribution / decode_signing_contribution (the same
 format carries refresh and reshare contributions), and the two-round
@@ -310,6 +313,7 @@ __all__ = [
     "RefreshFault",
     "diagnose_refresh_contributions",
     "create_reshare",
+    "create_local_reshare",
     "reshare",
     "ReshareFault",
     "diagnose_reshare_contributions",
@@ -5426,6 +5430,217 @@ def diagnose_reshare_local(
             "the constant-term commitments must multiply to the old public key"
         )
     return ()
+
+
+def create_local_reshare(
+    sender: int,
+    share: int,
+    dealers: Iterable[int],
+    members: Iterable[int],
+    threshold: int,
+    context: SigningPublicContext,
+    old_commitment: PedersenCommitment,
+    *,
+    rng: Callable[[int], int] = secrets.randbelow,
+) -> tuple[LocalDKGPacket, ...]:
+    """Create one dealer's resharing as one :class:`LocalDKGPacket` per new member.
+
+    This is the sender-side counterpart of :func:`reshare_local`: whereas
+    :func:`create_reshare` needs the whole old :class:`SigningDKGResult` and
+    returns a single :class:`SigningContribution` carrying every new member's
+    double share, :func:`create_local_reshare` needs only the dealer's own old
+    secret ``share`` ``s_i`` together with public material — the trusted old
+    :class:`SigningPublicContext` ``context`` and the old aggregated
+    :class:`PedersenCommitment` ``old_commitment`` — and returns one packet per
+    new member, each carrying only that receiver's double share alongside this
+    dealer's two public commitments. Every input is checked before the random
+    source is sampled and no partial result is ever returned.
+
+    ``sender`` is one of the old participants and ``share`` its aggregated
+    secret share ``s_i`` (checked against the old verification share ``Y_i`` in
+    ``context``; an out-of-range or mismatching share raises ValueError).
+    ``dealers`` is the strictly increasing, duplicate-free quorum of old
+    participants re-dealing the secret: it must number at least the old
+    threshold, every dealer must be both an old participant of ``context`` and
+    one of the new ``members``, and ``sender`` must be one of the dealers.
+    ``members`` is the new participant-id set — single-pass iterables are
+    accepted, the ids need not arrive sorted, and they are normalised to
+    strictly increasing order — and ``threshold`` is the new threshold ``t``,
+    bounded by ``1 <= t <= len(members)`` as everywhere else.
+
+    The dealing reuses the exact mathematics of :func:`create_reshare`: the
+    sender's new sharing polynomial over ``members`` has the constant term
+    ``lambda_i * share mod q`` (not drawn), where ``lambda_i`` is the sender's
+    Lagrange weight at zero over ``dealers``; then ``t - 1`` sharing
+    coefficients and ``t`` blinding coefficients are drawn from ``rng(q)`` in
+    exactly the order of :func:`create_reshare` and
+    :func:`create_signing_contribution`, using the old group parameters and
+    the old Pedersen blinding generator. With the same sequence of random
+    draws the packets are therefore item-by-item equal to the packets each
+    receiver extracts from the corresponding :func:`create_reshare`
+    contribution, and every receiver feeding the per-dealer packets into
+    :func:`reshare_local` obtains exactly the shares, commitments and public
+    context of the full :func:`reshare` — the joint public key is unchanged,
+    old signatures remain valid, and the new shares sign through the usual
+    public-round packet entries. A threshold of one, zero shares and identity
+    commitment values remain legal.
+
+    All inputs are validated before sampling: wrong object, field, id or share
+    types, a non-iterable ``dealers`` / ``members`` or a non-callable ``rng``
+    raise TypeError (a boolean is never an integer); empty sets, duplicate or
+    out-of-range ids, an illegal new threshold, an unsorted dealer quorum, a
+    dealer outside the old participants or the new members, a ``sender``
+    outside the dealers, an out-of-range or mismatching share, illegal group
+    parameters or commitment values, an old commitment disagreeing with the
+    context on the threshold or the shared group parameters, or a context for
+    which :func:`verify_signing_public_context` returns ``False`` raise
+    ValueError. ``rng`` defaults to the :mod:`secrets` source, must return a
+    non-boolean integer in ``range(field_prime)`` for every draw (a boolean or
+    other type makes TypeError, an out-of-range integer ValueError), and any
+    exception it raises propagates unchanged. The function never mutates its
+    inputs and keeps no state between calls.
+    """
+    if not isinstance(sender, int) or isinstance(sender, bool):
+        raise TypeError("sender must be an integer")
+    if not isinstance(share, int) or isinstance(share, bool):
+        raise TypeError("share must be an integer")
+    if not isinstance(threshold, int) or isinstance(threshold, bool):
+        raise TypeError("threshold must be an integer")
+    if not isinstance(context, SigningPublicContext):
+        raise TypeError("context must be a SigningPublicContext instance")
+    if not isinstance(old_commitment, PedersenCommitment):
+        raise TypeError("old_commitment must be a PedersenCommitment instance")
+    for name, value in (
+        ("field_prime", old_commitment.field_prime),
+        ("group_prime", old_commitment.group_prime),
+        ("generator", old_commitment.generator),
+        ("blinding_generator", old_commitment.blinding_generator),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"{name} must be an integer")
+    if not isinstance(old_commitment.values, tuple):
+        raise TypeError("commitment values must be a tuple")
+    for value in old_commitment.values:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError("commitment values must be integers")
+    if not callable(rng):
+        raise TypeError("rng must be callable")
+    # Materialise both single-pass iterables up front, exactly as the other
+    # dealing entries; a non-iterable set surfaces here as TypeError.
+    if isinstance(dealers, (str, bytes)):
+        raise TypeError("dealers must be an iterable of integers")
+    if isinstance(members, (str, bytes)):
+        raise TypeError("members must be an iterable of integers")
+    dealer_input = list(dealers)
+    member_input = list(members)
+    for dealer in dealer_input:
+        if not isinstance(dealer, int) or isinstance(dealer, bool):
+            raise TypeError("dealer ids must be integers")
+    for member in member_input:
+        if not isinstance(member, int) or isinstance(member, bool):
+            raise TypeError("member ids must be integers")
+
+    _check_signing_public_context(context)
+    field_prime = old_commitment.field_prime
+    group_prime = old_commitment.group_prime
+    generator = old_commitment.generator
+    blinding_generator = old_commitment.blinding_generator
+    _validate_commitment_setup(
+        old_commitment.values,
+        field_prime,
+        group_prime,
+        (generator, blinding_generator),
+    )
+    if (
+        field_prime != context.field_prime
+        or group_prime != context.group_prime
+        or generator != context.generator
+    ):
+        raise ValueError(
+            "old commitment must share the context's group parameters"
+        )
+    old_threshold = len(old_commitment.values)
+    if old_threshold != context.threshold:
+        raise ValueError("old commitment must share the context's threshold")
+    if not verify_signing_public_context(context):
+        raise ValueError("the old signing public context must be threshold-consistent")
+
+    old_ids = context.participant_ids
+    # The new member set and threshold follow the usual DKG dealing rules,
+    # including normalisation of an unsorted members iterable.
+    ordered_members = _validate_dkg_dealing_parameters(
+        sender,
+        member_input,
+        threshold,
+        field_prime,
+        group_prime,
+        generator,
+        blinding_generator,
+    )
+    dealer_list = _check_reshare_dealers(
+        dealer_input, old_ids, old_threshold, ordered_members
+    )
+    if sender not in dealer_list:
+        raise ValueError("sender must be one of the dealers")
+
+    if not 0 <= share < field_prime:
+        raise ValueError("share must satisfy 0 <= share < field_prime")
+    sender_index = old_ids.index(sender)
+    if pow(generator, share, group_prime) != context.verification_shares[sender_index]:
+        raise ValueError("share does not match the old verification share Y_i")
+
+    weight = _lagrange_weight(sender, dealer_list, field_prime)
+
+    def checked_rng(upper: int) -> int:
+        drawn = rng(upper)
+        if not isinstance(drawn, int) or isinstance(drawn, bool):
+            raise TypeError("rng must return an integer")
+        if not 0 <= drawn < upper:
+            raise ValueError("rng must return a value in range(field_prime)")
+        return drawn
+
+    (
+        ordered_ids,
+        coefficients,
+        _blinding_coefficients,
+        shares,
+        blinding_shares,
+        commitment,
+    ) = _deal_dkg_contribution(
+        sender,
+        ordered_members,
+        threshold,
+        group_prime=group_prime,
+        generator=generator,
+        blinding_generator=blinding_generator,
+        prime=field_prime,
+        randbelow=checked_rng,
+        constant=weight * share % field_prime,
+    )
+    feldman_commitment = FeldmanCommitment(
+        values=tuple(
+            pow(generator, coefficient, group_prime) for coefficient in coefficients
+        ),
+        field_prime=field_prime,
+        group_prime=group_prime,
+        generator=generator,
+    )
+    packets = []
+    for index, receiver_id in enumerate(ordered_ids):
+        packets.append(
+            LocalDKGPacket(
+                participant_ids=ordered_ids,
+                received=DKGReceivedShare(
+                    sender_id=sender,
+                    receiver_id=receiver_id,
+                    share=shares[index],
+                    blinding_share=blinding_shares[index],
+                ),
+                commitment=commitment,
+                feldman_commitment=feldman_commitment,
+            )
+        )
+    return tuple(packets)
 
 
 def _draw_nonzero_nonce(randbelow: Callable[[int], int], prime: int) -> int:

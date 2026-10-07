@@ -1537,6 +1537,22 @@ python3 -m thresholdsign
   `ValueError`）。新共享多项式（对新成员集合、新 `threshold`）常数项固定为
   `λ_i·share mod q`（`λ_i` 是 sender 在 dealers 上的零点拉格朗日权重，不抽样），
   随后依次抽取 `threshold - 1` 个秘密系数与 `threshold` 个盲化系数
+- `create_local_reshare(sender, share, dealers, members, threshold, context, old_commitment, *, rng=secrets.randbelow)`
+  — `create_reshare` 的分发者本地版本：只需本人旧秘密份额 `share` 与公开
+  材料（旧 `SigningPublicContext` 与旧聚合 `PedersenCommitment`），不需要完整
+  旧密钥。数学语义与 `create_reshare` 完全一致（同一常数项 `λ_i·share mod q`
+  与相同的抽样次数、顺序、旧群参数及盲化生成元），但返回按接收者编号升序的
+  `tuple[LocalDKGPacket, ...]`：每名新成员恰有一包，每包只携带该接收者的双份额
+  与本次两类公开承诺。`dealers`/`members` 接受一次性可迭代输入，`members` 允许
+  乱序并规范化排序；抽样前校验全部输入：对象、字段、编号或份额类型错误、不可
+  迭代集合或不可调用的 `rng` 抛 `TypeError`（布尔不视为整数），空集合、重复或
+  越界编号、非法门限、dealer 乱序或成员归属不符、sender 不属于 dealers、份额
+  越界或不匹配旧验证份额、非法群参数或承诺、旧承诺与上下文门限或群参数不一致、
+  `verify_signing_public_context` 返回 `False` 抛 `ValueError`；rng 返回非整数
+  或布尔抛 `TypeError`、返回域外整数抛 `ValueError`、其自身异常原样传播，失败不
+  返回部分包。相同有效随机数序列下与 `create_reshare` 贡献拆出的包逐项相等；
+  各接收者把每位分发者的包交给 `reshare_local` 即得到与完整 `reshare` 一致的
+  份额、承诺与公开上下文，联合公钥不变，旧签名继续有效
 - `reshare(contributions, dealers, key)` — 聚合每名 dealer 恰好一份的重共享贡献：
   双份额按域相加、Pedersen/Feldman 两类承诺按群相乘，结果与贡献顺序无关；每份贡献
   的 Feldman 常数项承诺必须等于 `Y_i ** λ_i` 且双份额匹配两类承诺，失败按
