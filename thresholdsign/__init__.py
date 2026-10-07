@@ -297,6 +297,7 @@ __all__ = [
     "decode_local_dkg_packet",
     "refresh_local",
     "reshare_local",
+    "diagnose_reshare_local",
     "ContributionFault",
     "diagnose_signing_contributions",
     "create_refresh",
@@ -4927,6 +4928,198 @@ def reshare_local(
             verification_shares=tuple(verification_shares),
         ),
     )
+
+
+def diagnose_reshare_local(
+    receiver_id: int,
+    packets: Iterable[LocalDKGPacket],
+    dealers: Iterable[int],
+    context: SigningPublicContext,
+    commitment: PedersenCommitment,
+) -> tuple[ReshareFault, ...]:
+    """Locate every failing check in one receiver's resharing packets.
+
+    Accepts exactly the arguments of :func:`reshare_local` and applies its
+    validation boundary unchanged: a non-integer ``receiver_id`` (a boolean is
+    never an integer), a non-:class:`SigningPublicContext` ``context``, a
+    non-:class:`PedersenCommitment` ``commitment``, a non-:class:`LocalDKGPacket`
+    packet element, or any wrong field or dealer element type raises TypeError;
+    an empty packet batch, an illegal value in any object, an empty,
+    duplicated, unsorted or too-small dealer quorum, a dealer outside the old
+    participants or the new members, a missing, duplicated or extra packet
+    sender, a ``receiver_id`` that is not one of the new members, a received
+    share whose ``receiver_id`` or share coordinates do not equal
+    ``receiver_id``, an out-of-range share value, illegal group parameters or
+    commitments, packets disagreeing on the new member ids or the new
+    threshold, packets not reusing the old group parameters and blinding
+    generator, or an old commitment disagreeing with the old context on the
+    threshold or the shared group parameters raise ValueError. Such inputs are
+    never reported as faults — they reject the whole call just as in
+    :func:`reshare_local`, and the structural validation completes before any
+    fault is returned.
+
+    For structurally legal packets, every dealer's packet is examined in
+    ascending ``sender_id`` order regardless of input order, and all three
+    checks run for every packet — no failure masks another. The receiver's
+    double share is checked against the dealer's Pedersen commitment
+    (``check="pedersen"``), the secret share alone against the dealer's
+    Feldman commitment (``check="feldman"``), and the dealer's Feldman
+    constant-term commitment against its old verification share in ``context``
+    raised to its Lagrange weight at zero over ``dealers``
+    (``Y_i ** lambda_i``, ``check="binding"``). Each failed check yields one
+    :class:`ReshareFault`: the two position checks record the receiver's own
+    ``receiver_id``, the dealer-level binding check records
+    ``receiver_id=None``, and a dealer's faults are listed in exactly this
+    order — pedersen, feldman, binding. The diagnosis certifies only the
+    receiver's own material: it says nothing about whether any other member
+    received valid shares.
+
+    If any check failed, the fault tuple is returned directly. With no
+    failures, the product of the constant-term commitments must equal the old
+    joint public key of ``context`` — otherwise the old public material
+    itself is inconsistent and ValueError is raised (this comparison never
+    fires when faults exist). The returned tuple is empty if and only if
+    :func:`reshare_local` would return its success four-tuple on the same
+    input. The function never mutates its input, keeps no state between
+    calls, returns no secret values, and changes no other entry point:
+    :func:`reshare_local`, :func:`reshare`,
+    :func:`diagnose_reshare_contributions`, the signing and audit entries,
+    the codecs and the command-line demo keep their existing return values
+    and exception behaviour.
+    """
+    if not isinstance(receiver_id, int) or isinstance(receiver_id, bool):
+        raise TypeError("receiver_id must be an integer")
+    if not isinstance(context, SigningPublicContext):
+        raise TypeError("context must be a SigningPublicContext instance")
+    _check_signing_public_context(context)
+    if not isinstance(commitment, PedersenCommitment):
+        raise TypeError("commitment must be a PedersenCommitment instance")
+    for name, value in (
+        ("field_prime", commitment.field_prime),
+        ("group_prime", commitment.group_prime),
+        ("generator", commitment.generator),
+        ("blinding_generator", commitment.blinding_generator),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"{name} must be an integer")
+    if not isinstance(commitment.values, tuple):
+        raise TypeError("commitment values must be a tuple")
+    for value in commitment.values:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError("commitment values must be integers")
+    materialised = list(packets)
+    if not materialised:
+        raise ValueError("at least one packet is required")
+    for packet in materialised:
+        _check_local_dkg_packet_types(packet)
+
+    old_ids = context.participant_ids
+    field_prime = commitment.field_prime
+    group_prime = commitment.group_prime
+    _validate_commitment_setup(
+        commitment.values,
+        field_prime,
+        group_prime,
+        (commitment.generator, commitment.blinding_generator),
+    )
+    if (
+        field_prime != context.field_prime
+        or group_prime != context.group_prime
+        or commitment.generator != context.generator
+    ):
+        raise ValueError("commitment must share the context's group parameters")
+    old_threshold = len(commitment.values)
+    if old_threshold != context.threshold:
+        raise ValueError("commitment must share the context's threshold")
+
+    for packet in materialised:
+        _check_local_dkg_packet_structure(packet, receiver_id)
+
+    first = materialised[0]
+    member_ids = first.participant_ids
+    threshold = len(first.commitment.values)
+    if receiver_id not in member_ids:
+        raise ValueError("receiver_id must be one of the new member ids")
+    for packet in materialised:
+        packet_commitment = packet.commitment
+        if packet.participant_ids != member_ids:
+            raise ValueError("packets must agree on the same participant ids")
+        if (
+            packet_commitment.field_prime != field_prime
+            or packet_commitment.group_prime != group_prime
+            or packet_commitment.generator != commitment.generator
+            or packet_commitment.blinding_generator != commitment.blinding_generator
+        ):
+            raise ValueError("packets must reuse the old group parameters")
+        if len(packet_commitment.values) != threshold:
+            raise ValueError("packets must share the same threshold")
+
+    dealer_list = _check_reshare_dealers(dealers, old_ids, old_threshold, member_ids)
+    sender_ids = [packet.received.sender_id for packet in materialised]
+    if len(set(sender_ids)) != len(sender_ids):
+        raise ValueError("duplicate packet from the same dealer")
+    if set(sender_ids) != set(dealer_list):
+        raise ValueError("each dealer must send exactly one packet")
+
+    # Sort by sender so the reported order cannot depend on the input order.
+    ordered = sorted(materialised, key=lambda packet: packet.received.sender_id)
+    weights = {
+        dealer: _lagrange_weight(dealer, dealer_list, field_prime)
+        for dealer in dealer_list
+    }
+
+    faults: list[ReshareFault] = []
+    for packet in ordered:
+        received = packet.received
+        # All three checks run for every packet, so one failure never masks
+        # another; a dealer's faults are listed pedersen, feldman, binding.
+        if not verify_pedersen_share(
+            received.share, received.blinding_share, packet.commitment
+        ):
+            faults.append(
+                ReshareFault(
+                    sender_id=received.sender_id,
+                    check="pedersen",
+                    receiver_id=receiver_id,
+                )
+            )
+        if not verify_share(received.share, packet.feldman_commitment):
+            faults.append(
+                ReshareFault(
+                    sender_id=received.sender_id,
+                    check="feldman",
+                    receiver_id=receiver_id,
+                )
+            )
+        # The Feldman constant must commit to lambda_i * s_i: exactly the
+        # dealer's old verification share Y_i raised to its Lagrange weight.
+        expected_constant = pow(
+            context.verification_shares[old_ids.index(received.sender_id)],
+            weights[received.sender_id],
+            group_prime,
+        )
+        if packet.feldman_commitment.values[0] != expected_constant:
+            faults.append(
+                ReshareFault(
+                    sender_id=received.sender_id,
+                    check="binding",
+                    receiver_id=None,
+                )
+            )
+    if faults:
+        return tuple(faults)
+
+    # Every Feldman constant was verified as Y_i ** lambda_i, so their
+    # product is g ** (sum lambda_i * s_i); it must equal the old public key
+    # of the caller-supplied context, which is public but unauthenticated.
+    public_key = 1
+    for packet in ordered:
+        public_key = public_key * packet.feldman_commitment.values[0] % group_prime
+    if public_key != context.public_key:
+        raise ValueError(
+            "the constant-term commitments must multiply to the old public key"
+        )
+    return ()
 
 
 def _draw_nonzero_nonce(randbelow: Callable[[int], int], prime: int) -> int:

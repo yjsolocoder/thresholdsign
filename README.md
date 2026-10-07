@@ -1552,6 +1552,26 @@ python3 -m thresholdsign
   与输入顺序无关；同一 dealer 的全部失败都返回。函数不修改输入、不生成新密钥或份额，
   也不改变任何既有入口的返回值与异常；返回空元组当且仅当 `reshare` 对同一输入
   返回 `SigningDKGResult`
+- `diagnose_reshare_local(receiver_id, packets, dealers, context, commitment)` —
+  `reshare_local` 的接收方本地诊断：接受与 `reshare_local` 相同的参数，只凭发给
+  本人的双份额与公开材料返回 `tuple[ReshareFault, ...]`，不需要旧秘密份额、完整
+  密钥或其他接收者的份额。结构边界与 `reshare_local` 完全一致：对象、字段或可
+  迭代参数类型错误（布尔不视为整数）抛 `TypeError`；空批次、dealer 为空/重复/
+  乱序/少于旧门限/不属于旧参与者或新成员、发送者缺失/重复/多余、接收编号或份额
+  坐标不等于 `receiver_id`、份额值越界、非法群参数或承诺、新成员集合或新门限不
+  一致、未沿用旧群参数或盲化生成元、旧承诺与旧上下文的门限或群参数不符均抛
+  `ValueError`（先完成结构校验再返回诊断，绝不以诊断记录掩盖）。对结构合法的包，
+  按 `sender_id` 升序逐包独立检查三项：本人双份额对 dealer 的 Pedersen 承诺
+  （`check="pedersen"`，记录本人 `receiver_id`）、本人份额对 dealer 的 Feldman
+  承诺（`check="feldman"`，记录本人 `receiver_id`）、Feldman 常数项承诺等于
+  旧验证份额按 dealers 零点拉格朗日权重求幂 `Y_i ** λ_i`（`check="binding"`，
+  `receiver_id=None`）；同一发送者多项失败全部保留，按 pedersen、feldman、
+  binding 顺序排列，不因一项失败跳过其余检查。已有故障时直接返回故障元组；全部
+  通过时还要求常数项承诺之积等于旧联合公钥，不等抛 `ValueError`。返回空元组
+  当且仅当 `reshare_local` 对同一输入返回成功四元组；诊断只证明本人接收材料
+  合格，不推断其他成员是否收到有效材料。包与 dealers 支持单次迭代，包顺序不
+  影响结果；门限一、零份额、单位元承诺与编解码往返后的包继续适用。函数不修改
+  输入、不保存状态、不返回秘密值，也不改变任何既有入口的返回值与异常
 - `encode_dkg_contribution(contribution)` / `decode_dkg_contribution(payload)` —
   `DKGContribution` 的唯一字节编码：标签 `thresholdsign/dkg-contribution/v1` 后依次
   写 `sender_id`、参与者计数与严格递增无重复的参与者编号、份额计数与各份额
