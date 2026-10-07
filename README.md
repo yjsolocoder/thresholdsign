@@ -371,6 +371,31 @@ Pedersen 记录在前，一项失败不遮蔽另一项，也不停止检查其�
 的检查，不推断其他成员是否收到有效份额，不产生聚合份额，不修改输入、不保存
 状态、不返回秘密值。
 
+### 跨接收者的公开承诺冲突诊断
+
+各接收者若要比对同一发送者分别向他们声称的公开承诺，无需汇集秘密份额：
+`export_dkg_view(packet)` 把一个 `LocalDKGPacket` 投影为只含公开字段的
+`DKGView(sender_id, receiver_id, participant_ids, commitment, feldman_commitment)`
+——冻结数据类，可按位置构造、按值相等，不携带原包、双份额或系数。导出入口沿用
+编码入口（`encode_local_dkg_packet`）的类型与结构校验：非包对象或字段类型错误
+（布尔不视为整数）抛 `TypeError`，成员、编号、门限、群参数或承诺非法抛
+`ValueError`；但不验证份额方程——结构合法而份额与承诺不匹配包照样导出，该判定
+仍属于 `aggregate_local_dkg` / `diagnose_local_dkg`。
+
+`diagnose_dkg_views(views)` 接受若干视图（支持单次迭代器），对同一发送者的每对
+不同接收者分别比较两类承诺的值元组：Pedersen 值元组不等产生一条
+`DKGEquivocation(sender_id, receiver_ids, "pedersen")`，Feldman 值元组不等产生
+一条 `check="feldman"` 的记录；`receiver_ids` 为升序的二元组，结果按发送者、
+接收者编号对升序排列，同一对的 Pedersen 记录在前，所有冲突均保留，输入顺序不
+影响结果。不同发送者之间不比较承诺；允许只提交部分成员的视图，某发送者仅有一
+个视图时不产生对应记录，全部一致返回空元组。调用方负责确认材料来自同一轮并
+认证来源，诊断结果只说明所提供的声明冲突。
+
+诊断先校验全部视图：空输入、重复的发送者与接收者组合（即使重复视图完全相同）、
+视图间成员集合/门限/群参数不一致，以及任何非法字段值均抛 `ValueError`，不返回
+部分诊断；类型错误统一抛 `TypeError`。合法的零秘密份额与单位元承诺保持支持。
+入口不修改输入、不保留跨调用状态；空结果不代表份额有效或材料收集完整。
+
 ### 按显式贡献者集合的本地聚合
 
 `aggregate_qualified_local_dkg(receiver_id, packets, qualified_ids)` 在
@@ -1890,6 +1915,25 @@ python3 -m thresholdsign
   承诺的密码学关系——结构合法但密码学不匹配的包正常往返，由聚合入口沿用既有
   判定；门限为一、零份额与单位元承诺值保持合法。编码以明文承载双份额，只用于
   保密认证通道，不加密、不认证、不落盘、不保存状态
+- `DKGView(sender_id, receiver_id, participant_ids, commitment, feldman_commitment)`
+  — 冻结数据类，可按位置构造、按值相等；一个发送者向某接收者声称的公开 DKG
+  材料：发送者与接收者编号、参与者编号元组、发送者的 Pedersen 承诺与 Feldman
+  承诺；不携带原包、双份额、多项式系数或隐藏状态
+- `export_dkg_view(packet)` — 把一个 `LocalDKGPacket` 投影为只含公开字段的
+  `DKGView`，供跨接收者比对而不泄露本人份额；沿用 `encode_local_dkg_packet`
+  的类型与结构校验（类型错误抛 `TypeError`，结构非法抛 `ValueError`），但不
+  验证份额方程；不修改输入、不保存状态
+- `DKGEquivocation(sender_id, receiver_ids, check)` — 冻结数据类，可按位置构造、
+  按值相等；一对接收者对同一发送者公开声明的冲突记录：`receiver_ids` 为升序
+  二元组，`check` 为 `"pedersen"` 或 `"feldman"`；不含份额、承诺值或隐藏状态
+- `diagnose_dkg_views(views)` — 跨接收者公开承诺冲突诊断：对同一发送者的每对
+  不同接收者分别比较两类承诺的值元组，每种不等各产生一条 `DKGEquivocation`
+  （同一对 Pedersen 记录在前），结果按发送者、接收者编号对升序排列，全部冲突
+  保留，输入顺序不影响结果；不同发送者不互比，允许部分成员视图，全部一致返回
+  空元组（不代表份额有效或材料收集完整）。空输入、重复的发送者与接收者组合
+  （即使完全相同）、视图间成员集合/门限/群参数不一致及非法字段值抛
+  `ValueError`，类型错误（布尔不视为整数）抛 `TypeError`；支持单次迭代器、
+  零秘密与单位元承诺；不修改输入、不保存状态
 - `SignatureReceipt(message, signature, public_key, field_prime, group_prime, generator)`
   — 冻结数据类，可按位置构造、按值相等；可独立流转的门限 Schnorr 签名凭证：
   `message` 为被签名字节串，`signature` 是 `AggregateSignature(R, z, signer_ids)`，

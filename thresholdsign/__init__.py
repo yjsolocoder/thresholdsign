@@ -44,7 +44,11 @@ to them, together with the senders' public commitments, into their own
 signing share, blinding share and the same public signing context, plus
 its stateless pre-aggregation diagnoser diagnose_local_dkg that names
 every failing Pedersen or Feldman check in one receiver's own packets
-without producing any aggregated share, and
+without producing any aggregated share, the public DKGView /
+export_dkg_view projection of one packet together with DKGEquivocation /
+diagnose_dkg_views, the stateless cross-receiver diagnoser that names
+every pair of receivers whose views of one sender's Pedersen or Feldman
+commitment conflict, without collecting any secret share, and
 the receiver-side refresh_local that proactively refreshes one
 participant's own double share, the aggregated Pedersen commitment and
 the public signing context from that participant's old material, a
@@ -305,6 +309,10 @@ __all__ = [
     "diagnose_local_dkg",
     "encode_local_dkg_packet",
     "decode_local_dkg_packet",
+    "DKGView",
+    "export_dkg_view",
+    "DKGEquivocation",
+    "diagnose_dkg_views",
     "refresh_local",
     "diagnose_refresh_local",
     "reshare_local",
@@ -4779,6 +4787,302 @@ def decode_local_dkg_packet(payload: bytes) -> LocalDKGPacket:
     if encode_local_dkg_packet(packet) != payload:
         raise ValueError("non-canonical local DKG packet encoding")
     return packet
+
+
+@dataclass(frozen=True)
+class DKGView:
+    """One sender's public DKG commitment material as claimed to one receiver.
+
+    ``sender_id`` is the participant id of the sender whose material the
+    view describes and ``receiver_id`` the participant id the material was
+    addressed to; ``participant_ids`` is the strictly increasing,
+    duplicate-free tuple of every DKG participant's id; ``commitment`` is
+    the sender's published Pedersen commitment and ``feldman_commitment``
+    the Feldman commitment to the same sharing polynomial. The dataclass is
+    frozen, positionally constructible and compared by value, and carries
+    no received share, no blinding share, no polynomial coefficient and no
+    hidden state — only the public fields a receiver can repeat without
+    revealing anything about their own double share.
+    """
+
+    sender_id: int
+    receiver_id: int
+    participant_ids: tuple[int, ...]
+    commitment: PedersenCommitment
+    feldman_commitment: FeldmanCommitment
+
+
+@dataclass(frozen=True)
+class DKGEquivocation:
+    """One conflicting pair of public DKG views attributed to one sender.
+
+    The fields, in order, are ``sender_id`` (the participant id of the
+    sender whose two claims conflict), ``receiver_ids`` (the ascending
+    pair of participant ids whose views of that sender's material
+    disagree) and ``check`` (the commitment kind whose value tuples
+    differ: ``"pedersen"`` for the sender's Pedersen commitment or
+    ``"feldman"`` for the sender's Feldman commitment). The dataclass is
+    frozen, positionally constructible and compared by value, and carries
+    no share, no commitment value and no hidden state.
+    """
+
+    sender_id: int
+    receiver_ids: tuple[int, int]
+    check: str
+
+
+def _check_dkg_view_types(view: DKGView) -> None:
+    """Type-check every field of a DKGView, raising TypeError.
+
+    A boolean is never accepted as an integer.
+    """
+    if not isinstance(view, DKGView):
+        raise TypeError("views must be DKGView instances")
+    for name, value in (
+        ("sender_id", view.sender_id),
+        ("receiver_id", view.receiver_id),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"{name} must be an integer")
+    if not isinstance(view.participant_ids, tuple):
+        raise TypeError("participant_ids must be a tuple")
+    for participant_id in view.participant_ids:
+        if not isinstance(participant_id, int) or isinstance(participant_id, bool):
+            raise TypeError("participant ids must be integers")
+    commitment = view.commitment
+    if not isinstance(commitment, PedersenCommitment):
+        raise TypeError("commitment must be a PedersenCommitment instance")
+    for name, value in (
+        ("field_prime", commitment.field_prime),
+        ("group_prime", commitment.group_prime),
+        ("generator", commitment.generator),
+        ("blinding_generator", commitment.blinding_generator),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"{name} must be an integer")
+    if not isinstance(commitment.values, tuple):
+        raise TypeError("commitment values must be a tuple")
+    for value in commitment.values:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError("commitment values must be integers")
+    feldman = view.feldman_commitment
+    if not isinstance(feldman, FeldmanCommitment):
+        raise TypeError("feldman_commitment must be a FeldmanCommitment instance")
+    for name, value in (
+        ("field_prime", feldman.field_prime),
+        ("group_prime", feldman.group_prime),
+        ("generator", feldman.generator),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"{name} must be an integer")
+    if not isinstance(feldman.values, tuple):
+        raise TypeError("feldman commitment values must be a tuple")
+    for value in feldman.values:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError("feldman commitment values must be integers")
+
+
+def _check_dkg_view_structure(view: DKGView) -> None:
+    """Value-check one view's ids and commitments, raising ValueError.
+
+    The public fields follow the same membership, numbering, threshold,
+    group parameter and commitment legality constraints as a local DKG
+    packet: empty or non-increasing participant ids, an id outside
+    ``1 .. field_prime - 1``, a sender or receiver outside the participant
+    set, a threshold outside ``1 .. participant count`` (the threshold is
+    the common length of the two commitments), the two commitments
+    disagreeing on the group or the threshold, or an illegal group
+    parameter or commitment value.
+    """
+    ids = view.participant_ids
+    if not ids:
+        raise ValueError("participant ids must not be empty")
+    if any(ids[index] >= ids[index + 1] for index in range(len(ids) - 1)):
+        raise ValueError("participant ids must be strictly increasing and unique")
+    commitment = view.commitment
+    feldman = view.feldman_commitment
+    field_prime = commitment.field_prime
+    for participant_id in ids:
+        if not 0 < participant_id < field_prime:
+            raise ValueError("participant ids must satisfy 1 <= id <= field_prime - 1")
+    if view.sender_id not in ids:
+        raise ValueError("sender_id must be one of the participant ids")
+    if view.receiver_id not in ids:
+        raise ValueError("receiver_id must be one of the participant ids")
+    if len(commitment.values) != len(feldman.values):
+        raise ValueError("the two commitments must share the same threshold")
+    if not 1 <= len(commitment.values) <= len(ids):
+        raise ValueError("threshold must satisfy 1 <= threshold <= participant count")
+    if (
+        feldman.field_prime != field_prime
+        or feldman.group_prime != commitment.group_prime
+        or feldman.generator != commitment.generator
+    ):
+        raise ValueError("the two commitments must share the same group parameters")
+    _validate_commitment_setup(
+        commitment.values,
+        field_prime,
+        commitment.group_prime,
+        (commitment.generator, commitment.blinding_generator),
+    )
+    _validate_commitment_setup(
+        feldman.values, feldman.field_prime, feldman.group_prime, (feldman.generator,)
+    )
+
+
+def export_dkg_view(packet: LocalDKGPacket) -> DKGView:
+    """Project one receiver's local DKG packet onto its public fields.
+
+    The result names the packet's sender and receiver and repeats the
+    participant ids together with the sender's published Pedersen and
+    Feldman commitments, so receivers can compare what one sender claimed
+    to each of them without revealing any received share. The view carries
+    no original packet, no double share and no polynomial coefficient.
+
+    The argument is validated exactly like the encoding entry
+    :func:`encode_local_dkg_packet`: a non-packet argument or any wrong
+    field type raises TypeError (a boolean is never an integer), and an
+    empty, non-increasing or out-of-range participant set, a sender or
+    receiver outside the participant set, a share coordinate that does not
+    equal the receiver, an out-of-range share value, a threshold outside
+    ``1 .. participant count``, the two commitments disagreeing on the
+    group parameters, or an illegal group parameter or commitment value
+    raises ValueError. The share equations are never verified here: a
+    well-formed packet whose double share does not match its commitments
+    still exports — that verdict belongs to :func:`aggregate_local_dkg`
+    and :func:`diagnose_local_dkg`. The function never mutates its input
+    and keeps no state between calls.
+    """
+    if not isinstance(packet, LocalDKGPacket):
+        raise TypeError("packet must be a LocalDKGPacket instance")
+    _check_local_dkg_packet_for_codec(packet)
+    return DKGView(
+        sender_id=packet.received.sender_id,
+        receiver_id=packet.received.receiver_id,
+        participant_ids=packet.participant_ids,
+        commitment=packet.commitment,
+        feldman_commitment=packet.feldman_commitment,
+    )
+
+
+def diagnose_dkg_views(
+    views: Iterable[DKGView],
+) -> tuple[DKGEquivocation, ...]:
+    """Locate every pair of receivers one sender's public claims conflict on.
+
+    ``views`` carries :class:`DKGView` objects — typically one
+    :func:`export_dkg_view` projection per (sender, receiver) pair the
+    caller collected — and may name only some members for a sender: views
+    are compared pairwise within one sender, never across senders, so a
+    sender with a single submitted view simply contributes no pair. The
+    caller is responsible for confirming that every view comes from the
+    same DKG round and for authenticating its origin; the diagnosis only
+    states that the provided claims conflict.
+
+    All views are validated structurally first: a non-iterable argument,
+    a non-:class:`DKGView` element or any wrong field type raises
+    TypeError (a boolean is never an integer); an empty iterable, a
+    duplicated (sender, receiver) pair — even when the duplicate views are
+    identical — empty, non-increasing or out-of-range participant ids, a
+    sender or receiver outside the participant set, a threshold outside
+    ``1 .. participant count``, the two commitments of one view
+    disagreeing on the group or the threshold, an illegal group parameter
+    or commitment value, or views disagreeing on the participant ids, the
+    threshold or the group parameters raise ValueError. Such inputs are
+    never reported as equivocations — they reject the whole call, all
+    structural validation completes before any record is returned, and no
+    partial diagnosis is produced.
+
+    For structurally legal views, every sender's views are examined in
+    ascending ``sender_id`` order regardless of input order, and for every
+    ascending pair of distinct receivers of that sender the two Pedersen
+    commitment value tuples are compared (``check="pedersen"``) and the
+    two Feldman commitment value tuples are compared
+    (``check="feldman"``). Each kind whose tuples differ yields one
+    :class:`DKGEquivocation` whose ``receiver_ids`` is the ascending pair;
+    a pair differing in both kinds produces two records, the Pedersen
+    record first, and all conflicts are kept — no mismatch masks another.
+    The records are sorted by sender id and then by the ascending receiver
+    pair, so the input order never affects the result. A sender whose
+    views all agree contributes no record, and if no sender equivocates
+    the result is the empty tuple — which says nothing about whether any
+    share is valid or whether the material has been collected in full.
+
+    The function never mutates its input, keeps no state between calls and
+    returns no secret values, and it changes no other entry point:
+    :func:`aggregate_local_dkg`, :func:`diagnose_local_dkg`,
+    :func:`refresh_local`, :func:`reshare_local`, the signing and audit
+    entries, the codecs and the command-line demo keep their existing
+    return values and exception behaviour.
+    """
+    materialised = list(views)
+    if not materialised:
+        raise ValueError("at least one view is required")
+    for view in materialised:
+        _check_dkg_view_types(view)
+    for view in materialised:
+        _check_dkg_view_structure(view)
+
+    first = materialised[0]
+    participant_ids = first.participant_ids
+    first_commitment = first.commitment
+    threshold = len(first_commitment.values)
+    for view in materialised:
+        commitment = view.commitment
+        if view.participant_ids != participant_ids:
+            raise ValueError("views must agree on the same participant ids")
+        if (
+            commitment.field_prime != first_commitment.field_prime
+            or commitment.group_prime != first_commitment.group_prime
+            or commitment.generator != first_commitment.generator
+            or commitment.blinding_generator != first_commitment.blinding_generator
+        ):
+            raise ValueError("views must share the same group parameters")
+        if len(commitment.values) != threshold:
+            raise ValueError("views must share the same threshold")
+
+    seen: set[tuple[int, int]] = set()
+    for view in materialised:
+        pair = (view.sender_id, view.receiver_id)
+        if pair in seen:
+            raise ValueError("duplicate view from the same sender and receiver")
+        seen.add(pair)
+
+    by_sender: dict[int, dict[int, DKGView]] = {}
+    for view in materialised:
+        by_sender.setdefault(view.sender_id, {})[view.receiver_id] = view
+
+    records: list[DKGEquivocation] = []
+    # Sort by sender and receiver pair so the reported order cannot depend
+    # on the input order; both checks run for every pair, pedersen first.
+    for sender_id in sorted(by_sender):
+        receiver_views = by_sender[sender_id]
+        receivers = sorted(receiver_views)
+        for index, first_receiver in enumerate(receivers):
+            for second_receiver in receivers[index + 1:]:
+                first_view = receiver_views[first_receiver]
+                second_view = receiver_views[second_receiver]
+                receiver_ids = (first_receiver, second_receiver)
+                if first_view.commitment.values != second_view.commitment.values:
+                    records.append(
+                        DKGEquivocation(
+                            sender_id=sender_id,
+                            receiver_ids=receiver_ids,
+                            check="pedersen",
+                        )
+                    )
+                if (
+                    first_view.feldman_commitment.values
+                    != second_view.feldman_commitment.values
+                ):
+                    records.append(
+                        DKGEquivocation(
+                            sender_id=sender_id,
+                            receiver_ids=receiver_ids,
+                            check="feldman",
+                        )
+                    )
+    return tuple(records)
 
 
 def refresh_local(
