@@ -1565,6 +1565,29 @@ python3 -m thresholdsign
   与输入顺序无关；同一 dealer 的全部失败都返回。函数不修改输入、不生成新密钥或份额，
   也不改变任何既有入口的返回值与异常；返回空元组当且仅当 `reshare` 对同一输入
   返回 `SigningDKGResult`
+- `create_local_reshare(sender, share, dealers, members, threshold, context, commitment, *, rng=secrets.randbelow)`
+  — 分发方本地重共享：只凭本人旧秘密份额 `share` 与旧公开材料（可信的旧
+  `SigningPublicContext` `context` 和旧聚合 `PedersenCommitment` `commitment`）
+  生成重共享分发包，不需要完整 `SigningDKGResult`、他人份额或联合秘密。数学语义
+  完全沿用 `create_reshare`：`dealers` 严格递增、唯一、人数不少于旧 threshold，
+  每人同时属于旧成员与新 `members`，`sender` 属于 dealers；新共享多项式常数项固定
+  为 `λ_i·share mod q`（不抽样），随后依次从 `rng(field_prime)` 抽取
+  `threshold - 1` 个秘密系数与 `threshold` 个盲化系数，两类承诺沿用旧群参数与旧
+  盲化生成元。返回按接收者编号升序的 `tuple[LocalDKGPacket, ...]`，每名新成员
+  恰好一包，每包只携带该接收者的双份额与本次公开承诺；相同有效随机序列下与
+  `create_reshare` 对应贡献拆出的包逐项相等。各接收者把每位 dealer 给自己的包
+  交给 `reshare_local`，得到与完整 `reshare` 一致的份额、承诺与公开上下文：联合
+  公钥不变、旧签名继续有效、新份额可立即经公开轮次包入口签名。`dealers` 与
+  `members` 支持单次迭代，`members` 允许乱序并规范化排序；新旧门限为一、零份额
+  与单位元承诺合法。所有输入在抽样前校验：对象、字段、编号或份额类型错误（布尔
+  不视为整数）、不可迭代的集合或不可调用的 `rng` 抛 `TypeError`；空成员集、重复
+  或越界编号、非法门限、dealer 为空/重复/乱序/少于旧门限/不属于旧成员或新成员、
+  `sender` 不属于 dealers、份额越界或不匹配旧验证份额 `Y_i`、非法群参数或承诺、
+  旧承诺与 `context` 的门限或共有群参数不一致、`verify_signing_public_context`
+  返回 `False` 均抛 `ValueError`。`rng` 默认为 `secrets.randbelow`；抽到非整数
+  （含布尔）抛 `TypeError`、域外整数抛 `ValueError`、`rng` 自身异常原样传播，
+  失败不返回部分包。函数不修改输入、不保存跨调用状态，既有生成、聚合、诊断、
+  编解码与命令行入口的返回值、异常与格式不变
 - `diagnose_reshare_local(receiver_id, packets, dealers, context, commitment)` —
   `reshare_local` 的接收方本地诊断：接受与 `reshare_local` 相同的参数，只凭发给
   本人的双份额与公开材料返回 `tuple[ReshareFault, ...]`，不需要旧秘密份额、完整
