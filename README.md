@@ -1523,6 +1523,25 @@ python3 -m thresholdsign
   `SigningContribution`；共享多项式常数项固定为 0 且不抽样（Feldman 常数项承诺为
   `g^0 = 1`），其余系数的抽取顺序与规则完全沿用 `create_signing_contribution`；
   支持 `threshold = 1`（此时没有非常数系数抽取）
+- `create_local_refresh(sender_id, context, old_commitment, *, randbelow=secrets.randbelow)`
+  — `create_refresh` 的发送者本地版本：只凭公开材料（当前
+  `SigningPublicContext` 与旧聚合 `PedersenCommitment`）创建本人的零秘密刷新，
+  不接收任何旧秘密份额（旧承诺也无需证明与旧份额对应）。刷新保持当前成员、
+  threshold 与群参数并沿用旧盲化生成元；共享多项式常数项固定为 0（Feldman
+  常数项承诺为 `g^0 = 1`），抽样次数、顺序与上界和 `create_refresh` 完全一致。
+  返回按接收者编号升序的 `tuple[LocalDKGPacket, ...]`：每名成员恰有一包，每包
+  只携带该接收者的双份额与本次两类公开承诺；相同有效随机数序列下与
+  `create_refresh` 贡献拆出的包逐项相等，各成员把每位发送者的包交给
+  `refresh_local` 即得到与完整 `refresh` 一致的双份额、承诺与公开上下文，
+  联合公钥不变、旧签名继续有效，新份额可经既有公开轮次包入口签名；
+  `threshold = 1`、零份额与单位元承诺合法，输出包可经
+  `encode_local_dkg_packet` / `decode_local_dkg_packet` 往返。抽样前校验全部
+  输入：对象或字段类型错误、布尔充当整数、随机源不可调用抛 `TypeError`；
+  sender 不属于当前成员、上下文字段违反公开校验规则、验证份额与联合公钥不满足
+  门限一致性、旧承诺值或群参数非法、旧承诺与上下文门限或共同群参数不一致抛
+  `ValueError`，且不调用随机源；随机源返回非整数或布尔抛 `TypeError`、返回域外
+  整数抛 `ValueError`、其自身异常原样传播，失败不返回部分包。不修改输入、不
+  保存状态
 - `refresh(contributions, key)` — 用每名参与者恰好一份的同参零常数贡献刷新 `key`：
   双份额按域相加、Pedersen/Feldman 两类承诺按群相乘，并重算 `verification_shares`；
   联合秘密与 `public_key` 不变（旧签名仍有效），结果与贡献顺序无关。全部通过返回

@@ -13,7 +13,9 @@ SigningDKGResult / create_signing_contribution / aggregate_signing_dkg,
 plus ContributionFault / diagnose_signing_contributions, the stateless
 pre-aggregation diagnoser that reports every failing Pedersen or Feldman
 double-share pairing without one bad pairing masking the others,
-proactive share refresh via create_refresh / refresh, member resharing via
+proactive share refresh via create_refresh / refresh, the sender-local
+create_local_refresh that deals one participant's zero-secret refresh from
+public material alone as one LocalDKGPacket per member, member resharing via
 create_reshare / reshare, and the sender-local create_local_reshare that
 deals one dealer's resharing from only that dealer's own old share plus
 public material as one LocalDKGPacket per new member, and the canonical
@@ -309,6 +311,7 @@ __all__ = [
     "ContributionFault",
     "diagnose_signing_contributions",
     "create_refresh",
+    "create_local_refresh",
     "refresh",
     "RefreshFault",
     "diagnose_refresh_contributions",
@@ -5004,6 +5007,169 @@ def diagnose_refresh_local(
                 )
             )
     return tuple(faults)
+
+
+def create_local_refresh(
+    sender_id: int,
+    context: SigningPublicContext,
+    old_commitment: PedersenCommitment,
+    *,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> tuple[LocalDKGPacket, ...]:
+    """Create one participant's zero-secret refresh as one packet per member.
+
+    This is the sender-side counterpart of :func:`refresh_local`: whereas
+    :func:`create_refresh` needs the whole old :class:`SigningDKGResult` and
+    returns a single :class:`SigningContribution` carrying every member's
+    double share, :func:`create_local_refresh` needs only public material —
+    the trusted current :class:`SigningPublicContext` ``context`` and the
+    current aggregated :class:`PedersenCommitment` ``old_commitment`` — and
+    returns one :class:`LocalDKGPacket` per member, sorted by receiver id,
+    each carrying only that receiver's double share alongside this sender's
+    two public commitments. No old secret share is involved: a refresh
+    contribution shares the zero secret, so there is nothing secret to
+    supply, and ``old_commitment`` is not required to prove anything about
+    old shares. Every input is checked before the random source is sampled
+    and no partial result is ever returned.
+
+    ``sender_id`` must be one of the context's current participants. The
+    refresh keeps the current members, threshold and group parameters: the
+    dealing runs over ``context.participant_ids`` and ``context.threshold``
+    with the context's field and group, reusing the old commitment's
+    blinding generator. The sharing polynomial's constant term is fixed at
+    zero (its Feldman constant-term commitment is ``g ** 0 == 1``), exactly
+    as in :func:`create_refresh`; the remaining ``threshold - 1`` sharing
+    coefficients are drawn first, then all ``threshold`` blinding
+    coefficients, in exactly the order of :func:`create_refresh` and
+    :func:`create_signing_contribution`. With the same sequence of random
+    draws — the same number of calls, in the same order, with the same
+    upper bounds — the packets are therefore item-by-item equal to the
+    packets each receiver extracts from the corresponding
+    :func:`create_refresh` contribution, and every member feeding the
+    per-sender packets addressed to them into :func:`refresh_local` obtains
+    exactly the double share, aggregated commitment and public context of
+    the full :func:`refresh`: the joint public key is unchanged, old
+    signatures remain valid, and the new shares sign through the usual
+    public-round packet entries. A threshold of one, zero shares and
+    identity commitment values remain legal, and the packets round-trip
+    through :func:`encode_local_dkg_packet` /
+    :func:`decode_local_dkg_packet`.
+
+    All inputs are validated before sampling: wrong object or field types
+    or a non-callable ``randbelow`` raise TypeError (a boolean is never an
+    integer); a ``sender_id`` outside the current members, a context whose
+    fields violate the public-context rules, a context whose verification
+    shares and joint public key fail the threshold-consistency check of
+    :func:`verify_signing_public_context`, illegal commitment values or
+    group parameters, or an old commitment disagreeing with the context on
+    the threshold or the shared group parameters raise ValueError, in every
+    case without touching the random source. ``randbelow`` defaults to the
+    :mod:`secrets` source, must return a non-boolean integer in
+    ``range(field_prime)`` for every draw (a boolean or other type makes
+    TypeError, an out-of-range integer ValueError), and any exception it
+    raises propagates unchanged. The function never mutates its inputs and
+    keeps no state between calls.
+    """
+    if not isinstance(sender_id, int) or isinstance(sender_id, bool):
+        raise TypeError("sender_id must be an integer")
+    if not isinstance(context, SigningPublicContext):
+        raise TypeError("context must be a SigningPublicContext instance")
+    if not isinstance(old_commitment, PedersenCommitment):
+        raise TypeError("old_commitment must be a PedersenCommitment instance")
+    for name, value in (
+        ("field_prime", old_commitment.field_prime),
+        ("group_prime", old_commitment.group_prime),
+        ("generator", old_commitment.generator),
+        ("blinding_generator", old_commitment.blinding_generator),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"{name} must be an integer")
+    if not isinstance(old_commitment.values, tuple):
+        raise TypeError("commitment values must be a tuple")
+    for value in old_commitment.values:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError("commitment values must be integers")
+    if not callable(randbelow):
+        raise TypeError("randbelow must be callable")
+
+    _check_signing_public_context(context)
+    field_prime = old_commitment.field_prime
+    group_prime = old_commitment.group_prime
+    generator = old_commitment.generator
+    blinding_generator = old_commitment.blinding_generator
+    _validate_commitment_setup(
+        old_commitment.values,
+        field_prime,
+        group_prime,
+        (generator, blinding_generator),
+    )
+    if (
+        field_prime != context.field_prime
+        or group_prime != context.group_prime
+        or generator != context.generator
+    ):
+        raise ValueError(
+            "old commitment must share the context's group parameters"
+        )
+    threshold = context.threshold
+    if len(old_commitment.values) != threshold:
+        raise ValueError("old commitment must share the context's threshold")
+    if not verify_signing_public_context(context):
+        raise ValueError("the signing public context must be threshold-consistent")
+    participant_ids = context.participant_ids
+    if sender_id not in participant_ids:
+        raise ValueError("sender_id must be one of the participant ids")
+
+    def checked_randbelow(upper: int) -> int:
+        drawn = randbelow(upper)
+        if not isinstance(drawn, int) or isinstance(drawn, bool):
+            raise TypeError("randbelow must return an integer")
+        if not 0 <= drawn < upper:
+            raise ValueError("randbelow must return a value in range(field_prime)")
+        return drawn
+
+    (
+        ordered_ids,
+        coefficients,
+        _blinding_coefficients,
+        shares,
+        blinding_shares,
+        commitment,
+    ) = _deal_dkg_contribution(
+        sender_id,
+        participant_ids,
+        threshold,
+        group_prime=group_prime,
+        generator=generator,
+        blinding_generator=blinding_generator,
+        prime=field_prime,
+        randbelow=checked_randbelow,
+        constant=0,
+    )
+    feldman_commitment = FeldmanCommitment(
+        values=tuple(
+            pow(generator, coefficient, group_prime) for coefficient in coefficients
+        ),
+        field_prime=field_prime,
+        group_prime=group_prime,
+        generator=generator,
+    )
+    packets = []
+    for index, receiver_id in enumerate(ordered_ids):
+        packets.append(
+            LocalDKGPacket(
+                participant_ids=ordered_ids,
+                received=DKGReceivedShare(
+                    sender_id=sender_id,
+                    receiver_id=receiver_id,
+                    share=shares[index],
+                    blinding_share=blinding_shares[index],
+                ),
+                commitment=commitment,
+                feldman_commitment=feldman_commitment,
+            )
+        )
+    return tuple(packets)
 
 
 def reshare_local(
