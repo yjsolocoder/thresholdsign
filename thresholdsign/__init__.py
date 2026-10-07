@@ -296,6 +296,7 @@ __all__ = [
     "encode_local_dkg_packet",
     "decode_local_dkg_packet",
     "refresh_local",
+    "diagnose_refresh_local",
     "reshare_local",
     "diagnose_reshare_local",
     "ContributionFault",
@@ -4694,6 +4695,188 @@ def refresh_local(
             verification_shares=tuple(verification_shares),
         ),
     )
+
+
+def diagnose_refresh_local(
+    receiver_id: int,
+    share: Share,
+    blinding_share: Share,
+    commitment: PedersenCommitment,
+    context: SigningPublicContext,
+    packets: Iterable[LocalDKGPacket],
+) -> tuple[RefreshFault, ...]:
+    """Locate every failing check in one receiver's refresh packets.
+
+    Accepts exactly the arguments of :func:`refresh_local` and applies its
+    validation boundary unchanged: a non-integer ``receiver_id`` (a boolean
+    is never an integer), a non-:class:`Share` share or blinding share, a
+    non-:class:`PedersenCommitment` ``commitment``, a
+    non-:class:`SigningPublicContext` ``context``, a
+    non-:class:`LocalDKGPacket` packet element, or any wrong field type
+    raises TypeError; an empty packet batch, an illegal value in any object,
+    a ``receiver_id`` that is not one of the context's participants, an old
+    share or blinding share whose coordinate does not equal ``receiver_id``,
+    a missing, duplicated or non-member packet sender, packets disagreeing
+    with the context on the participant ids, the threshold or the group
+    parameters — including the old commitment's blinding generator — and an
+    old commitment disagreeing with the context on the threshold or the
+    shared group parameters raise ValueError. Once the structure is legal,
+    the old double share is checked against the old aggregated Pedersen
+    commitment and the old secret share against the receiver's own
+    verification share in ``context``; either failure raises ValueError,
+    because the caller's own trusted material — not any sender's packet — is
+    at fault. Such inputs are never reported as faults: structural and
+    old-material errors reject the whole call just as in
+    :func:`refresh_local`, and no fault record can mask them.
+
+    For structurally legal packets, every sender's packet is examined in
+    ascending ``sender_id`` order regardless of input order, and all three
+    checks run for every packet — no failure masks another. The received
+    double share is checked against the sender's Pedersen commitment
+    (``check="pedersen"``), the secret share alone against the sender's
+    Feldman commitment (``check="feldman"``), and the sender's Feldman
+    constant-term commitment against ``1`` (the zero-secret proof every
+    refresh contribution must carry, ``check="constant"``). Each failed
+    check yields one :class:`RefreshFault`: the two share checks record the
+    receiver's own ``receiver_id``, the sender-level constant check records
+    ``receiver_id=None``, and a sender's faults are listed in exactly this
+    order — pedersen, feldman, constant. The diagnosis certifies only the
+    receiver's own material: it says nothing about whether any other member
+    received valid shares, and it never produces refreshed shares.
+
+    The returned tuple is empty if and only if :func:`refresh_local` would
+    return its success four-tuple on the same input, and the deduplicated
+    fault senders are exactly that function's rejection list otherwise. The
+    function never mutates its input, keeps no state between calls and
+    returns no secret values, and changes no other entry point:
+    :func:`refresh_local`, :func:`refresh`,
+    :func:`diagnose_refresh_contributions`, the resharing, signing and audit
+    entries, the codecs and the command-line demo keep their existing return
+    values and exception behaviour.
+    """
+    if not isinstance(receiver_id, int) or isinstance(receiver_id, bool):
+        raise TypeError("receiver_id must be an integer")
+    for name, old_share in (("share", share), ("blinding_share", blinding_share)):
+        if not isinstance(old_share, Share):
+            raise TypeError(f"{name} must be a Share instance")
+        for coordinate_name, coordinate in (("x", old_share.x), ("y", old_share.y)):
+            if not isinstance(coordinate, int) or isinstance(coordinate, bool):
+                raise TypeError(f"{name}.{coordinate_name} must be an integer")
+    if not isinstance(commitment, PedersenCommitment):
+        raise TypeError("commitment must be a PedersenCommitment instance")
+    for name, value in (
+        ("field_prime", commitment.field_prime),
+        ("group_prime", commitment.group_prime),
+        ("generator", commitment.generator),
+        ("blinding_generator", commitment.blinding_generator),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"{name} must be an integer")
+    if not isinstance(commitment.values, tuple):
+        raise TypeError("commitment values must be a tuple")
+    for value in commitment.values:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError("commitment values must be integers")
+    if not isinstance(context, SigningPublicContext):
+        raise TypeError("context must be a SigningPublicContext instance")
+    _check_signing_public_context(context)
+    materialised = list(packets)
+    if not materialised:
+        raise ValueError("at least one packet is required")
+    for packet in materialised:
+        _check_local_dkg_packet_types(packet)
+
+    participant_ids = context.participant_ids
+    threshold = context.threshold
+    field_prime = commitment.field_prime
+    group_prime = commitment.group_prime
+    _validate_commitment_setup(
+        commitment.values,
+        field_prime,
+        group_prime,
+        (commitment.generator, commitment.blinding_generator),
+    )
+    if (
+        field_prime != context.field_prime
+        or group_prime != context.group_prime
+        or commitment.generator != context.generator
+    ):
+        raise ValueError("commitment must share the context's group parameters")
+    if len(commitment.values) != threshold:
+        raise ValueError("commitment must share the context's threshold")
+    if receiver_id not in participant_ids:
+        raise ValueError("receiver_id must be one of the participant ids")
+    for name, old_share in (("share", share), ("blinding_share", blinding_share)):
+        if old_share.x != receiver_id:
+            raise ValueError(f"{name} coordinate must equal receiver_id")
+        if not 0 <= old_share.y < field_prime:
+            raise ValueError(f"{name} value must satisfy 0 <= y <= field_prime - 1")
+    for packet in materialised:
+        _check_local_dkg_packet_structure(packet, receiver_id)
+    for packet in materialised:
+        packet_commitment = packet.commitment
+        if packet.participant_ids != participant_ids:
+            raise ValueError("packets must agree on the same participant ids")
+        if (
+            packet_commitment.field_prime != field_prime
+            or packet_commitment.group_prime != group_prime
+            or packet_commitment.generator != commitment.generator
+            or packet_commitment.blinding_generator != commitment.blinding_generator
+        ):
+            raise ValueError("packets must share the same group parameters")
+        if len(packet_commitment.values) != threshold:
+            raise ValueError("packets must share the same threshold")
+    sender_ids = [packet.received.sender_id for packet in materialised]
+    if len(set(sender_ids)) != len(sender_ids):
+        raise ValueError("duplicate packet from the same participant")
+    if set(sender_ids) != set(participant_ids):
+        raise ValueError("each participant must send exactly one packet")
+
+    # The caller's own old material is trusted input: a failure here is an
+    # illegal argument, never a sender fault.
+    if not verify_pedersen_share(share, blinding_share, commitment):
+        raise ValueError("old double share must verify against the old commitment")
+    index = participant_ids.index(receiver_id)
+    if pow(context.generator, share.y, group_prime) != context.verification_shares[index]:
+        raise ValueError("old share must match the receiver's verification share")
+
+    # Sort by sender so the reported order cannot depend on the input order.
+    ordered = sorted(materialised, key=lambda packet: packet.received.sender_id)
+
+    faults: list[RefreshFault] = []
+    for packet in ordered:
+        received = packet.received
+        # All three checks run for every packet, so one failure never masks
+        # another; a sender's faults are listed pedersen, feldman, constant.
+        if not verify_pedersen_share(
+            received.share, received.blinding_share, packet.commitment
+        ):
+            faults.append(
+                RefreshFault(
+                    sender_id=received.sender_id,
+                    check="pedersen",
+                    receiver_id=receiver_id,
+                )
+            )
+        if not verify_share(received.share, packet.feldman_commitment):
+            faults.append(
+                RefreshFault(
+                    sender_id=received.sender_id,
+                    check="feldman",
+                    receiver_id=receiver_id,
+                )
+            )
+        # A refresh packet must share the zero secret: its Feldman
+        # constant-term commitment must be exactly g ** 0 == 1.
+        if packet.feldman_commitment.values[0] != 1:
+            faults.append(
+                RefreshFault(
+                    sender_id=received.sender_id,
+                    check="constant",
+                    receiver_id=None,
+                )
+            )
+    return tuple(faults)
 
 
 def reshare_local(
