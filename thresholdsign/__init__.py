@@ -41,7 +41,12 @@ the public context alone as one self-delimiting byte string, the
 receiver-side LocalDKGPacket / aggregate_local_dkg
 that lets each DKG participant aggregate only the double shares addressed
 to them, together with the senders' public commitments, into their own
-signing share, blinding share and the same public signing context, plus
+signing share, blinding share and the same public signing context, and
+aggregate_qualified_local_dkg that aggregates the same way from an
+explicit, pre-agreed qualified sender set (a true subset counts only that
+subset's shares and commitments; choosing every member equals
+aggregate_local_dkg by value) without changing the participant set or the
+threshold, plus
 its stateless pre-aggregation diagnoser diagnose_local_dkg that names
 every failing Pedersen or Feldman check in one receiver's own packets
 without producing any aggregated share, and
@@ -301,6 +306,7 @@ __all__ = [
     "decode_signing_public_context",
     "LocalDKGPacket",
     "aggregate_local_dkg",
+    "aggregate_qualified_local_dkg",
     "diagnose_local_dkg",
     "encode_local_dkg_packet",
     "decode_local_dkg_packet",
@@ -4257,6 +4263,174 @@ def aggregate_local_dkg(
         raise ValueError("duplicate packet from the same participant")
     if set(sender_ids) != set(participant_ids):
         raise ValueError("each participant must send exactly one packet")
+
+    # Sort by sender so the input order cannot influence the outcome.
+    ordered = sorted(materialised, key=lambda packet: packet.received.sender_id)
+
+    rejections: list[DKGRejection] = []
+    for packet in ordered:
+        received = packet.received
+        if not verify_pedersen_share(
+            received.share, received.blinding_share, packet.commitment
+        ) or not verify_share(received.share, packet.feldman_commitment):
+            rejections.append(DKGRejection(sender_id=received.sender_id))
+    if rejections:
+        return rejections
+
+    field_prime = first_commitment.field_prime
+    group_prime = first_commitment.group_prime
+    y = 0
+    y_blinding = 0
+    for packet in ordered:
+        y = (y + packet.received.share.y) % field_prime
+        y_blinding = (y_blinding + packet.received.blinding_share.y) % field_prime
+
+    public_key = 1
+    verification_shares: list[int] = [1 for _ in participant_ids]
+    for packet in ordered:
+        feldman = packet.feldman_commitment
+        public_key = public_key * feldman.values[0] % group_prime
+        for index, participant_id in enumerate(participant_ids):
+            x_power = 1
+            evaluation = 1
+            for value in feldman.values:
+                evaluation = evaluation * pow(value, x_power, group_prime) % group_prime
+                x_power = x_power * participant_id % field_prime
+            verification_shares[index] = (
+                verification_shares[index] * evaluation % group_prime
+            )
+    context = SigningPublicContext(
+        participant_ids=participant_ids,
+        threshold=threshold,
+        field_prime=field_prime,
+        group_prime=group_prime,
+        generator=first_commitment.generator,
+        public_key=public_key,
+        verification_shares=tuple(verification_shares),
+    )
+    return (
+        Share(x=receiver_id, y=y),
+        Share(x=receiver_id, y=y_blinding),
+        context,
+    )
+
+
+def aggregate_qualified_local_dkg(
+    receiver_id: int,
+    packets: Iterable[LocalDKGPacket],
+    qualified_ids: tuple[int, ...],
+) -> tuple[Share, Share, SigningPublicContext] | list[DKGRejection]:
+    """Aggregate one participant's shares from an explicit qualified sender set.
+
+    Behaves exactly like :func:`aggregate_local_dkg`, except that the
+    contributing senders are named beforehand by ``qualified_ids`` — a
+    strictly increasing tuple of participant ids — instead of defaulting
+    to every participant. ``packets`` must carry exactly one
+    :class:`LocalDKGPacket` per qualified sender: a missing, duplicated or
+    extra sender, an empty or non-increasing ``qualified_ids``, an id
+    outside the packets' participant set, or fewer qualified senders than
+    the packets' common threshold all raise ValueError. The entry point
+    never selects or removes contributors itself: the qualified set is the
+    caller's agreement, not this function's decision. Members outside it
+    keep their eligibility to receive addressed shares and to sign, the
+    receiver need not itself be qualified, and neither the participant set
+    on the returned context nor the threshold changes.
+
+    Every input passes structural validation before either commitment
+    check runs. Wrong object or field types raise TypeError (a boolean is
+    never an integer, and ``qualified_ids`` must be a tuple of integers);
+    an empty batch, empty, non-increasing or out-of-range qualified ids, a
+    ``receiver_id`` that is not one of the participants, a missing,
+    duplicated, extra or non-member sender, a received share whose
+    ``receiver_id`` or share coordinates do not equal ``receiver_id``,
+    illegal group parameters or commitments, an out-of-range share value,
+    an insufficient qualified count, or packets disagreeing on the
+    participant ids, the threshold or the group parameters raise
+    ValueError.
+
+    Once the structure is legal, each qualified sender's double share is
+    checked against that sender's Pedersen commitment and the secret share
+    against the Feldman commitment, exactly as in
+    :func:`aggregate_local_dkg`. Failures are never dropped and no partial
+    result is returned: if any check fails, the result is a
+    sender-sorted, duplicate-free ``list`` of :class:`DKGRejection` naming
+    every qualified sender whose packet failed.
+
+    On success returns ``(share, blinding_share, context)`` in the same
+    shape as :func:`aggregate_local_dkg`: both shares have coordinate
+    ``receiver_id`` and values that sum only the qualified senders'
+    received shares modulo ``field_prime``; the joint public key is the
+    product of the qualified senders' constant-term Feldman commitments
+    and each verification share the product of their Feldman evaluations
+    at that participant id. The context therefore depends on the public
+    commitments alone — two receivers aggregating packets carrying the
+    same qualified commitments get equal contexts — and with enough
+    qualified members the result flows through the existing signing round,
+    share signing and aggregate-verification entry points. When
+    ``qualified_ids`` names every participant, the success result and any
+    rejection list equal :func:`aggregate_local_dkg`'s by value; for a
+    true subset only that subset's contributions count. Success certifies
+    only the receiver's own material — it neither proves the qualified set
+    reached consensus nor that any other member received valid shares.
+    The input order does not affect the result, single-pass iterators are
+    accepted, and a threshold of one, zero shares and identity commitment
+    values remain legal. The function does not mutate its inputs and keeps
+    no state between calls.
+    """
+    if not isinstance(receiver_id, int) or isinstance(receiver_id, bool):
+        raise TypeError("receiver_id must be an integer")
+    if not isinstance(qualified_ids, tuple):
+        raise TypeError("qualified_ids must be a tuple")
+    for qualified_id in qualified_ids:
+        if not isinstance(qualified_id, int) or isinstance(qualified_id, bool):
+            raise TypeError("qualified ids must be integers")
+    if not qualified_ids:
+        raise ValueError("at least one qualified id is required")
+    if any(
+        qualified_ids[index] >= qualified_ids[index + 1]
+        for index in range(len(qualified_ids) - 1)
+    ):
+        raise ValueError("qualified ids must be strictly increasing and unique")
+
+    materialised = list(packets)
+    if not materialised:
+        raise ValueError("at least one packet is required")
+    for packet in materialised:
+        _check_local_dkg_packet_types(packet)
+    for packet in materialised:
+        _check_local_dkg_packet_structure(packet, receiver_id)
+
+    first = materialised[0]
+    participant_ids = first.participant_ids
+    first_commitment = first.commitment
+    threshold = len(first_commitment.values)
+    if receiver_id not in participant_ids:
+        raise ValueError("receiver_id must be one of the participant ids")
+    for packet in materialised:
+        commitment = packet.commitment
+        if packet.participant_ids != participant_ids:
+            raise ValueError("packets must agree on the same participant ids")
+        if (
+            commitment.field_prime != first_commitment.field_prime
+            or commitment.group_prime != first_commitment.group_prime
+            or commitment.generator != first_commitment.generator
+            or commitment.blinding_generator != first_commitment.blinding_generator
+        ):
+            raise ValueError("packets must share the same group parameters")
+        if len(commitment.values) != threshold:
+            raise ValueError("packets must share the same threshold")
+
+    qualified_set = set(qualified_ids)
+    if not qualified_set <= set(participant_ids):
+        raise ValueError("every qualified id must be one of the participant ids")
+    if len(qualified_ids) < threshold:
+        raise ValueError("the qualified set must contain at least threshold participants")
+
+    sender_ids = [packet.received.sender_id for packet in materialised]
+    if len(set(sender_ids)) != len(sender_ids):
+        raise ValueError("duplicate packet from the same participant")
+    if set(sender_ids) != qualified_set:
+        raise ValueError("each qualified participant must send exactly one packet")
 
     # Sort by sender so the input order cannot influence the outcome.
     ordered = sorted(materialised, key=lambda packet: packet.received.sender_id)
