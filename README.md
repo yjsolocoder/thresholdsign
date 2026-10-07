@@ -1530,6 +1530,23 @@ python3 -m thresholdsign
   常数项承诺不为 1、双份额不匹配两类承诺者各一条）；类型错误抛 `TypeError`，缺失、
   重复、参数不一致或结构非法抛 `ValueError`。库不保存隐藏状态，调用方须销毁旧份额、
   改用返回份额
+- `create_local_refresh(sender_id, context, old_commitment, *, randbelow=secrets.randbelow)`
+  — `create_refresh` 的纯公开材料版本：只需可信的当前 `SigningPublicContext` 与当前
+  聚合 `PedersenCommitment`，不接收任何旧秘密份额，返回按接收者编号升序的
+  `tuple[LocalDKGPacket, ...]`：每名当前成员恰有一包，每包只携带该接收者的双份额
+  与本次两类公开承诺。刷新保持当前成员、门限与群参数，沿用旧盲化生成元，秘密多项式
+  常数项固定为 0（Feldman 常数项承诺为 1）；相同有效随机数序列下与 `create_refresh`
+  贡献拆出的包逐项相等，抽样次数、顺序与上界一致。每名成员把各发送者的包交给
+  `refresh_local` 即得到与完整 `refresh` 一致的双份额、承诺与公开上下文，联合公钥
+  不变，旧签名继续有效，新份额可经 `sign_round_packet` 签名；`threshold = 1`、零份额
+  与单位元承诺保持合法，输出包可直接经 `encode_local_dkg_packet` /
+  `decode_local_dkg_packet` 往返。抽样前校验全部输入：对象或字段类型错误、布尔充当
+  整数或随机源不可调用抛 `TypeError`；发送者不属于当前成员、上下文字段违反公开校验
+  规则、公开验证份额与联合公钥不满足门限一致性、旧承诺值或群参数非法、旧承诺与
+  上下文门限或群参数不一致抛 `ValueError`（旧承诺不要求对应任何旧秘密份额——本入口
+  不接收秘密材料）；随机源返回非整数或布尔抛 `TypeError`、返回域外整数抛
+  `ValueError`、其自身异常原样传播，失败不返回部分包。函数不修改输入，调用间不保存
+  状态
 - `create_reshare(sender, share, dealers, members, threshold, key, *, rng=secrets.randbelow)`
   — 旧参与者 `sender` 为成员重共享创建一份 `SigningContribution`：`dealers` 是严格
   递增、唯一、人数不少于旧 threshold 的旧参与者 quorum，且每人同时属于旧 `key` 与新
